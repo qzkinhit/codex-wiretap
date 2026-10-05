@@ -1,0 +1,2 @@
+aiohttp>=3.14.3,<4
+backports.zstd>=1.0,<2; python_version < "3.14"
