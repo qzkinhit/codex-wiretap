@@ -64,8 +64,17 @@ def prepare():
         if row is None:
             raise ValueError('未选择 Codex 供应商')
         meta = json.loads(row['meta'] or '{}')
-        if meta.get('wiretapSourceProviderId'):
-            row = db.execute("SELECT * FROM providers WHERE app_type='codex' AND id=?", (meta['wiretapSourceProviderId'],)).fetchone()
+        source_id = meta.get('wiretapSourceProviderId')
+        if not source_id:
+            # Some CC Switch versions discard unknown metadata when a provider is edited.
+            try:
+                saved = json.loads(STATE.read_text())
+                if row['id'] == saved.get('provider_id'):
+                    source_id = saved.get('source_id')
+            except (OSError, ValueError, AttributeError):
+                pass
+        if source_id:
+            row = db.execute("SELECT * FROM providers WHERE app_type='codex' AND id=?", (source_id,)).fetchone()
         if row is None:
             raise ValueError('原供应商已被删除，无法安装适配')
         source = dict(row)

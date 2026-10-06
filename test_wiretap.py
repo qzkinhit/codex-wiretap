@@ -7,7 +7,7 @@ import unittest
 
 from aiohttp import web, ClientSession
 from yarl import URL
-from wiretap import Journal, LIMIT, Observer, Proxy, SSE, WSObserver, configuration, connection_status, read_report, request_fields, zstd
+from wiretap import Journal, LIMIT, Observer, Proxy, SSE, WSObserver, configuration, connection_status, read_report, request_fields, zstd, ProviderCredentialsError
 
 
 class FieldsTest(unittest.TestCase):
@@ -292,6 +292,35 @@ class IntegrationTest(unittest.IsolatedAsyncioTestCase):
             await r.read()
         self.assertNotIn('PROVIDER_KEY', self.journal.path.read_text())
         self.assertNotIn('LOGIN_TOKEN', self.journal.path.read_text())
+
+    async def test_key_loader_is_called_for_each_http_request(self):
+        observed = []
+        async def handler(request):
+            observed.append(request.headers.get('Authorization'))
+            return web.json_response({'model':'ok'})
+        app = web.Application(); app.router.add_post('/v1/responses',handler)
+        upstream = await self.start(app)
+        keys = iter(['FIRST_KEY','SECOND_KEY'])
+        base = await self.start(Proxy(upstream+'/v1',self.journal,key_loader=lambda:next(keys)).app())
+        for _ in range(2):
+            async with self.client.post(base+'/v1/responses',json={'model':'x'}) as r:
+                self.assertEqual(r.status,200); await r.read()
+        self.assertEqual(observed,['Bearer FIRST_KEY','Bearer SECOND_KEY'])
+        self.assertNotIn('SECOND_KEY',self.journal.path.read_text())
+
+    async def test_failed_key_loading_never_falls_back_to_login_token(self):
+        observed = []
+        async def handler(request):
+            observed.append(True); return web.Response()
+        def fail():
+            raise ProviderCredentialsError()
+        app = web.Application(); app.router.add_post('/v1/responses',handler)
+        upstream = await self.start(app)
+        base = await self.start(Proxy(upstream+'/v1',self.journal,key_loader=fail).app())
+        async with self.client.post(base+'/v1/responses',json={'model':'x'},headers={'Authorization':'Bearer CLIENT_KEY'}) as r:
+            self.assertEqual(r.status,502)
+            self.assertEqual((await r.json())['error']['type'],'wiretap_credentials_error')
+        self.assertEqual(observed,[])
 
     async def test_websocket_reuse_frames_and_token_attribution(self):
         async def handler(request):
