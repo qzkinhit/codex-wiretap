@@ -226,7 +226,7 @@ def report(run, state, round_dir, code, elapsed, facts, events, changed, new_sta
         print("\n".join(lines[-20:]))
     print("\n== 执行过的命令，退出码非 0 的以 ! 开头")
     for exit_code, command in commands[-60:]:
-        print(("! " if exit_code not in (0, None) else "  ") + command[:220])
+        print(("! " if exit_code not in (0, None) else "  ") + command.replace("\n", "\\n")[:220])
     print("\n== 本轮修改过的文件，按修改时间判断，可能包含其他进程的写入")
     print("\n".join(changed[:LISTED]))
     if len(changed) > LISTED:
