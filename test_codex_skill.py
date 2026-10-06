@@ -29,6 +29,7 @@ FAKE_CODEX = textwrap.dedent('''\
         fh.writelines(json.dumps(row) + '\\n' for row in rows)
     print(json.dumps({'type': 'thread.started', 'thread_id': 'SESSION'}))
     print(json.dumps({'type': 'item.completed', 'item': {'type': 'command_execution', 'command': 'python3 check.py', 'exit_code': 1}}))
+    print(json.dumps({'type': 'item.completed', 'item': {'type': 'command_execution', 'command': 'python3 - <<EOF\\nprint(1)\\nEOF', 'exit_code': 0}}))
     pathlib.Path(args[args.index('-o') + 1]).write_text('完成情况 已完成', encoding='utf-8')
 ''').replace('SESSION', SESSION)
 
@@ -78,7 +79,8 @@ class CodexSkillTest(unittest.TestCase):
         self.assertTrue(call['prompt'].startswith('# 执行约定'))
         self.assertTrue(call['prompt'].endswith('画一张示例图。\n'))
         for text in (SESSION, '模型 model-example，思考强度 high', '上下文 1,000 tokens', '完成情况 已完成',
-                     '! python3 check.py', str(self.repo / 'made_by_codex.txt'), '?? made_by_codex.txt'):
+                     '! python3 check.py', '  python3 - <<EOF\\nprint(1)\\nEOF\n',
+                     str(self.repo / 'made_by_codex.txt'), '?? made_by_codex.txt'):
             self.assertIn(text, result.stdout)
 
     def test_model_and_effort_pins_reach_codex(self):
