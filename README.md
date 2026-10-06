@@ -5,7 +5,9 @@
 
 一个本地请求监测工具，用来对照 Codex 请求中的模型与推理强度，以及上游响应声明的模型、推理强度和 token 用量。支持 HTTP JSON、SSE、Responses WebSocket，提供中文实时面板和可暂停的元数据记录。
 
-A local HTTP/SSE/WebSocket observer for Codex model and reasoning metadata. The CC Switch adapter supports macOS. Response metadata is a server claim, not proof of the model actually executed.
+A local HTTP/SSE/WebSocket observer for Codex model and reasoning metadata. The CC Switch adapter supports macOS. Response metadata is a server claim, not proof of the model actually executed. The repository also ships a Claude Code skill that delegates figure drawing, proof review and well-specified execution tasks to the Codex CLI.
+
+仓库另附一个 Claude Code skill，用于把画图、定理审查和规格明确的执行任务派给 Codex CLI，见 [Claude Code 子代理 skill](#claude-code-子代理-skill)。
 
 **想知道请求有没有被改参数，可以用它观察字段差异。想证明中转站实际运行了哪个模型或多少计算量，仅靠这个工具做不到。**
 
@@ -232,6 +234,36 @@ codex -c 'model_providers.custom.base_url="http://127.0.0.1:10812/v1"'
 
 HTTPS 校验保持启用；可以通过 `SSL_CERT_FILE` 指定已有 CA。工具不自动读取 `HTTP_PROXY` 或 `HTTPS_PROXY`，避免意外循环。遇到代理端口冲突，应明确区分模型网关、Wiretap 监听端口与出站网络代理。
 
+## Claude Code 子代理 skill
+
+`skills/codex/` 是一个 Claude Code skill，让 Claude Code 把画图、定理审查、理论审查和规格明确的执行任务派给本机 Codex CLI 在后台完成。Claude 负责拆分任务、写任务说明、审核与验收，写作类任务不派发。它与 Wiretap 代理相互独立，可以单独使用。
+
+安装或更新时复制整个目录。
+
+```bash
+mkdir -p ~/.claude/skills
+cp -R skills/codex ~/.claude/skills/
+```
+
+需要固定子代理使用的模型或思考强度时，把 `~/.claude/skills/codex/.env.example` 复制为同目录的 `.env` 并填写。未设置时沿用 Codex 的 `config.toml`。
+
+在 Claude Code 中输入 `/codex <任务描述>`，或在对话中说“让 codex 画这张图”。Claude 写好任务说明后在后台调用 `skills/codex/scripts/codex_run.py`，三种模式如下。
+
+| 模式 | 用途 | Codex 可写范围 |
+| --- | --- | --- |
+| `new <工作目录> <任务说明.md> [额外可写目录...]` | 画图与执行任务 | 工作目录与额外可写目录 |
+| `review <审查说明.md>` | 定理与理论审查 | 运行目录下的独立 workspace |
+| `resume <运行目录> <返工说明.md>` | 在同一会话中返工 | 沿用首轮设置 |
+
+每轮结束后，脚本输出 Codex 本地会话记录中的模型、思考强度、沙箱与上下文占用，以及 Codex 的最终报告、执行过的命令和本轮修改过的文件。上下文达到上限（默认 256k tokens）的 75% 后，脚本拒绝续接，需要拆成新任务。完整的分派规则见 [skills/codex/SKILL.md](skills/codex/SKILL.md)。
+
+使用限制如下。
+
+- 需要 Python 3.9+ 和可以运行的 Codex CLI。每次调用都会消耗 Codex 所用服务的额度。
+- 修改文件按修改时间判断，同一时段其他进程写入的文件也会列出。
+- 会话记录中的模型与思考强度反映客户端设置，不能证明上游实际执行的模型。需要观察请求与响应字段时，配合前文的 Wiretap 面板使用。
+- 运行记录默认保存在 `~/.claude/codex-runs/`，包含任务说明与 Codex 输出，可能涉及私有内容，不要提交到仓库。
+
 ## 常见问题
 
 ### 页面有显示，但一直是零条记录
@@ -275,7 +307,7 @@ HTTPS 校验保持启用；可以通过 `SSL_CERT_FILE` 指定已有 CA。工具
 .venv/bin/python -m unittest discover -v
 ```
 
-GitHub Actions 覆盖 Linux 上的 Python 3.11/3.14 和 macOS 上的 Python 3.14。自动化测试覆盖流式转发、WebSocket 配对、压缩、认证头处理、日志脱敏、暂停恢复和供应商配置复制等；不能替代每个 CC Switch 版本的人工集成验证。
+GitHub Actions 覆盖 Linux 上的 Python 3.11/3.14 和 macOS 上的 Python 3.14。自动化测试覆盖流式转发、WebSocket 配对、压缩、认证头处理、日志脱敏、暂停恢复、供应商配置复制，以及 skill 脚本的派发、续接与上下文限制。skill 脚本的测试用模拟的 codex 可执行文件代替 Codex CLI。这些测试不能替代每个 CC Switch 版本的人工集成验证。
 
 ## 贡献与许可证
 
