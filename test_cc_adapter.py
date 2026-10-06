@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 import cc_adapter
-from wiretap import cc_provider
+from wiretap import cc_provider, CCKeyLoader, ProviderCredentialsError
 
 
 class AdapterTest(unittest.TestCase):
@@ -50,6 +50,37 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(again['source_id'], 'original')
         with sqlite3.connect(self.db) as db:
             self.assertEqual(db.execute('SELECT COUNT(*) FROM providers').fetchone()[0], 2)
+
+    def test_clone_edit_can_discard_metadata_without_losing_source_link(self):
+        result = self.prepare()
+        with sqlite3.connect(self.db) as db:
+            db.execute('UPDATE providers SET is_current=(id=?)', (result['provider_id'],))
+            db.execute('UPDATE providers SET meta=? WHERE id=?', ('{}', result['provider_id']))
+        self.assertEqual(self.prepare()['source_id'], 'original')
+
+    def test_key_rotates_without_restart_but_does_not_follow_new_destination(self):
+        loader = CCKeyLoader('original', 'https://provider.example/v1', self.db)
+        self.assertEqual(loader(), 'SYNTHETIC_TEST_KEY')
+        changed = json.loads(json.dumps(self.settings))
+        changed['auth']['OPENAI_API_KEY'] = 'ROTATED_TEST_KEY'
+        with sqlite3.connect(self.db) as db:
+            db.execute('UPDATE providers SET settings_config=? WHERE id=?', (json.dumps(changed), 'original'))
+        self.assertEqual(loader(), 'ROTATED_TEST_KEY')
+        changed['config'] = changed['config'].replace('provider.example', 'different.example')
+        with sqlite3.connect(self.db) as db:
+            db.execute('UPDATE providers SET settings_config=? WHERE id=?', (json.dumps(changed), 'original'))
+        with self.assertRaises(ProviderCredentialsError):
+            loader()
+
+    def test_missing_key_fails_without_reusing_cached_secret(self):
+        loader = CCKeyLoader('original', 'https://provider.example/v1', self.db)
+        self.assertTrue(loader())
+        changed = json.loads(json.dumps(self.settings))
+        changed['auth'].clear()
+        with sqlite3.connect(self.db) as db:
+            db.execute('UPDATE providers SET settings_config=? WHERE id=?', (json.dumps(changed), 'original'))
+        with self.assertRaises(ProviderCredentialsError):
+            loader()
 
     def test_missing_database_is_not_created(self):
         absent = self.root / 'missing.db'

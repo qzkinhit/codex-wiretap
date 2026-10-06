@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import codecs
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,7 @@ import aiohttp
 from aiohttp import web, WSMsgType
 from multidict import CIMultiDict
 from yarl import URL
+from conversations import ConversationIndex
 try:
     from compression import zstd
 except ImportError:
@@ -34,6 +36,24 @@ LIMIT = 4 * 1024 * 1024
 HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
        "te", "trailer", "transfer-encoding", "upgrade", "host"}
 TERMINAL = {"response.completed", "response.failed", "response.incomplete", "response.done"}
+
+
+class ProviderCredentialsError(Exception):
+    """No valid credential for the fixed upstream; never include the secret."""
+
+
+class CCKeyLoader:
+    def __init__(self, provider_id, upstream, db_path=None):
+        self.provider_id, self.upstream, self.db_path = provider_id, URL(upstream), db_path
+
+    def __call__(self):
+        try:
+            upstream, key = cc_provider(self.provider_id, self.db_path)
+            if URL(upstream) != self.upstream:
+                raise ValueError('upstream_changed')
+            return key
+        except (OSError, ValueError, TypeError, KeyError, sqlite3.Error):
+            raise ProviderCredentialsError() from None
 
 
 def stamp():
@@ -116,7 +136,8 @@ class ZstdStream:
 
 class Journal:
     """Append only whitelisted snapshots; keep the latest 300 rows in memory."""
-    def __init__(self, path):
+    def __init__(self, path, conversations=None):
+        self.conversations = conversations or ConversationIndex()
         self.path = Path(path)
         self.control_path = self.path.with_suffix('.control.json')
         self.enabled = True
@@ -144,11 +165,12 @@ class Journal:
         self.file.write(json.dumps({k:v for k,v in row.items() if not k.startswith('_')}, ensure_ascii=False) + "\n")
         self.file.flush()
 
-    def new(self, data, transport, endpoint):
+    def new(self, data, transport, endpoint, headers=None):
         row = {"id": uuid.uuid4().hex[:16], "time": stamp(), "transport": transport,
                "_capture": self.enabled,
                "endpoint": endpoint, "phase": "request", "request": request_fields(data),
                "response": {}, "notes": [], "http_status": None}
+        row['conversation'] = self.conversations.identify(data, headers) if self.enabled else {'id': None, 'status': 'unidentified', 'source': None}
         self.save(row)
         return row
 
@@ -293,14 +315,15 @@ def clean_headers(headers, websocket=False):
 
 
 class WSObserver:
-    def __init__(self, journal, endpoint):
+    def __init__(self, journal, endpoint, headers=None):
         self.journal, self.endpoint = journal, endpoint
+        self.headers = headers
         self.pending = []
         self.active = {}
 
     def client(self, data):
         if data.get("type") == "response.create" or ("model" in data and not data.get("type")):
-            self.pending.append(self.journal.new(data, "WebSocket", self.endpoint))
+            self.pending.append(self.journal.new(data, "WebSocket", self.endpoint, self.headers))
         # Do not guess inherited configuration from absent request fields.
 
     def server(self, data):
@@ -336,7 +359,8 @@ class WSObserver:
 
 
 class Proxy:
-    def __init__(self, upstream, journal, config_path=DEFAULT_CONFIG, profile=None, api_key=None, outbound_proxy=None):
+    def __init__(self, upstream, journal, config_path=DEFAULT_CONFIG, profile=None, api_key=None, outbound_proxy=None, key_loader=None):
+        self.key_loader = key_loader
         self.api_key, self.outbound_proxy = api_key, outbound_proxy
         self.config_path, self.profile = Path(config_path), profile
         self.upstream = URL(upstream)
@@ -392,7 +416,7 @@ class Proxy:
         return web.json_response({"started": self.started, "upstream": str(self.upstream),
                                   "recording": self.journal.enabled,
                                   "connection": connection,
-                                  "records": [{k:v for k,v in row.items() if not k.startswith('_')} for row in reversed(self.journal.rows.values())]},
+                                  "records": self.journal.conversations.enrich(list(reversed(self.journal.rows.values())))},
                                  headers={"Cache-Control": "no-store"})
 
     async def recording(self, request):
@@ -416,8 +440,9 @@ class Proxy:
 
     def upstream_headers(self, request, websocket=False):
         headers = clean_headers(request.headers, websocket)
-        if self.api_key:
-            headers['Authorization'] = 'Bearer ' + self.api_key
+        key = self.key_loader() if self.key_loader else self.api_key
+        if key:
+            headers['Authorization'] = 'Bearer ' + key
             for name in ['Cookie', 'ChatGPT-Account-ID', 'OpenAI-Organization', 'OpenAI-Project']:
                 headers.popall(name, None)
         return headers
@@ -441,7 +466,7 @@ class Proxy:
         elif encoding not in {"", "identity"}:
             data = b""
             parse_note = "unsupported_request_encoding"
-        row = self.journal.new(parse_json(data) if len(data) <= LIMIT else {}, "HTTP", endpoint) if endpoint and request.method == "POST" else None
+        row = self.journal.new(parse_json(data) if len(data) <= LIMIT else {}, "HTTP", endpoint, request.headers) if endpoint and request.method == "POST" else None
         if row and (parse_note or len(data) > LIMIT):
             row["notes"].append(parse_note or "request_observation_limit_exceeded")
             self.journal.save(row)
@@ -470,6 +495,11 @@ class Proxy:
                     row["duration_ms"] = round((time.monotonic() - start) * 1000)
                     self.journal.finish(row, "error" if upstream.status >= 400 else "finished")
                 return downstream
+        except ProviderCredentialsError:
+            if row:
+                row['notes'].append('cc_credentials_unavailable_or_upstream_changed')
+                self.journal.finish(row, 'error')
+            return web.json_response({'error': {'type': 'wiretap_credentials_error', 'message': '无法读取原供应商有效凭据，或上游地址已改变。检查 CC Switch 原供应商；更换上游地址后需重新加载服务。'}}, status=502)
         except (aiohttp.ClientError, OSError, asyncio.TimeoutError):
             if row:
                 row["notes"].append("transport_error")
@@ -488,14 +518,19 @@ class Proxy:
 
     async def websocket(self, request, target):
         endpoint = "responses" if request.path.rstrip("/").endswith("/responses") else "other"
-        observer = WSObserver(self.journal, endpoint)
+        observer = WSObserver(self.journal, endpoint, request.headers)
         protocols = [p.strip() for p in request.headers.get("Sec-WebSocket-Protocol", "").split(",") if p.strip()]
         try:
             upstream = await self.session.ws_connect(target, headers=self.upstream_headers(request, True), proxy=self.outbound_proxy,
                                                      protocols=protocols, compress=0, autoping=False, max_msg_size=64 * 1024 * 1024)
+        except ProviderCredentialsError:
+            row = self.journal.new({}, 'WebSocket', endpoint, request.headers)
+            row['notes'].append('cc_credentials_unavailable_or_upstream_changed')
+            self.journal.finish(row, 'error')
+            return web.Response(status=502, text='无法读取原供应商有效凭据，或上游地址已改变')
         except aiohttp.WSServerHandshakeError as error:
             # Preserve status (e.g. 426) so Codex can fall back to HTTP.
-            row = self.journal.new({}, "WebSocket", endpoint)
+            row = self.journal.new({}, "WebSocket", endpoint, request.headers)
             row["http_status"] = error.status
             row["notes"].append("websocket_handshake_rejected")
             self.journal.finish(row, "error")
@@ -612,7 +647,8 @@ def settings(args):
 
 def cc_provider(provider_id, db_path=None):
     db_path = Path(db_path or Path.home() / '.cc-switch/cc-switch.db')
-    with sqlite3.connect(db_path.as_uri() + '?mode=ro', uri=True) as db:
+    with closing(sqlite3.connect(db_path.resolve().as_uri() + '?mode=ro', uri=True, timeout=.1)) as db:
+        db.execute('PRAGMA query_only=ON')
         row = db.execute("SELECT settings_config FROM providers WHERE id=? AND app_type='codex'", (provider_id,)).fetchone()
         if not row:
             raise ValueError('CC Switch 供应商不存在')
@@ -631,8 +667,9 @@ async def run(args):
     if args.cc_provider_id:
         args.upstream, key = cc_provider(args.cc_provider_id)
     config, upstream, base = settings(args)
-    journal = Journal(args.log)
-    proxy = Proxy(upstream, journal, args.config, args.profile, api_key=key, outbound_proxy=args.outbound_proxy)
+    journal = Journal(args.log, ConversationIndex(args.codex_home, titles=not args.no_conversation_titles))
+    key_loader = CCKeyLoader(args.cc_provider_id, upstream) if args.cc_provider_id else None
+    proxy = Proxy(upstream, journal, args.config, args.profile, api_key=key if not key_loader else None, outbound_proxy=args.outbound_proxy, key_loader=key_loader)
     runner = web.AppRunner(proxy.app(), access_log=None, auto_decompress=False, handler_cancellation=True)
     await runner.setup()
     try:
@@ -673,6 +710,8 @@ def main():
     parser.add_argument("--cc-provider-id", help="只读加载 CC Switch 原供应商的 HTTPS 上游与 API Key，不在日志中输出 Key")
     parser.add_argument("--outbound-proxy", help="显式指定连接外部上游的 HTTP 代理，与模型网关不同")
     parser.add_argument("--port", type=int, default=10812)
+    parser.add_argument("--codex-home", type=Path, help="用于只读查询对话标题的 Codex 数据目录，默认 CODEX_HOME 或 ~/.codex")
+    parser.add_argument("--no-conversation-titles", action='store_true', help="仅展示对话 ID 和链接，不读取本地标题或项目名")
     parser.add_argument("--log", type=Path, default=ROOT / "data" / "capture.jsonl")
     sub = parser.add_subparsers(dest="action", required=True)
     sub.add_parser("serve", help="启动代理和实时页面，Ctrl+C 停止")

@@ -2,18 +2,133 @@
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Codex 请求监测</title><style>
 :root{color-scheme:light;font:15px/1.6 system-ui,-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;color:#17312f;background:#f3f5f3}*{box-sizing:border-box}body{margin:0}main{max-width:1440px;margin:0 auto;padding:44px 32px}header{display:flex;justify-content:space-between;align-items:center;gap:24px}h1{font-size:30px;margin:0 0 8px;letter-spacing:-.7px}p{margin:4px 0;color:#62736d}.status{border:1px solid #b7d1c4;background:#e7f3ec;color:#236442;padding:7px 14px;border-radius:24px;white-space:nowrap;font-size:13px}.status.off{background:#fff0e5;border-color:#ebc5a8;color:#8b451e}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin:30px 0 22px}.card{background:#fff;border:1px solid #dce4de;border-radius:12px;padding:20px}.card span{color:#667970;font-size:13px}.card strong{display:block;font-size:30px;margin:4px 0}.notice{padding:17px 20px;background:#e8eeea;border-radius:10px;color:#40564b;margin-bottom:26px;font-size:14px}.notice strong{color:#234539}.toolbar{display:flex;justify-content:space-between;align-items:center;gap:16px;margin:16px 0}h2{font-size:18px;margin:0}select{border:1px solid #cad7cd;border-radius:7px;padding:8px;background:white;color:inherit}.table{overflow:auto;background:#fff;border:1px solid #dce4de;border-radius:12px}table{border-collapse:collapse;width:100%;white-space:nowrap;font-size:14px}th{text-align:left;color:#62776a;font-size:12px;font-weight:600;background:#f9fbf9}td,th{padding:17px 16px;border-bottom:1px solid #e8ede8}tbody tr:last-child td{border:0}td small{display:block;color:#75817a;font-size:11px;margin-top:3px}code{font:12px ui-monospace,SFMono-Regular,monospace}.same{color:#227149}.different{color:#a74920;font-weight:600}.unknown{color:#78847d}.badge{display:inline-block;border-radius:4px;padding:2px 6px;background:#edf2ee;font-size:11px}.empty{text-align:center;padding:72px 28px;color:#667a70}.empty b{display:block;color:#345248;font-size:17px;margin-bottom:9px}footer{font-size:12px;color:#75847a;margin-top:18px}a{color:#2e6b52}#upstream{font-family:ui-monospace,monospace;font-size:12px;overflow-wrap:anywhere}@media(max-width:800px){main{padding:24px 16px}.cards{grid-template-columns:repeat(2,1fr)}header{align-items:flex-start;flex-direction:column}.card{padding:14px}h1{font-size:25px}}
-</style></head><body><main>
+.conversation-cell{min-width:210px;max-width:280px;white-space:normal}.conversation-title{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-weight:600;text-decoration:none}.conversation-title:hover{text-decoration:underline}.conversation-cell small{overflow-wrap:anywhere}.toolbar{flex-wrap:wrap}.conversation-controls{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}.conversation-controls input{padding:9px 12px;border:1px solid #cad7cd;border-radius:7px;min-width:230px;color:inherit;background:#fff}.conversation-help{font-size:12px;margin:0 0 14px}.conversation-empty{color:#78847d;font-size:13px}</style></head><body><main>
 <header><div><h1>Codex 请求监测</h1><p>对照请求参数与上游返回字段，区分配置、声明和可验证事实。</p><p id="upstream">正在读取上游地址</p></div><span id="status" class="status">正在连接</span></header>
 <p id="connection" role="status" style="margin-top:18px">正在检查 Codex 是否接入代理</p>
 <div class="cards"><div class="card"><span>捕获请求</span><strong id="total">0</strong></div><div class="card"><span>模型名称不同</span><strong id="models">0</strong></div><div class="card"><span>强度字段不同</span><strong id="efforts">0</strong></div><div class="card"><span>有推理 token 数据</span><strong id="usage">0</strong></div></div>
 <div class="notice"><strong>“响应模型”和“响应强度”都是上游声明。</strong>经过第三方网关时，这些字段可以被改写，不能据此独立证明后端实际执行了哪个模型或强度。模型名称不同也可能来自别名解析。推理 token 数表示返回的用量，不能换算成 high、ultra 等强度。未返回的数据保留为未知。</div>
 <div class="toolbar"><h2>实时请求对照</h2><button id="recording" style="padding:9px 16px;border:1px solid #96b8a4;border-radius:7px;background:#fff;color:#17312f;cursor:pointer">读取记录状态</button><select id="filter" aria-label="筛选请求"><option value="all">全部请求</option><option value="different">字段不同</option><option value="unknown">响应字段缺失</option></select></div>
-<div class="table"><table><thead><tr><th>时间 / 协议</th><th>请求模型</th><th>响应模型</th><th>请求强度</th><th>响应强度</th><th>推理 tokens</th><th>状态</th></tr></thead><tbody id="rows"></tbody></table><div class="empty" id="empty"><b>等待 Codex 请求经过代理</b>仅启动页面不会截获已有连接。将 Codex 的 provider 地址接到本地代理后，发起一轮新请求。<br>已经运行的客户端可能需要重新加载配置。</div></div>
+<div class="conversation-controls"><select id="conversation-filter" aria-label="按对话筛选"><option value="all">全部对话</option></select><input id="conversation-search" type="search" aria-label="搜索对话标题、项目或 ID" placeholder="搜索对话标题、项目或 ID"><span id="shown-count"></span></div><p class="conversation-help">点击对话标题可在 Codex 中打开。标题从本机只读查询，不写入抓包日志；无标识的历史记录无法补归属。</p><div class="table"><table><thead><tr><th>时间 / 协议</th><th>对话</th><th>请求模型</th><th>响应模型</th><th>请求强度</th><th>响应强度</th><th>推理 tokens</th><th>状态</th></tr></thead><tbody id="rows"></tbody></table><div class="empty" id="empty"><b>等待 Codex 请求经过代理</b>仅启动页面不会截获已有连接。将 Codex 的 provider 地址接到本地代理后，发起一轮新请求。<br>已经运行的客户端可能需要重新加载配置。</div></div>
 <footer>每 1 秒刷新。页面展示本次进程最近 300 条记录，完整元数据保存在本地 JSONL。<a href="https://developers.openai.com/codex/config-reference/" target="_blank" rel="noreferrer">Codex 配置文档</a> · <a href="https://developers.openai.com/api/reference/resources/responses/methods/create" target="_blank" rel="noreferrer">Responses 字段文档</a></footer>
 </main><script>
-let records=[],recording=true;const $=id=>document.getElementById(id);const present=v=>v===null||v===undefined?'未知':String(v);
-const phases={request:'已发送',response:'接收中',finished:'已结束',error:'错误',disconnected:'连接中断',unpaired:'无法配对'};
-function cell(row,text,cls,sub){const el=document.createElement('td');el.textContent=text;if(cls)el.className=cls;if(sub){const s=document.createElement('small');s.textContent=sub;el.append(s)}row.append(el)}
-function render(){const filter=$('filter').value;const shown=records.filter(r=>filter==='all'||filter==='different'&&(r.model_comparison==='different'||r.effort_comparison==='different')||filter==='unknown'&&(!r.response.model||!r.response.reasoning_effort));$('rows').replaceChildren();for(const r of shown){const tr=document.createElement('tr');const a=r.request,b=r.response;cell(tr,new Date(r.time).toLocaleTimeString('zh-CN',{hour12:false}),null,r.transport);cell(tr,present(a.model),null,r.id);cell(tr,present(b.model),r.model_comparison);cell(tr,a.reasoning_effort??'未发送');cell(tr,b.reasoning_effort??'未返回',r.effort_comparison);cell(tr,present(b.reasoning_tokens),b.reasoning_tokens==null?'unknown':'',`输出 tokens ${present(b.output_tokens)}`);cell(tr,phases[r.phase]||r.phase,null,`HTTP ${r.http_status??'—'}${r.notes.length?' · 有观测限制':''}`);tr.title=r.notes.join(', ');$('rows').append(tr)}$('empty').hidden=shown.length>0;if(records.length&&!shown.length){$('empty').textContent='没有符合筛选条件的记录。'}$('total').textContent=records.length;$('models').textContent=records.filter(r=>r.model_comparison==='different').length;$('efforts').textContent=records.filter(r=>r.effort_comparison==='different').length;$('usage').textContent=records.filter(r=>r.response.reasoning_tokens!=null).length}
-async function refresh(){try{const r=await fetch('/__wiretap__/api/records',{cache:'no-store'});if(!r.ok)throw Error();const d=await r.json();records=d.records;recording=d.recording!==false;$('recording').textContent=recording?'暂停记录（保持转发）':'开始记录';$('upstream').textContent=`上游 ${d.upstream}`;$('status').textContent=!recording?'转发保持开启 · 记录已暂停':records.length?'● 已捕获模型请求':'服务运行中 · 尚无模型请求';$('status').className=records.length?'status':'status off';const c=d.connection||{};$('connection').textContent=c.configured===true?'磁盘配置已指向代理。正在运行的客户端或旧会话仍可能使用旧地址，以新捕获记录为准。':c.configured===false?`当前客户端地址 ${c.configured_host||'未知'}:${c.configured_port||'默认端口'}，未直接指向本代理。通过 CC Switch 转发时这是正常情况，以捕获到的新请求为准；无需为此反复修改配置。`:'无法读取 Codex 配置，尚不能确认接入状态。';render()}catch(e){$('status').textContent='监测服务未连接';$('status').className='status off';$('connection').textContent='无法连接监测服务。'}finally{setTimeout(refresh,1000)}}$('filter').addEventListener('change',render);$('recording').addEventListener('click',async()=>{const b=$('recording');b.disabled=true;try{const r=await fetch('/__wiretap__/api/recording',{method:'POST',headers:{'Content-Type':'application/json','X-Wiretap-Control':'1'},body:JSON.stringify({enabled:!recording})});if(!r.ok)throw Error();recording=(await r.json()).recording;b.textContent=recording?'暂停记录（保持转发）':'开始记录'}catch(e){b.textContent='操作失败，请重试'}finally{b.disabled=false}});if(location.protocol==='file:'){document.getElementById('status').textContent='这是离线文件，无法监测';document.getElementById('connection').innerHTML='<a href="http://127.0.0.1:10812/__wiretap__/">点击打开运行中的监测面板</a>';}else{refresh();}
+let records = [], recording = true;
+const $ = id => document.getElementById(id);
+const present = v => v == null ? '未知' : String(v);
+const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+const phases = {request:'已发送',response:'接收中',finished:'已结束',error:'错误',disconnected:'连接中断',unpaired:'无法配对'};
+const shortId = id => `${id.slice(0,8)}…${id.slice(-6)}`;
+function cell(row, text, cls, sub) {
+  const el = document.createElement('td');
+  el.textContent = text;
+  if (cls) el.className = cls;
+  if (sub) {const s = document.createElement('small'); s.textContent = sub; el.append(s);}
+  row.append(el);
+  return el;
+}
+function conversationCell(row, conversation) {
+  const c = conversation || {}, id = uuid.test(c.id || '') ? c.id : null;
+  const el = cell(row, '', 'conversation-cell');
+  if (id) {
+    const link = document.createElement('a');
+    link.href = `codex://threads/${id}`;
+    link.className = 'conversation-title';
+    link.textContent = c.title || `对话 ${shortId(id)}`;
+    link.title = `${c.title || '本地标题暂不可用'}\n${id}`;
+    el.append(link);
+    const detail = document.createElement('small');
+    detail.textContent = [c.project, shortId(id)].filter(Boolean).join(' · ');
+    el.append(detail);
+    if (!c.title) {const hint = document.createElement('small'); hint.textContent = '本地标题暂不可用'; el.append(hint);}
+  } else {
+    el.classList.add('conversation-empty');
+    el.textContent = c.status === 'ambiguous' ? '会话标识冲突' : c.status === 'legacy' ? '旧记录无会话标识' : '未识别对话';
+  }
+}
+function syncConversations() {
+  const select = $('conversation-filter'), previous = select.value;
+  const known = new Map();
+  for (const row of records) {
+    const c = row.conversation || {};
+    if (uuid.test(c.id || '')) known.set(c.id, c);
+  }
+  const options = [{id:'all', name:'全部对话'}, {id:'unidentified', name:'未识别 / 旧记录'}];
+  for (const [id,c] of known) options.push({id, name:`${c.title || '未命名对话'} (${shortId(id)})`});
+  select.replaceChildren(...options.map(item => {
+    const option = document.createElement('option'); option.value = item.id; option.textContent = item.name; return option;
+  }));
+  // Keep a selected thread even if its last row aged out of the 300-record window.
+  if (previous && !options.some(o => o.id === previous)) {
+    const option = document.createElement('option'); option.value = previous;
+    option.textContent = `已筛选 ${uuid.test(previous) ? shortId(previous) : previous}`; select.append(option);
+  }
+  select.value = previous || 'all';
+}
+function render() {
+  const filter = $('filter').value, selected = $('conversation-filter').value;
+  const query = $('conversation-search').value.trim().toLocaleLowerCase();
+  const shown = records.filter(r => {
+    const c = r.conversation || {};
+    const fieldMatch = filter === 'all' || filter === 'different' && (r.model_comparison === 'different' || r.effort_comparison === 'different') || filter === 'unknown' && (!r.response.model || !r.response.reasoning_effort);
+    const threadMatch = selected === 'all' || selected === 'unidentified' && !c.id || c.id === selected;
+    const textMatch = !query || [c.title,c.project,c.id].filter(Boolean).join(' ').toLocaleLowerCase().includes(query);
+    return fieldMatch && threadMatch && textMatch;
+  });
+  const fragment = document.createDocumentFragment();
+  for (const r of shown) {
+    const tr = document.createElement('tr'), a = r.request, b = r.response;
+    cell(tr, new Date(r.time).toLocaleTimeString('zh-CN',{hour12:false}), null, r.transport);
+    conversationCell(tr, r.conversation);
+    cell(tr, present(a.model), null, r.id);
+    cell(tr, present(b.model), r.model_comparison);
+    cell(tr, a.reasoning_effort ?? '未发送');
+    cell(tr, b.reasoning_effort ?? '未返回', r.effort_comparison);
+    cell(tr, present(b.reasoning_tokens), b.reasoning_tokens == null ? 'unknown' : '', `输出 tokens ${present(b.output_tokens)}`);
+    cell(tr, phases[r.phase] || r.phase, null, `HTTP ${r.http_status ?? '—'}${r.notes.length ? ' · 有观测限制' : ''}`);
+    tr.title = r.notes.join(', '); fragment.append(tr);
+  }
+  $('rows').replaceChildren(fragment);
+  $('empty').hidden = shown.length > 0;
+  $('empty').textContent = records.length ? '没有符合筛选条件的记录。' : '等待 Codex 新请求经过代理。已有连接可能仍使用旧配置。';
+  $('shown-count').textContent = `显示 ${shown.length} / ${records.length} 条`;
+  $('total').textContent = records.length;
+  $('models').textContent = records.filter(r => r.model_comparison === 'different').length;
+  $('efforts').textContent = records.filter(r => r.effort_comparison === 'different').length;
+  $('usage').textContent = records.filter(r => r.response.reasoning_tokens != null).length;
+}
+function recordingStatus() {
+  $('recording').textContent = recording ? '暂停记录（保持转发）' : '开始记录';
+  $('status').textContent = !recording ? '转发保持开启 · 记录已暂停' : records.length ? '● 已捕获模型请求' : '服务运行中 · 尚无模型请求';
+  $('status').className = recording && records.length ? 'status' : 'status off';
+}
+async function refresh() {
+  try {
+    const r = await fetch('/__wiretap__/api/records',{cache:'no-store'});
+    if (!r.ok) throw Error();
+    const d = await r.json(); records = d.records; recording = d.recording !== false;
+    $('upstream').textContent = `上游 ${d.upstream}`;
+    recordingStatus();
+    const c = d.connection || {};
+    $('connection').textContent = c.configured === true ? '磁盘配置已指向代理。正在运行的客户端或旧会话仍可能使用旧地址，以新捕获记录为准。' : c.configured === false ? `当前客户端地址 ${c.configured_host || '未知'}:${c.configured_port || '默认端口'}，未直接指向本代理。通过 CC Switch 转发时这是正常情况，以捕获到的新请求为准。` : '无法读取 Codex 配置，尚不能确认接入状态。';
+    syncConversations(); render();
+  } catch(e) {
+    $('status').textContent = '监测服务未连接'; $('status').className = 'status off';
+    $('connection').textContent = '无法连接监测服务。';
+  } finally {setTimeout(refresh,1000);}
+}
+$('filter').addEventListener('change', render);
+$('conversation-filter').addEventListener('change', render);
+$('conversation-search').addEventListener('input', render);
+$('recording').addEventListener('click', async () => {
+  const button = $('recording'); button.disabled = true;
+  try {
+    const r = await fetch('/__wiretap__/api/recording', {method:'POST', headers:{'Content-Type':'application/json','X-Wiretap-Control':'1'}, body:JSON.stringify({enabled:!recording})});
+    if (!r.ok) throw Error();
+    recording = (await r.json()).recording; recordingStatus();
+  } catch(e) {button.textContent = '操作失败，请重试';}
+  finally {button.disabled = false;}
+});
+if (location.protocol === 'file:') {
+  $('status').textContent = '这是离线文件，无法监测';
+  $('connection').innerHTML = '<a href="http://127.0.0.1:10812/__wiretap__/">点击打开运行中的监测面板</a>';
+} else {refresh();}
 </script></body></html>
