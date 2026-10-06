@@ -11,7 +11,7 @@
 <div class="conversation-controls"><select id="conversation-filter" aria-label="按对话筛选"><option value="all">全部对话</option></select><input id="conversation-search" type="search" aria-label="搜索对话标题、项目或 ID" placeholder="搜索对话标题、项目或 ID"><span id="shown-count"></span></div><p class="conversation-help">点击对话标题可在 Codex 中打开。标题从本机只读查询，不写入抓包日志；无标识的历史记录无法补归属。</p><div class="table"><table><thead><tr><th>时间 / 协议</th><th>对话</th><th>请求模型</th><th>响应模型</th><th>请求强度</th><th>响应强度</th><th>推理 tokens</th><th>状态</th></tr></thead><tbody id="rows"></tbody></table><div class="empty" id="empty"><b>等待 Codex 请求经过代理</b>仅启动页面不会截获已有连接。将 Codex 的 provider 地址接到本地代理后，发起一轮新请求。<br>已经运行的客户端可能需要重新加载配置。</div></div>
 <footer>每 1 秒刷新。页面展示本次进程最近 300 条记录，完整元数据保存在本地 JSONL。<a href="https://developers.openai.com/codex/config-reference/" target="_blank" rel="noreferrer">Codex 配置文档</a> · <a href="https://developers.openai.com/api/reference/resources/responses/methods/create" target="_blank" rel="noreferrer">Responses 字段文档</a></footer>
 </main><script>
-let records = [], recording = true;
+let records = [], recording = true, conversationOptionsSignature = null;
 const $ = id => document.getElementById(id);
 const present = v => v == null ? '未知' : String(v);
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
@@ -52,7 +52,10 @@ function syncConversations() {
     if (uuid.test(c.id || '')) known.set(c.id, c);
   }
   const options = [{id:'all', name:'全部对话'}, {id:'unidentified', name:'未识别 / 旧记录'}];
-  for (const [id,c] of known) options.push({id, name:`${c.title || '未命名对话'} (${shortId(id)})`});
+  for (const [id,c] of [...known].sort(([a],[b]) => a.localeCompare(b))) options.push({id, name:`${(c.title || '未命名对话').slice(0,64)} (${shortId(id)})`});
+  const signature = JSON.stringify(options);
+  if (signature === conversationOptionsSignature) return;
+  conversationOptionsSignature = signature;
   select.replaceChildren(...options.map(item => {
     const option = document.createElement('option'); option.value = item.id; option.textContent = item.name; return option;
   }));
