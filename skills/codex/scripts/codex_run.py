@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Delegate a task from Claude Code to the Codex CLI and print a summary for review. Python 3.9+.
+"""从 Claude Code 把任务派给 Codex CLI，并打印供审核的摘要。需要 Python 3.9+。
 
-usage:
-  codex_run.py new <workdir> <brief.md> [extra writable dir ...]
-  codex_run.py review <brief.md>
-  codex_run.py resume <run dir> <follow-up.md>
+用法
+  codex_run.py new <工作目录> <任务说明.md> [额外可写目录...]   画图与执行任务
+  codex_run.py review <审查说明.md>                             定理与理论审查，在独立 workspace 中运行
+  codex_run.py resume <运行目录> <返工说明.md>                  续接同一会话返工
 """
 from __future__ import annotations
 
