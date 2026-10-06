@@ -255,7 +255,7 @@ cp -R skills/codex ~/.claude/skills/
 
 需要固定子代理使用的模型或思考强度时，把 `~/.claude/skills/codex/.env.example` 复制为同目录的 `.env` 并填写。未设置时沿用 Codex 的 `config.toml`。
 
-在 Claude Code 中输入 `/codex <任务描述>`，或在对话中说“让 codex 画这张图”。Claude 写好任务说明后在后台调用 `skills/codex/scripts/codex_run.py`，三种模式如下。
+skill 只在用户明确要求时调用，Claude 不会自行派发。在 Claude Code 中输入 `/codex <任务描述>`，或在对话中明确说“让 codex 画这张图”，Claude 写好任务说明后在后台调用 `skills/codex/scripts/codex_run.py`，三种模式如下。
 
 | 模式 | 用途 | Codex 可写范围 |
 | --- | --- | --- |
