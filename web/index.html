@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="referrer" content="no-referrer">
+  <title>Pool Router · 号池路由</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Pool Router 首页"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span><span>Pool Router<small>本地号池路由</small></span></a>
+      <div class="header-actions"><span class="live-status" id="service-status"><span class="status-dot"></span><span id="service-status-text">连接中</span></span><button class="button button-secondary" id="sync-button" type="button"><span aria-hidden="true">↻</span> 同步 BiWrite</button><button class="button button-primary" id="connect-button" type="button">直接接入 Codex</button></div>
+    </header>
+
+    <main>
+      <section class="intro"><div><div class="eyebrow">ANYROUTER WORKSPACE</div><h1>让每个号池都用起来。</h1><p>Codex → Pool Router → Anyrouter。按会话分配，实时查看路由与请求状态。</p></div><div class="endpoint-chip"><span class="endpoint-label">本地接入地址</span><div><code id="base-url">等待连接</code><button class="icon-button" id="copy-url" type="button" aria-label="复制本地接入地址" title="复制接入地址">⧉</button></div></div></section>
+
+      <div class="alert alert-error" id="connection-error" role="alert" hidden></div>
+      <div class="alert alert-note" id="connection-note" hidden></div>
+      <details id="legacy-integration" class="legacy-integration"><summary>兼容 CC Switch 监控 <span class="legacy-brand">Codex Wiretap</span><span id="legacy-status" class="badge badge-neutral">等待状态</span></summary><div class="legacy-integration-body"><p>只需接入一次，将 CC Switch 供应商接到本地入口。以后照旧在 CC Switch 修改 Key，Pool Router 按收到的 Key 和模型转发并记录元数据，不自动换号，也无须把 Key 复制到这里。</p><p class="legacy-path">Codex → CC Switch → Pool Router → Anyrouter</p><p class="legacy-scope" id="legacy-scope">仅能监控经过本地入口的请求，无法查看未经过代理的 HTTPS 流量。</p><div class="legacy-actions"><button class="button button-secondary" id="legacy-connect-button" type="button">接入旧方式监控</button><button class="button button-secondary" id="legacy-restore-button" type="button">恢复旧方式接入前配置</button></div></div></details>
+
+      <section class="stats-grid" aria-label="运行概况">
+        <article class="stat-card"><span class="stat-label">可调度号池</span><div class="stat-main"><strong id="stat-ready">—</strong><span id="stat-total">/ — 个</span></div><span class="stat-foot" id="stat-verified">等待号池状态</span></article>
+        <article class="stat-card"><span class="stat-label">进行中</span><div class="stat-main"><strong id="stat-active">—</strong><span>个请求</span></div><span class="stat-foot">多会话分散使用空闲号池</span></article>
+        <article class="stat-card"><span class="stat-label">已完成请求</span><div class="stat-main"><strong id="stat-requests">—</strong><span>次</span></div><span class="stat-foot" id="stat-results">尚无代理请求</span></article>
+        <article class="stat-card"><span class="stat-label">运行时长</span><div class="stat-main"><strong class="stat-time" id="stat-uptime">—</strong></div><span class="stat-foot" id="stat-version">本地服务</span></article>
+      </section>
+
+      <div class="workspace-header"><nav class="tabs" role="tablist" aria-label="控制台页面"><button class="tab active" id="tab-accounts" role="tab" aria-controls="panel-accounts" aria-selected="true" data-tab="accounts" type="button">号池<span id="account-count" class="count">0</span></button><button class="tab" id="tab-routing" role="tab" aria-controls="panel-routing" aria-selected="false" tabindex="-1" data-tab="routing" type="button">路由设置</button><button class="tab" id="tab-monitor" role="tab" aria-controls="panel-monitor" aria-selected="false" tabindex="-1" data-tab="monitor" type="button">请求监控</button></nav><span class="poll-hint"><span class="status-dot"></span>每 2 秒更新</span></div>
+
+      <section id="panel-accounts" role="tabpanel" aria-labelledby="tab-accounts" class="tab-panel">
+        <div class="panel-heading"><div><h2 id="source-heading">BiWrite 保活候选</h2><p id="source-description">每 1.5 秒自动读取 BiWrite 候选号池，无须复制 Key。可用性以探测或实际代理请求的结果为准。</p></div><div class="source-heading-actions"><div class="source-time" id="source-time">等待首次同步</div><button class="button button-secondary button-small" id="manage-sources" type="button">来源与手动池</button></div></div>
+        <div class="alert alert-warning" id="source-warning" hidden></div>
+        <div id="accounts-empty" class="empty-state" hidden><span class="empty-symbol" aria-hidden="true">▦</span><h3 id="accounts-empty-title">还没有同步到号池</h3><p id="accounts-empty-description">先在 BiWrite 配置 AnyRouter 并运行保活，Pool Router 每 1.5 秒自动读取候选号池，无须复制 Key。也可点击「同步 BiWrite」立即重新读取。</p></div>
+        <div class="account-grid" id="account-list" aria-live="off"></div>
+        <div class="info-strip"><span class="info-icon" aria-hidden="true">i</span><p>默认按会话固定号池，不同会话分散到其他空闲号池。同一号池按模型分别记录并发与冷却，其他模型可独立使用。</p></div>
+      </section>
+
+      <section id="panel-routing" role="tabpanel" aria-labelledby="tab-routing" class="tab-panel" hidden>
+        <div class="panel-heading"><div><h2>配置一次，持续使用</h2><p>Codex 直接接入 Pool Router 后，以下路由设置会对后续请求生效。</p></div><span id="dirty-label" class="badge badge-amber" hidden>有未保存的修改</span></div>
+        <form id="routing-form">
+          <section class="source-settings"><div class="source-settings-heading"><div><h3>号池来源</h3><p>选择账号从哪里读取；下方路由策略单独决定如何分配请求。</p></div><button class="button button-secondary button-small" id="open-manual-editor" type="button">管理手动池</button></div><fieldset class="strategy-fieldset"><legend class="sr-only">号池来源模式</legend><div class="source-options"><label class="strategy-option"><input type="radio" name="source_mode" value="biwrite" checked><span><strong>自动读取 BiWrite</strong><small>默认每 1.5 秒自动同步，无须复制 Key</small></span><em>默认</em></label><label class="strategy-option"><input type="radio" name="source_mode" value="manual"><span><strong>手动维护号池</strong><small>使用本地自定义池，可配合自动路由策略</small></span></label></div></fieldset><p class="source-mode-hint" id="source-mode-hint">来源切换在保存设置后生效。自动来源也可以使用「指定号池」。</p></section>
+          <section class="legacy-settings"><label class="switch-row"><span><strong>允许旧方式监控</strong><small>默认开启。关闭后拒绝 CC Switch 传来的上游 Key，不影响使用本地令牌的号池模式。</small></span><input id="legacy-monitor-enabled" name="legacy_monitor_enabled" type="checkbox" role="switch" checked><span class="switch-track" aria-hidden="true"></span></label></section>
+          <div class="settings-grid">
+            <section class="settings-card"><div class="section-number">01</div><h3>号池分配</h3><p class="section-description">选择会话与号池的对应方式。</p>
+              <fieldset class="strategy-fieldset"><legend class="sr-only">路由策略</legend><div class="strategy-options">
+                <label class="strategy-option"><input type="radio" name="strategy" value="sticky"><span><strong>会话固定</strong><small>优先复用同一号池，新会话分散分配</small></span><em>推荐</em></label>
+                <label class="strategy-option"><input type="radio" name="strategy" value="random"><span><strong>随机选择</strong><small>每个请求随机选择一个可调度号池</small></span></label>
+                <label class="strategy-option"><input type="radio" name="strategy" value="round_robin"><span><strong>轮流使用</strong><small>在可调度号池之间依次分配请求</small></span></label>
+                <label class="strategy-option"><input type="radio" name="strategy" value="pinned"><span><strong>指定号池</strong><small>手动指定优先使用的号池</small></span></label>
+              </div></fieldset>
+              <label class="field" id="pinned-field" hidden><span>指定号池</span><select id="pinned-key" name="pinned_key"><option value="">请选择号池</option></select></label>
+            </section>
+            <section class="settings-card"><div class="section-number">02</div><h3>模型与推理</h3><p class="section-description">保留 Codex 选择，或在本地统一覆盖。</p>
+              <label class="field"><span>请求模型</span><select id="model-override" name="model_override"><option value="">跟随 Codex</option></select><small>覆盖后，请求中的模型名称会改为所选模型。</small></label>
+              <label class="field"><span>推理强度</span><select id="reasoning-override" name="reasoning_override"><option value="">跟随 Codex</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option><option value="ultra">ultra</option></select><small>上游是否支持该强度，取决于模型和供应商。</small></label>
+              <div class="subtle-note">监控中的「返回模型」是供应商声明的字段，不能独立证明底层模型身份。</div>
+            </section>
+            <section class="settings-card"><div class="section-number">03</div><h3>并发与重试</h3><p class="section-description">限制单个号池的负载，容忍上游临时失败。</p>
+              <div class="field-pair"><label class="field"><span>每号每模型并发</span><input id="max-concurrency" name="max_concurrency_per_key" type="number" min="1" max="128" step="1" required value="1"></label><label class="field"><span>最多尝试次数</span><input id="max-attempts" name="max_attempts" type="number" min="1" max="100" step="1" required value="20"></label></div>
+              <div class="field-pair"><label class="field"><span>排队上限（秒）</span><input id="queue-timeout" name="queue_timeout" type="number" min="1" max="3600" step="1" required value="120"></label><label class="field"><span>账号总并发</span><input id="shared-concurrency" name="shared_account_concurrency" type="number" min="0" max="128" step="1" required value="0"><small>0 表示不额外限制。</small></label></div>
+              <label class="switch-row"><span><strong>记录请求元数据</strong><small>记录路由、耗时、用量与重试结果</small></span><input id="recording-enabled" name="recording_enabled" type="checkbox" role="switch"><span class="switch-track" aria-hidden="true"></span></label>
+              <div class="subtle-note">同一号池的不同模型独立计算并发与冷却。控制台仅展示请求元数据。已开始向客户端输出的请求不能无损重放。</div>
+            </section>
+          </div>
+          <div class="save-bar"><p id="save-hint">设置由本地服务保存。</p><div><button class="button button-secondary" id="discard-settings" type="button" disabled>撤销修改</button><button class="button button-primary" id="save-settings" type="submit" disabled>保存设置</button></div></div>
+        </form>
+        <details id="manual-editor" class="manual-editor"><summary>手动池管理 <span id="manual-count" class="count">0</span><span class="manual-summary-note">可提前维护，保存来源设置后才会切换</span></summary><div class="manual-editor-body"><p class="manual-explanation" id="manual-effect-note">当前使用自动来源时，增删手动池不会改变当前路由。相同 Key 再次提交会更新该账号。</p><div class="alert alert-warning" id="manual-error" hidden></div><form id="manual-form" autocomplete="off"><div class="manual-form-grid"><label class="field"><span>AnyRouter Key</span><input id="manual-key" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required placeholder="仅提交给本机，不回显已存 Key"><small>添加或更新均需输入 Key，成功后清空。</small></label><label class="field"><span>模型 ID</span><input id="manual-models" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" required placeholder="gpt-6-astra, gpt-6.1-sol"><small>多个模型用逗号分隔。</small></label><label class="field"><span>昵称（可选）</span><input id="manual-label" type="text" autocomplete="off" maxlength="120" placeholder="例如：备用账号"></label><label class="field"><span>每模型并发上限</span><input id="manual-concurrency" type="number" min="1" max="128" step="1" value="1" required></label></div><div class="manual-form-actions"><span>Key 不写入浏览器存储，只保存到本机手动池。</span><button id="save-manual-account" class="button button-primary" type="submit">添加或更新账号</button></div></form><div class="manual-list" id="manual-list"></div><div class="subtle-note" id="manual-empty">手动池尚未添加账号。空池不能切换为手动来源。</div><p class="manual-delete-note">删除会立即移除手动池账号。若当前指定该账号，不会自动改用其他账号。</p></div></details>
+        <div class="info-strip"><span class="info-icon" aria-hidden="true">i</span><p>切换同一供应商的号池，不代表上下文不再传输。上下文是否重传取决于请求协议与会话状态；缓存命中取决于上游实现。监控会分别显示输入规模和缓存 token。</p></div>
+      </section>
+
+      <section id="panel-monitor" role="tabpanel" aria-labelledby="tab-monitor" class="tab-panel" hidden>
+        <div class="panel-heading"><div><h2>请求经过哪里，一目了然</h2><p>查看请求分配、重试和用量。点击一条记录可查看详情。</p></div><span id="recording-status" class="badge badge-neutral">记录状态未知</span></div>
+        <div class="monitor-toolbar"><label class="filter-field"><span>模型</span><select id="filter-model"><option value="">全部模型</option></select></label><label class="filter-field filter-search"><span>对话 ID</span><input id="filter-conversation" type="search" placeholder="搜索对话 ID" autocomplete="off"></label><label class="filter-field"><span>状态</span><select id="filter-status"><option value="">全部状态</option><option value="success">成功</option><option value="failure">失败</option><option value="active">进行中</option></select></label><label class="filter-field filter-tier"><span>服务档位</span><select id="filter-tier"><option value="">全部档位</option><option value="fast">Fast 请求</option><option value="fast_to_normal">请求 Fast、响应普通</option><option value="unknown">未知或未确认</option></select></label><button class="button button-secondary" id="refresh-records" type="button">刷新</button></div>
+        <div class="alert alert-warning" id="records-error" hidden></div>
+        <div class="table-wrap"><table class="records-table"><thead><tr><th scope="col">时间 / 对话</th><th scope="col">模型 / 推理强度</th><th scope="col">账号 / 转发方式</th><th scope="col">请求档位 → 响应档位</th><th scope="col">状态</th><th scope="col">耗时 / 首 token</th><th scope="col">输入 / 输出</th><th scope="col">缓存 token</th></tr></thead><tbody id="records-body"></tbody></table><div class="empty-state compact" id="records-empty"><h3>尚无请求记录</h3><p>请求经过 Pool Router 后，号池调度或旧方式监控的元数据会显示在这里。</p></div></div><div class="table-footer"><span id="record-count">0 条记录</span><span>档位仅为上游声明；缺失字段显示「—」或未确认</span></div>
+      </section>
+    </main>
+    <footer class="page-footer"><span>Pool Router <span class="footer-separator">/</span> 本机控制台</span><span id="last-update">等待服务响应</span></footer>
+  </div>
+
+  <dialog id="record-dialog" class="record-dialog"><div class="dialog-header"><div><div class="eyebrow">REQUEST INSPECTOR</div><h2>请求详情</h2></div><button class="icon-button dialog-close" id="close-record-dialog" type="button" aria-label="关闭请求详情">×</button></div><div id="record-details"></div><div class="dialog-footer">仅展示请求元数据，不展示密钥与正文。</div></dialog>
+  <dialog id="probe-dialog" class="probe-dialog"><div class="dialog-header"><h2>验证号池</h2><button class="icon-button dialog-close" id="close-probe-dialog" type="button" aria-label="关闭号池验证">×</button></div><form id="probe-form"><p id="probe-description"></p><label class="field"><span>验证模型</span><select id="probe-model" required></select></label><div class="subtle-note">将向 AnyRouter 发送一个小请求，会使用该号池的额度。成功只表示本次请求可用。</div><div class="dialog-actions"><button class="button button-secondary" id="cancel-probe" type="button">取消</button><button class="button button-primary" id="submit-probe" type="submit">发送验证请求</button></div></form></dialog>
+  <div class="toast-region" id="toast-region" role="status" aria-live="polite" aria-atomic="true"></div>
+</body>
+</html>

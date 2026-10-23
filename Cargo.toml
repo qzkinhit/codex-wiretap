@@ -1,0 +1,36 @@
+[package]
+name = "pool-router"
+version = "0.1.0"
+edition = "2024"
+description = "BiWrite 号池同步、Codex 调度和请求监控"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+async-stream = "0.3"
+axum = { version = "0.8", features = ["ws", "macros"] }
+blake3 = "1"
+bytes = "1"
+futures-util = "0.3"
+http = "1"
+httpdate = "1"
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "http2", "stream", "json", "system-proxy", "gzip", "deflate", "zstd"] }
+flate2 = "1"
+zstd = "0.13"
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+toml_edit = "0.25"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -1,344 +1,227 @@
-# Codex Wiretap
+# Codex Wiretap (Rust)
 
-[![Tests](https://github.com/qzkinhit/codex-wiretap/actions/workflows/tests.yml/badge.svg)](https://github.com/qzkinhit/codex-wiretap/actions/workflows/tests.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+**简体中文** | [English](README.en.md)
 
-一个本地请求监测工具，用来对照 Codex 请求中的模型与推理强度，以及上游响应声明的模型、推理强度和 token 用量。支持 HTTP JSON、SSE、Responses WebSocket，提供中文实时面板和可暂停的元数据记录。
+Codex Wiretap 的 Rust 版本提供本地号池调度和请求监控。它默认只读同步 BiWrite 的 Anyrouter 候选，让 Codex 直接连接 `http://127.0.0.1:10813/v1`，按账号与模型选择可用容量，并在本地面板中查看请求状态和用量。日常默认流程只需要 BiWrite 与本软件，不依赖 CC Switch。
 
-A local HTTP/SSE/WebSocket observer for Codex model and reasoning metadata. The CC Switch adapter supports macOS. Response metadata is a server claim, not proof of the model actually executed. The repository also ships a Claude Code skill that delegates figure drawing, proof review and well-specified execution tasks to the Codex CLI.
+桌面启动器名称为 **Pool Router**，命令行程序为 **`pool-router`**。macOS 启动器打开浏览器面板，实际转发由本机后台服务完成。项目同时保留可选的 CC Switch 兼容监控路径，供仍在 CC Switch 中维护 Key 的用户使用。
 
-仓库另附一个 Claude Code skill，用于把画图、定理审查和规格明确的执行任务派给 Codex CLI，见 [Claude Code 子代理 skill](#claude-code-子代理-skill)。
+[下载预编译版本](https://github.com/qzkinhit/codex-wiretap/releases/latest) · [历史 Python 实现](legacy/python/)
 
-**想知道请求有没有被改参数，可以用它观察字段差异。想证明中转站实际运行了哪个模型或多少计算量，仅靠这个工具做不到。**
+![Codex Wiretap 本地控制台示例](docs/dashboard.png)
 
-## 系统界面
+图中为模拟数据，不包含真实账号、密钥或对话。
 
-![Codex Wiretap 在线监测面板](docs/images/dashboard.jpg)
+## 安装与启动
 
-上图为经使用者授权公开的实际在线面板截图，包含请求统计、记录开关、模型与强度对照及用量信息，不包含 API Key 或对话正文。它只展示截图时的观测状态；其中的中转站地址不是推荐服务，字段差异也不是对该服务实际执行模型的独立鉴定。
+### 预编译版本
 
-## 你会看到什么
+从 [最新 Release](https://github.com/qzkinhit/codex-wiretap/releases/latest) 下载匹配系统和处理器架构的压缩包。macOS 安装包解压后，在包根目录执行：
 
-下面是说明界面含义的模拟数据，不是实际测试结论。
+```bash
+bash scripts/macos-install.sh --no-build
+```
 
-| 请求模型 | 响应模型 | 请求强度 | 响应强度 | 推理 tokens |
-| --- | --- | --- | --- | --- |
-| model-example | model-example | high | low | 128 |
-| model-example | model-example-v2 | high | 未返回 | 未知 |
+此命令使用包内 `target/release/pool-router`，不需要现场编译。安装脚本需要 `python3` 来生成 macOS plist，会安装当前用户的后台服务和 `~/Applications/Pool Router.app`，然后打开面板。安装本身不会修改 Codex 或 CC Switch 的接入配置。
 
-- 请求字段来自流经代理的 JSON，包括 `model` 和 `reasoning.effort`。
-- 响应字段来自上游 JSON 或流式事件，包括 `response.model`、`response.reasoning.effort` 和 `usage.output_tokens_details.reasoning_tokens`。
-- 支持 Chat Completions 的 `reasoning_effort` 与 `completion_tokens_details.reasoning_tokens` 字段。
-- 缺失字段显示为“未知”“未发送”或“未返回”，不会从请求中补齐响应。
-- 模型别名解析可能导致名称不同；推理 token 数为 `0` 也不能单独证明降档。
+### 从源码构建
 
-**观察位置很重要。** 如果请求先经过 CC Switch，工具记录的是 CC Switch 转发出来的请求。若 CC Switch 在转发前改写了字段，这个位置看不到改写前的值。面板顶部的上游地址来自配置，不是工具鉴定出的服务身份。
-
-## 选择接入方式
-
-| 你的情况 | 使用方式 |
-| --- | --- |
-| macOS，使用 CC Switch 管理带 API Key 的中转站供应商 | [方式 A：CC Switch 常驻适配](#方式-a-cc-switch-常驻适配macos) |
-| 不用 CC Switch，已经配置自定义 Responses provider | [方式 B：独立代理](#方式-b-独立代理) |
-| 只使用官方 ChatGPT 登录，没有明确的自定义 API 上游 | 目前没有开箱即用的自动接入；不要把登录地址当作模型 API 地址 |
-
-独立代理适用于 macOS/Linux 和 Python 3.11+。CC Switch 自动安装仅支持 macOS，使用用户级 `launchd`，不需要 `sudo`。当前没有 Windows 安装支持。
-
-## 安装源码与依赖
+需要当前稳定版 Rust、Cargo 和 C 编译工具链。macOS 可直接构建并安装：
 
 ```bash
 git clone https://github.com/qzkinhit/codex-wiretap.git
 cd codex-wiretap
-python3 --version
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
+bash scripts/macos-install.sh
 ```
 
-如果 `python3 --version` 低于 3.11，先安装较新的 Python，并使用对应解释器创建虚拟环境。不要把自己的 `auth.json`、`config.toml` 或 CC Switch 数据库复制进仓库。
+安装选项包括 `--no-build`、`--no-open` 和 `--no-start`。其中 `--no-start` 只安装文件，不启动服务或打开面板。重新安装会重启本软件自己的后台服务。
 
-## 方式 A：CC Switch 常驻适配（macOS）
-
-### 1. 确认原供应商可以正常使用
-
-在 CC Switch 的 **Codex** 页面选择你原来的中转站供应商，确认 Codex 能回复。该供应商必须在配置中保存：
-
-- 一个真实的 HTTPS `base_url`，例如 `https://your-provider.example/v1`。
-- `auth.OPENAI_API_KEY` 中的 API Key。
-- `config` TOML 中的 `model_provider`，以及对应 `[model_providers.<名称>]` 表的 `base_url`。
-
-上面的域名只是占位示例，不是可用服务。工具不绑定任何特定中转站，也不自带 Key。
-
-此适配直接读取并新增 CC Switch SQLite 供应商记录，**不是 CC Switch 官方 API 集成**。它要求 `~/.cc-switch/cc-switch.db` 存在，且具有 `providers` 表及相关字段。未来 CC Switch 版本可能改变结构。建议先使用 CC Switch 自带的备份功能保存配置。
-
-### 2. 安装常驻服务并创建供应商副本
-
-在本仓库目录执行：
+也可以只运行命令行程序，不安装后台服务：
 
 ```bash
-.venv/bin/python cc_adapter.py install
+cargo build --release --locked
+./target/release/pool-router init
+./target/release/pool-router serve
 ```
 
-它会执行以下操作：
-
-1. 读取当前 Codex 供应商，保留原记录。
-2. 新增一个名为 **“原名称（本地抓包）”** 的供应商副本，其地址指向 `http://127.0.0.1:10812/v1`。
-3. 在 `~/Library/LaunchAgents/local.codex-wiretap.plist` 安装用户级后台服务。
-4. 启动服务，并确认它指向原供应商的 HTTPS 上游。
-
-安装器不会修改 Codex 的 `auth.json`，也不会替你在运行中的 CC Switch 中切换供应商。副本及原有凭据留在 CC Switch 数据库中；`data/cc-adapter.json` 只保存关联 ID、名称与地址，不保存 Key。
-
-服务会在登录后启动，进程意外退出后由 `launchd` 重启。安装目录必须保留原位，因为服务使用其中 `.venv` 和脚本的绝对路径。同名服务已安装在其他目录时，安装器会拒绝覆盖。
-
-### 3. 在 CC Switch 中启用新供应商
-
-回到 CC Switch 的 Codex 页面，刷新界面，选择 **“原名称（本地抓包）”**，点击 **启用**。如果列表尚未更新，可尝试刷新窗口或重新打开 CC Switch。
-
-必须在应用内执行启用操作。单独修改数据库的当前标记不能可靠更新 CC Switch 内存中的路由。若客户端仍使用旧地址，等正在运行的任务结束后，完全退出并重开 Codex。
-
-启用 CC Switch 本地代理时，链路如下。其端口以你的实际设置为准，图中 `10811` 仅为示例。
-
-```text
-Codex
-  → CC Switch 本地代理，例如 127.0.0.1:10811
-  → Codex Wiretap，127.0.0.1:10812
-  → 原供应商的 HTTPS API
-```
-
-未启用 CC Switch 本地代理时，可以是：
-
-```text
-Codex → Codex Wiretap，127.0.0.1:10812 → 原供应商的 HTTPS API
-```
-
-两种情况下，Wiretap 都从**原供应商**读取真实 HTTPS 地址和 Key，不会再把 CC Switch 当作自己的上游，所以不会形成代理循环。
-
-### 4. 打开在线面板并验证
-
-打开 **<http://127.0.0.1:10812/__wiretap__/>**，然后给 Codex 发一条新消息。
-
-以面板出现对应时间的新请求为成功依据。仅显示“服务运行中”不代表 Codex 已接入。该端口可以收到多个会话的请求。新的“对话”列根据请求中的会话 ID 显示本地标题、项目名和打开链接，并支持按对话筛选与搜索。
-
-**不要双击 `dashboard.html` 查看实时数据。** `file://` 打开的是离线文件，应使用上面的 HTTP 地址。
-
-### 5. 日常使用只切换记录开关
-
-保持 **“原名称（本地抓包）”** 被选中，在面板操作：
-
-- **暂停记录（保持转发）**：新请求继续转发，但不再创建记录；暂停前已开始的请求仍会记录到结束。
-- **开始记录**：恢复记录新请求。
-
-暂停状态会保存，并在服务重启后保留。关闭面板不会停止转发。日常不需要切换供应商或重启 Codex，**不要把终止后台服务当作暂停记录**。
-
-### 更新 API Key
-
-在 CC Switch 中编辑**原供应商**并保存新 Key。日常可以继续选中“原名称（本地抓包）”，不需要再修改抓包副本或重启服务。下一次 HTTP 请求或新 WebSocket 握手会自动使用原供应商的新 Key。
-
-正在执行的请求不会被中途替换凭据；已建立的 WebSocket 连接仍使用建立连接时的认证，需要重连后更新。非常旧的版本只在启动时加载 Key，应先更新本工具并重启一次服务。
-
-如果还修改了原供应商的上游地址，必须重启服务。运行中的服务不会把新地址的 Key 发往旧地址，而会返回本地配置错误。原供应商被删除或 Key 为空时也会拒绝转发，不会悄悄复用旧 Key。
-
-### 管理服务、更新与恢复
-
-查看安装状态：
+保持上述服务运行，在另一终端打开面板：
 
 ```bash
-.venv/bin/python cc_adapter.py status
-launchctl print "gui/$(id -u)/local.codex-wiretap"
+./target/release/pool-router open
 ```
 
-`status` 显示安装记录；是否运行以 `launchctl` 或在线面板为准。双击 `start.command` 可以启动已安装的服务。
+所有命令支持 `--config /absolute/path/config.json`。`open` 从私有配置读取本地令牌，通过 URL fragment 交给面板，不在命令输出中打印令牌。前台运行时使用 `Ctrl+C` 停止服务。
 
-更新代码或更改原供应商的上游地址后，等正在执行的请求结束，再重启服务。重启期间会短暂无法转发。**只更换 Key 不需要重启**，见下方说明。
+### macOS 安装位置
+
+| 内容 | 位置 |
+| --- | --- |
+| 程序 | `~/Library/Application Support/Pool Router/bin/pool-router` |
+| 配置 | `~/Library/Application Support/Pool Router/config.json` |
+| 手动号池 | `~/Library/Application Support/Pool Router/manual-keys.json` |
+| 请求元数据 | `~/Library/Application Support/Pool Router/records.jsonl` |
+| 服务日志 | `~/Library/Application Support/Pool Router/logs/service.log` |
+| 启动器 | `~/Applications/Pool Router.app` |
+| 后台服务 | `~/Library/LaunchAgents/local.pool-router.plist` |
+
+其他系统可使用命令行构建与运行方式；当前仓库提供的后台服务安装脚本仅适用于 macOS。
+
+## 默认流程：BiWrite 与 Codex 直连
+
+1. 在 BiWrite 中配置 Anyrouter 的 Responses 供应商，并对所需模型运行保活。启用本地密钥文件模式，使密钥存于 `keys.json`。
+2. 启动 Pool Router，确认面板显示了预期模型的候选。可按需运行账号与模型探测；探测是真实上游请求，可能消耗额度。
+3. 在面板执行 Codex 直连接入，或运行：
 
 ```bash
-git pull --ff-only
-.venv/bin/python -m pip install -r requirements.txt
-launchctl kickstart -k "gui/$(id -u)/local.codex-wiretap"
+"$HOME/Library/Application Support/Pool Router/bin/pool-router" connect
 ```
 
-如果 CC Switch 自身依赖额外的 HTTP 出站代理，而直接访问上游失败，可按[高级参数](#高级参数)设置 `--outbound-proxy`。自动安装不会自动继承 CC Switch 的全局出站代理设置。
+接入会备份 `~/.codex/config.toml`，新增独立的 `pool_router` 供应商，并切换 Codex 的活动供应商。它使用本地入口、本软件生成的本地令牌，以及以下协议设置：
 
-**恢复原供应商或卸载的顺序：**
-
-1. 保持 Wiretap 运行，在 CC Switch 中启用原供应商。
-2. 必要时完全退出并重开 Codex，确认一条新消息能够正常回复。
-3. 确认客户端及 CC Switch 的当前路由不再依赖 `10812`，再停止并移除后台服务。
-
-```bash
-launchctl bootout "gui/$(id -u)/local.codex-wiretap"
-rm "$HOME/Library/LaunchAgents/local.codex-wiretap.plist"
+```toml
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
 ```
 
-此后可在 CC Switch 中删除未选中的抓包供应商副本。原供应商、历史元数据和源码目录不会被上述命令删除。如果是迁移目录，完成恢复与卸载后，再从新目录安装。
+原供应商和其他配置保留，`auth.json` 不改动。默认直连接入不读取或修改 CC Switch 数据库，也不会停止 CC Switch。存在本软件旧版接入备份时，程序会先检查并恢复自己的旧改动，再建立新备份。
 
-## 方式 B：独立代理
+首次接入后，已经打开的 Codex 会话可能需要重新打开或重载一次。请发出真实请求并确认面板出现记录。此后，来源切换、候选同步、路由策略及模型和推理强度覆盖在代理内生效，不需要为这些变化重启 Codex。在途请求继续使用已选中的账号和模型。
 
-该模式不修改 CC Switch 数据库，不安装后台服务。认证头沿原请求转发，上游需要能接受客户端使用的认证方式。若客户端保留的是 ChatGPT 登录凭据，而中转站要求另一把 API Key，应使用方式 A 或自行正确配置认证。
+对相同地址和令牌重复接入保持幂等；接入后被用户修改的受管字段会触发冲突检查，不会被静默覆盖。
 
-### 临时运行 Codex CLI
+## 号池来源与调度方式
 
-已有自定义 provider 且配置中的 `base_url` 是真实上游时：
+配置字段 `source_mode` 决定账号从哪里来，调度方式决定一次请求使用哪个账号。这两项独立设置。
 
-```bash
-.venv/bin/python wiretap.py inspect
-.venv/bin/python wiretap.py run
-```
+| 号池来源 | 行为 |
+| --- | --- |
+| `biwrite`，默认 | 每 1.5 秒只读同步 BiWrite 的本地 `settings.json` 和 `keys.json`，无需复制 Key。 |
+| `manual` | 只使用用户在面板中添加的 Key、模型、昵称和并发配置。 |
 
-`run` 会启动代理，通过一次性的 `-c` 覆盖地址来运行 Codex，退出 Codex 后关闭代理，不修改全局配置。macOS 上会优先查找桌面应用内置的 Codex，也可以指定可执行文件：
+自动来源只导入 Anyrouter Responses 的 `keptKeys` 候选，并排除对应供应商下被忽略或停止的密钥。macOS 默认 BiWrite 目录为 `~/Library/Application Support/app.biwrite.desktop`。该适配器要求 `keysInFile` 开启，不读取系统钥匙串，也不修改 BiWrite 文件。
 
-```bash
-.venv/bin/python wiretap.py run -- /path/to/codex exec --ephemeral '只回答 OK'
-```
+`keptKeys` 表示保活及等待重新进入的候选集合，并不等同于此刻严格“已挤成功”的状态。`keyThrough` 是历史成功时间，可能按小时粒度持久化。代理实际观察到的成功、失败、冷却和并发另行记录。读取失败时短暂保留此前快照；最后一次成功读取超过 30 秒后，停止用该旧快照分配新请求，待文件恢复后继续同步。
 
-模型和推理强度沿用客户端设置。真实模型请求会消耗你原有服务的额度。请勿在已有 `10812` 服务运行时再启动第二个同端口代理；可使用其他端口，例如把 `--port 10813` 放在 `run` 之前。
+手动来源可先添加账号，再保存来源切换。自动来源下维护手动列表不会改变当前 BiWrite 号池；手动池为空时会拒绝切换。相同 Key 重复添加会合并模型，已保存的 Key 不在列表中回显。手动密钥存于本机私有 `manual-keys.json`，自动来源密钥只读入内存。
 
-### 接入已有 CLI 或桌面客户端
+| 调度方式 | 行为 |
+| --- | --- |
+| `sticky`，默认 | 尽量保持同一会话使用原账号；允许切换的请求可在原账号不可用时选择其他候选。 |
+| `random` | 从当前可调度候选中随机选择。 |
+| `round_robin` | 在当前可调度候选间轮流选择。 |
+| `pinned` | 只使用指定账号，不因失败而自动换号。 |
 
-先显式指定你的真实 API 上游。以下地址必须替换：
+因此，BiWrite 自动导入的账号可以手动指定，手动维护的多个账号也可以自动随机或轮询调度。
 
-```bash
-.venv/bin/python wiretap.py --upstream https://your-provider.example/v1 serve
-```
+并发与健康状态以 **Key + 模型** 为单位。同一个 Key 的 Astra 失败不会把 Sol 一并标为失败。默认每个 Key、每个模型最多有 1 个本代理请求在途，并结合来源中保存的模型并发上限。可额外设置跨模型的账号总并发上限。BiWrite 保活与其他客户端的请求不计入本代理的并发数，仍可能与本代理请求一起触发上游限制。
 
-独立终端中运行 Codex，假设你的 provider ID 是 `custom`：
+模型和推理强度默认跟随 Codex。面板覆盖只作用于后续号池请求；携带 `previous_response_id` 的请求保留原账号与模型关联，不能跨模型覆盖或跨账号续接。
 
-```bash
-codex -c 'model_providers.custom.base_url="http://127.0.0.1:10812/v1"'
-```
+## 可选流程：兼容 CC Switch 监控
 
-桌面客户端也可以在备份后，只将现有 `[model_providers.custom]` 表中的 `base_url` 改为 `http://127.0.0.1:10812/v1`，保留其他字段，然后让客户端重新加载配置。`custom` 必须替换为自己的 provider ID。不要重复添加同名 TOML 表。
+仍希望在 CC Switch 中换 Key 时，可展开面板的“兼容 CC Switch 监控”，执行“接入旧方式监控”。这会将 **CC Switch 当前 Codex 供应商** 的 Anyrouter 地址改为本地入口，并关闭该供应商的 WebSocket 支持。它不修改 Key、模型、推理强度或服务档位，也不切换 CC Switch 的当前供应商。
 
-**如果 CC Switch 在同步这份配置，请使用方式 A，不要反复手动改两处地址。**
+后续仍在 CC Switch 修改 Key，不需要把 Key 添加到 Pool Router 的手动池。若切换到另一个尚未接入本地入口的 CC Switch 供应商，它的请求不会自动出现在监控中。
 
-停止独立代理前，先恢复原地址并重新加载客户端，确认请求正常。代理不是系统级抓包器，无法捕获未经过它的请求，也无法补抓历史请求。
-
-## 高级参数
-
-所有公共参数都写在 `serve`、`run` 等子命令之前：
-
-```bash
-# 自定义端口和日志
-.venv/bin/python wiretap.py --port 10813 --log data/session.jsonl \
-  --upstream https://your-provider.example/v1 serve
-
-# 显式设置出站 HTTP 代理；这不是 CC Switch 的模型 API 网关
-.venv/bin/python wiretap.py --upstream https://your-provider.example/v1 \
-  --outbound-proxy http://127.0.0.1:7890 serve
-
-# 只读加载一个 CC Switch 原供应商的上游和 Key
-.venv/bin/python wiretap.py --cc-provider-id ORIGINAL_PROVIDER_ID serve
-
-# 指定用于读取配置的文件或 profile
-.venv/bin/python wiretap.py --config /path/to/config.toml inspect
-.venv/bin/python wiretap.py --profile work inspect
-
-# 合并同一请求的状态快照，查看历史记录
-.venv/bin/python wiretap.py report
-```
-
-默认配置位置为 `$CODEX_HOME/config.toml`，未设置时使用 `~/.codex/config.toml`。`--config` 控制工具读取哪个配置文件，不会自动改变子进程的 `CODEX_HOME`。
-
-`--cc-provider-id` 只接受保存了 HTTPS 上游和 API Key 的原供应商。启用此参数后，代理使用该供应商的 Key 替换上游 Authorization，并去掉 Cookie、ChatGPT 账号 ID 和 OpenAI 组织/项目头；其他模式不做这一认证替换。真实上游不能包含 URL 凭据、查询串或片段。
-
-HTTPS 校验保持启用；可以通过 `SSL_CERT_FILE` 指定已有 CA。工具不自动读取 `HTTP_PROXY` 或 `HTTPS_PROXY`，避免意外循环。遇到代理端口冲突，应明确区分模型网关、Wiretap 监听端口与出站网络代理。
-
-## Claude Code 子代理 skill
-
-`skills/codex/` 是一个 Claude Code skill，让 Claude Code 把画图、定理审查、理论审查和规格明确的执行任务派给本机 Codex CLI 在后台完成。Claude 负责拆分任务、写任务说明、审核与验收，写作类任务不派发。它与 Wiretap 代理相互独立，可以单独使用。
-
-安装或更新时复制整个目录。
-
-```bash
-mkdir -p ~/.claude/skills
-cp -R skills/codex ~/.claude/skills/
-```
-
-需要固定子代理使用的模型或思考强度时，把 `~/.claude/skills/codex/.env.example` 复制为同目录的 `.env` 并填写。未设置时沿用 Codex 的 `config.toml`。
-
-skill 只在用户明确要求时调用，Claude 不会自行派发。在 Claude Code 中输入 `/codex <任务描述>`，或在对话中明确说“让 codex 画这张图”，Claude 写好任务说明后在后台调用 `skills/codex/scripts/codex_run.py`，三种模式如下。
-
-| 模式 | 用途 | Codex 可写范围 |
+| 请求路径 | 认证凭证 | 处理方式 |
 | --- | --- | --- |
-| `new <工作目录> <任务说明.md> [额外可写目录...]` | 画图与执行任务 | 工作目录与额外可写目录 |
-| `review <审查说明.md>` | 定理与理论审查 | 运行目录下的独立 workspace |
-| `resume <运行目录> <返工说明.md>` | 在同一会话中返工 | 沿用首轮设置 |
+| Codex → Pool Router → Anyrouter | 本软件的本地令牌 | `route_mode = "pool"`，使用当前号池来源和调度策略。 |
+| Codex → CC Switch → Pool Router → Anyrouter | CC Switch 转发的受支持 `sk-` 上游 Key | `route_mode = "legacy"`，只使用该请求携带的 Key。 |
 
-每轮结束后，脚本输出 Codex 本地会话记录中的模型、思考强度、沙箱与上下文占用，以及 Codex 的最终报告、执行过的命令和本轮修改过的文件。上下文达到上限（默认 256k tokens）的 75% 后，脚本拒绝续接，需要拆成新任务。完整的分派规则见 [skills/codex/SKILL.md](skills/codex/SKILL.md)。
+`legacy` 路径不会选择或回退到已存号池，不应用面板中的模型或推理强度覆盖，不修改请求的 `service_tier`，也不自动重试或更换 Key。上游请求体按收到的字节转发，监控解析与转发分离。
 
-使用限制如下。
+兼容接入与恢复分别对应 `POST /api/legacy/connect` 和 `POST /api/legacy/restore`，两个管理接口都要求本地令牌认证。兼容接入有独立恢复备份；恢复只还原本软件修改的地址和协议字段，保留接入后在 CC Switch 更换的新 Key 以及其他非受管设置。
 
-- 需要 Python 3.9+ 和可以运行的 Codex CLI。每次调用都会消耗 Codex 所用服务的额度。
-- 修改文件按修改时间判断，同一时段其他进程写入的文件也会列出。
-- 会话记录中的模型与思考强度反映客户端设置，不能证明上游实际执行的模型。需要观察请求与响应字段时，配合前文的 Wiretap 面板使用。
-- 运行记录默认保存在 `~/.claude/codex-runs/`，包含任务说明与 Codex 输出，可能涉及私有内容，不要提交到仓库。
+`legacy_monitor_enabled` 默认为 `true`，只表示允许这类传入 Key 的监控请求，不会改变默认 `biwrite` 来源或本地令牌请求的号池调度。关闭后会拒绝兼容 Key 请求，本地令牌路径继续工作。
 
-## 区分多个对话
+## 协议、重试与上下文
 
-列表中的“对话”列显示标题、项目目录名和短 ID，点击标题使用 `codex://threads/<线程 ID>` 在本机 Codex 桌面应用中打开。可以使用“全部对话”下拉框筛选，或搜索标题、项目名、完整/部分 ID。同名对话仍按不同 ID 区分。
+当前 Rust 版本支持 `POST /v1/responses` 的 HTTP/SSE，以及 `POST /v1/responses/compact`；另有本地 `GET /v1/models`。不支持 Responses WebSocket、Chat Completions 或任意路径转发，客户端需设置 `supports_websockets = false`。上游固定为 `https://anyrouter.top/v1`。
 
-识别顺序为请求的 `Thread-Id` / `client_metadata.thread_id`，其次是 `Session-Id` / `client_metadata.session_id`。同一级标识冲突时显示“会话标识冲突”，不按时间或模型猜测归属。`prompt_cache_key` 只有精确匹配本地线程 ID 时才作为兼容路径使用。
+号池路径同时检查 HTTP 状态与 Responses/SSE 事件。HTTP 200 中的失败事件不会计为成功。有效内容输出前，明确可重试的拒绝或已确认未建立连接的失败可以更换候选；输出文本、推理或工具调用之后不自动重放。结果不确定的传输中断也不透明重试。
 
-标题从 `$CODEX_HOME/state_*.sqlite` 的线程索引只读查询，约每 5 秒刷新；不读取消息正文，不调用模型生成摘要。标题与项目名只返回给本地面板，不写入抓包 JSONL。日志新增会话 ID 和来源字段，这些元数据仍属于本地隐私信息。
+号池默认最多尝试 20 次，排队和等待有效输出的前导阶段共用 120 秒期限，单次上游响应头等待上限为 45 秒，流式空闲上限为 180 秒。重试次数不保证成功，也不能消除上游整体故障。兼容监控路径始终只提交一次上游请求。
 
-```bash
-# 指定索引所在的 Codex 数据目录
-.venv/bin/python wiretap.py --codex-home /path/to/codex-home --upstream https://your-provider.example/v1 serve
+号池客户端发送 `Accept: text/event-stream` 时，代理立即发出 SSE 等待注释，并在等待期间每 5 秒发送心跳。注释不含响应 ID 或模型内容，不阻止前导失败时换号。响应头发出后的错误通过 SSE `error` 事件返回；记录仍保留实际处理状态。客户端断开会取消未完成的等待和转发。
 
-# 不读取或展示标题和项目名，只保留 ID 与链接
-.venv/bin/python wiretap.py --no-conversation-titles --upstream https://your-provider.example/v1 serve
-```
+携带 `previous_response_id` 的号池请求必须使用已记录的原账号与模型。绑定未知、过期或不可用时会明确返回错误。绑定保存在内存中，默认有效期为 24 小时；重启代理会丢失绑定，客户端可能需要重新发送上下文。兼容监控路径按原样转发客户端的续接字段，不利用号池绑定替换账号。
 
-旧日志没有会话标识，不能补推归属。远程机器或临时会话可能没有本地标题，仍可显示已收到的 ID；深度链接需要相应 Codex 桌面应用和可访问的会话。不同版本的本地索引结构可能不兼容，标题读取失败不会阻断转发。对话标题可能包含敏感信息，分享新面板截图前请检查。
+同一 Anyrouter 地址不证明不同账号共享服务端会话或提示词缓存。每次请求发送多少上下文取决于 Codex 和协议。缓存命中与网络上是否发送请求体是不同问题，代理不会自动补齐被省略的历史。
 
-## 常见问题
+## 监控记录与数据边界
 
-### 页面有显示，但一直是零条记录
+只监控**经过本地入口**的请求，不读取其他进程的 HTTPS 流量，也不执行系统级抓包或中间人解密。默认保存最近 1000 条白名单元数据，可暂停记录而继续转发。
 
-先确认打开的是 HTTP 在线面板。然后检查实际路由是否经过 `10812`，CC Switch 是否已在应用内启用抓包副本，以及旧客户端是否仍缓存原地址。页面的配置提示只反映磁盘状态，不能证明正在运行的客户端已加载它。
+记录包括路由类型 `route_mode`、匿名账号标识、可识别的会话 UUID、请求与服务器声明的模型和推理强度、请求与响应的 `service_tier`、状态与失败分类、重试次数、耗时、字节数，以及上游报告的 token、缓存和推理 token 用量。号池覆盖后的实际发送模型与推理强度单独显示。没有报告的字段保持未知，不推算为已确认信息。
 
-### config.toml 还是 CC Switch 的端口，正常吗？
+面板将 `fast` 与 `priority` 放在同一服务档位组中方便查看，同时保留请求和响应的原始值。这些字段只说明请求参数或服务器声明，不能证明实际后端模型、服务档位执行情况或最终计费。
 
-正常。方式 A 启用 CC Switch 本地代理时，客户端应先连接 CC Switch，再由当前抓包供应商转到 Wiretap。不要为了把配置文件改成 `10812` 而破坏这个路由，以实际新记录为准。
+监控不保存 Key、提示词、回复正文或任意上游错误消息。BiWrite 密钥只读入内存；手动密钥存于私有文件；兼容请求的 Key 只用于该请求转发。私有配置保存本地访问令牌，接入恢复备份也可能包含原配置中的凭证。这些文件使用 `0600` 权限，不应随源码、截图或诊断包分享。
 
-### 开始记录后，返回了 401 或 403
+服务仅监听回环地址，并检查 Host 和浏览器 Origin。管理接口始终要求本地令牌。兼容的真实 Key 只被模型转发接口接受，不能作为管理令牌使用。
 
-确认原供应商本身仍可用、原记录未被删除、Key 有效且有权限使用该模型。方式 A 会在每次 HTTP 请求和新 WebSocket 握手前读取原供应商 Key。只改抓包副本的 Key 不会替换服务实际使用的原供应商 Key；已有 WebSocket 连接需要重连后使用新凭据。响应 401/403 不等于抓包工具发现了模型降级。
+## 维护、恢复与卸载
 
-### 安装失败或端口占用
-
-确认系统是 macOS、`.venv` 已创建、CC Switch 数据库存在且符合上述结构。使用 `lsof -nP -iTCP:10812 -sTCP:LISTEN` 查看监听进程。不要同时从不同仓库副本安装同名服务。失败时可能已创建一个未启用的供应商副本，原供应商仍保留。
-
-### 切换回原供应商后，Codex 无法使用
-
-保持 Wiretap 运行，让 CC Switch 真正启用原供应商，并让 Codex 重新加载地址。某些客户端会缓存旧配置；切换供应商后立即关闭代理可能导致仍指向代理的连接失败。按前面的恢复顺序操作，或在日常使用时仅暂停记录。
-
-### 能看到真实的内部思考或证明“降智”吗？
-
-不能。工具展示请求参数与响应声明；模型名称可能是别名，中转站也可能重写字段。推理 token 用量无法直接换算成某个强度等级。本工具不保存或展示对话正文、思考文本或工具调用正文。
-
-## 数据、限制与测试
-
-- 面板显示本次服务进程最近 300 条请求；服务重启后面板列表清空，历史元数据仍在 `data/capture.jsonl`，可用 `report` 查看。
-- JSONL 按快照追加，`id` 关联同一请求；日志使用 UTC，页面使用浏览器时区。没有自动日志轮转，长期运行应安排日志归档。
-- 请求和响应正文在代理内存中经过处理，日志仅保存白名单字段，权限为 `0600`。详细说明见 [SECURITY.md](SECURITY.md)。
-- HTTP body 保持原始字节，但连接头和分块边界可能改变。WebSocket 重新建立握手并禁用消息压缩协商，转发解码后的消息内容；不是 TCP 原始报文抓取。
-- 字段观察支持 gzip、deflate、zstd。解码后的单个 JSON/SSE 事件观察上限为 4 MiB；HTTP body 和 WebSocket 消息上限为 64 MiB。
-- 目前记录 POST `/responses`、`/chat/completions` 和 Responses WebSocket；其他 HTTP 路径只转发，不产生模型记录。
-- 无法可靠配对的 WebSocket 并发响应会标记为未配对，不猜测对应请求。省略字段时也不猜测继承配置。
-- 暂停记录不会删除已有数据。源供应商被删除、服务被停止、网络不可达等仍可能导致转发失败；后台自动重启不等于零中断保证。
-
-测试只使用本地模拟服务器和临时数据，不需要 Key，不会调用付费模型，也不会运行 CC Switch 安装流程：
+查看脱敏状态或重新打开面板：
 
 ```bash
-.venv/bin/python -m unittest discover -v
+"$HOME/Library/Application Support/Pool Router/bin/pool-router" status
+"$HOME/Library/Application Support/Pool Router/bin/pool-router" open
 ```
 
-GitHub Actions 覆盖 Linux 上的 Python 3.11/3.14 和 macOS 上的 Python 3.14。自动化测试覆盖流式转发、WebSocket 配对、压缩、认证头处理、日志脱敏、暂停恢复、供应商配置复制，以及 skill 脚本的派发、续接与上下文限制。skill 脚本的测试用模拟的 codex 可执行文件代替 Codex CLI。这些测试不能替代每个 CC Switch 版本的人工集成验证。
+更新程序时重新运行安装脚本。重启代理可能影响在途请求和内存中的续接绑定，宜在当前请求结束后更新。一般的面板设置变化不需要重启服务或 Codex。
 
-## 贡献与许可证
+已接入 Codex 或 CC Switch 时，停用或卸载前先恢复接入：
 
-欢迎提交 Issue 和 PR。请提供系统、Python/CC Switch 版本、接入方式和脱敏后的现象描述。不要上传真实 Key、数据库、配置、对话日志或含个人信息的截图。
+```bash
+"$HOME/Library/Application Support/Pool Router/bin/pool-router" restore
+```
 
-项目使用 [MIT License](LICENSE)，与 OpenAI、Codex、CC Switch 或任何中转站均无官方隶属关系。
+该命令检查并恢复本软件待恢复的直连接入和兼容监控接入。只恢复 CC Switch 监控时，也可使用面板对应恢复按钮。恢复保留无关的后续修改；受管字段发生冲突时拒绝覆盖并保留备份。恢复后可能需要重新打开 Codex 会话，确认请求已采用恢复后的入口。
 
-参考 [Codex 配置文档](https://developers.openai.com/codex/config-reference/) 和 [Responses API 文档](https://developers.openai.com/api/reference/resources/responses/methods/create)。
+仅停用 macOS 后台服务，不卸载文件：
+
+```bash
+launchctl bootout "gui/$(id -u)/local.pool-router"
+```
+
+重新启用：
+
+```bash
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/local.pool-router.plist"
+```
+
+卸载后台服务与启动器：
+
+```bash
+bash "$HOME/Library/Application Support/Pool Router/uninstall.sh"
+```
+
+卸载不停止 CC Switch 或其他 wiretap 服务。配置、手动密钥、日志和归档恢复备份默认保留；确认恢复完成且不再需要数据后，可手动删除本软件的数据目录。不要在仍有客户端指向本地入口时直接删除程序。
+
+## 历史版本与开发
+
+此前的 Python 实现保存在 [`legacy/python/`](legacy/python/)，用于保留历史源码和功能参考。旧版支持的 WebSocket 等能力不代表当前 Rust 版本已实现，也不会由 Rust 安装器自动启用。
+
+本地验证使用临时夹具和 localhost mock，不需要真实 Anyrouter Key。前端测试需要 Node.js 22 或更新版本。
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-targets --all-features --locked
+node --test web/app.test.cjs
+bash -n scripts/macos-install.sh scripts/macos-uninstall.sh
+```
+
+CI 在 Linux 与 macOS 执行检查，不修改真实 Codex 接入配置。测试不代替实际供应商验证。
+
+以下官方文档用于理解配置和协议概念，不代表 Anyrouter 的实现与官方服务完全一致：
+
+- [Codex 配置参考](https://learn.chatgpt.com/docs/config-file/config-reference)
+- [Responses WebSocket 模式](https://developers.openai.com/api/docs/guides/websocket-mode)
+- [提示词缓存](https://developers.openai.com/api/docs/guides/prompt-caching)
+
+本项目使用 [MIT 许可证](LICENSE)。
+
+旧方式监控不计入号池调度的并发额度。若同时通过两条路径使用同一 Key，还需要考虑上游的总并发限制。已回到接入前供应商时，可再次点击“直接接入”返回号池模式，原始备份及之后更新的非受管配置会保留。

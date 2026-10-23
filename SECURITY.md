@@ -1,15 +1,11 @@
-# 安全与隐私
+# Security and local data
 
-本工具是运行在本机的反向代理，默认只监听 `127.0.0.1`，不安装根证书，不关闭 HTTPS 证书校验。
+Pool Router binds only to a loopback address. Management endpoints and the pool-backed model path require the generated local token. Host and Origin checks reject cross-site access.
 
-HTTP 请求和响应正文会经过代理内存；解析器只将指定的模型、推理强度、响应 ID、时间、状态及 token 用量写入 JSONL。认证头、Cookie、输入正文、输出正文和服务端错误消息不写入抓包日志。日志还会保存会话 ID 与标识来源。元数据仍可能具有隐私性，请勿直接提交真实日志。
+When legacy monitoring is enabled, the two Responses POST endpoints may accept a caller-provided `sk-` credential. This path forwards only that credential to the fixed AnyRouter origin. It cannot select stored pool credentials or access management endpoints and the model list.
 
-对话标题和项目目录名从本机 Codex 线程索引只读查询，只在本地面板显示，不写入 JSONL，不发送给上游，不读取消息正文。可通过 `--no-conversation-titles` 禁用标题和项目名读取。标题可能包含私人信息，分享面板截图前应检查。
+BiWrite credentials are read into memory. Manually added credentials are stored in `manual-keys.json` in the private application data directory. Configuration and recovery backups can contain credentials. These files are private local state and must not be included in bug reports or commits. The application uses owner-only file permissions on Unix systems.
 
-CC Switch 模式会读取原供应商保存在本地 SQLite 中的 API Key，并将其用于发往该供应商固定 HTTPS 地址的 Authorization 头。供应商副本会保存在同一个 CC Switch 数据库。服务在每次 HTTP 请求和新 WebSocket 握手前重新读取原供应商 Key，因此只轮换 Key 不需要重启；已建立的 WebSocket 连接需重连。上游地址改变时必须重启，服务不会将新 Key 发往旧地址。此模式不适合不信任的多用户共享机器：本机其他进程也可能访问监听端口并使用已配置的上游凭据。
+Monitoring keeps an allowlist of metadata rather than prompt, response, tool, or authorization bodies. Model, reasoning and service-tier values are upstream declarations, not independent verification of execution or billing. Published screenshots use synthetic data.
 
-控制接口要求本地来源、JSON 请求和专用请求头，并拒绝跨站 Origin；不要把监听服务公开到局域网或互联网。代理不能提供后端模型身份的独立证明，响应字段可能由中转站修改。
-
-`data/`、日志、数据库、证书、`.env` 和本地配置均在 `.gitignore` 中排除。开 Issue 或提交 PR 时，请只提供脱敏信息或模拟数据，不要上传 API Key、auth.json、config.toml、CC Switch 数据库、完整抓包记录或个人会话截图。
-
-如果发现漏洞，请优先使用仓库的私密漏洞报告入口（启用时可用）。如果该入口不可用，可提交不含复现秘密或利用细节的 Issue，请维护者提供私下联系方式。
+Do not put credentials in public GitHub issues. Use GitHub private vulnerability reporting if it is enabled for this repository; otherwise contact the repository owner without including a working credential or private conversation.

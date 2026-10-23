@@ -1,4 +1,4 @@
-name: Tests
+name: Legacy Python tests
 on:
   push:
   pull_request:
@@ -17,6 +17,9 @@ jobs:
           - os: macos-latest
             python: '3.14'
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: legacy/python
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
