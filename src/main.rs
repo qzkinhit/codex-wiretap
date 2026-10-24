@@ -141,7 +141,9 @@ async fn serve(cfg: Config, path: PathBuf) -> Result<()> {
         .await
         .map_err(|_| anyhow::anyhow!("无法监听 {addr}，请检查端口占用"))?;
     let state = AppState::new(cfg, path, true)?;
-    if state.sync_source().await.is_err() {
+    // Populate the in-memory pool once on startup, then honor the saved pause
+    // setting for periodic reads. A paused restart must not create an empty pool.
+    if state.sync_source_now().await.is_err() {
         eprintln!("BiWrite 号池暂未读取成功，控制台可查看原因，服务会继续重试");
     }
     let weak = std::sync::Arc::downgrade(&state);

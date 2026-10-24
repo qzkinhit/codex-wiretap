@@ -223,6 +223,7 @@ impl Harness {
         let upstream = format!("http://{}/v1", upstream_listener.local_addr().unwrap());
         let mock_router = Router::new()
             .route("/v1/responses", post(mock_response))
+            .route("/v1/responses/compact", post(mock_response))
             .with_state(mock.clone());
         let upstream_job = tokio::spawn(async move {
             axum::serve(upstream_listener, mock_router).await.unwrap();
@@ -242,10 +243,13 @@ impl Harness {
         config.biwrite_dir = dir.path().join("biwrite-fixture");
         let state = AppState::new(config, dir.path().join("config.json"), false).unwrap();
         state.scheduler.sync_accounts(
-            [TEST_KEY_A, TEST_KEY_B]
-                .into_iter()
-                .take(accounts)
-                .map(|secret| account(secret, &upstream, models))
+            (0..accounts)
+                .map(|index| match index {
+                    0 => TEST_KEY_A.to_owned(),
+                    1 => TEST_KEY_B.to_owned(),
+                    _ => format!("sk-integration-fixture-{index}"),
+                })
+                .map(|secret| account(&secret, &upstream, models))
                 .collect(),
         );
         let proxy_router = proxy::router(state.clone());
@@ -303,7 +307,7 @@ impl Harness {
             json!({
                 "keysInFile": true,
                 "providers": [{"id":"p-auto-fixture","name":"自动测试","kind":"openai_compatible",
-                    "wireApi":"responses","baseUrl":"https://anyrouter.top/v1","model":ASTRA,
+                    "wireApi":"responses","baseUrl":"https://api.example.com/v1","model":ASTRA,
                     "hasKey":true,"keyCount":1,"keyConcurrency":1}],
                 "keptKeys":{"p-auto-fixture":[fingerprint]}
             })
@@ -997,6 +1001,54 @@ async fn source_defaults_to_biwrite_and_empty_manual_selection_preserves_auto_po
 }
 
 #[tokio::test]
+async fn manual_keys_without_a_selected_upstream_cannot_replace_existing_config_or_pool() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let h = Harness::new(vec![], 1, &[ASTRA]).await;
+        let before = h.state.settings();
+        assert!(before.upstream_base_url.is_none());
+        assert!(!before.biwrite_dir.exists());
+        pool_router::config::save(&h.state.config_path, &before).unwrap();
+        let saved_before = fs::read(&h.state.config_path).unwrap();
+        let account_before = h.state.scheduler.snapshot(&before.policy)[0].id.clone();
+        let add = h
+            .api_post(
+                "/api/manual",
+                json!({"key":TEST_MANUAL_KEY,"models":[SOL],"label":"手动测试"}),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(add.status(), StatusCode::OK);
+
+        let response = h
+            .api_post(
+                "/api/config",
+                json!({"source_mode":"manual","policy":{"strategy":"random"}}),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = response.json::<Value>().await.unwrap();
+        assert_eq!(response["error"]["code"], "source_unavailable");
+        assert!(!response.to_string().contains(TEST_MANUAL_KEY));
+        assert_eq!(
+            serde_json::to_value(h.state.settings()).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        assert_eq!(fs::read(&h.state.config_path).unwrap(), saved_before);
+        let accounts = h.state.scheduler.snapshot(&h.state.settings().policy);
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].id, account_before);
+        assert_eq!(accounts[0].models, [ASTRA]);
+        assert!(!h.state.settings().biwrite_dir.exists());
+        assert_eq!(h.calls(), 0);
+    })
+    .await
+    .expect("已有手动密钥但缺少上游时必须拒绝切换并保留配置与当前号池");
+}
+
+#[tokio::test]
 async fn adding_manual_key_keeps_auto_pool_and_pinned_auto_routing_unchanged() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let h = Harness::new(vec![success("resp_pinned_auto", ASTRA)], 2, &[ASTRA]).await;
@@ -1096,6 +1148,7 @@ async fn manual_source_is_independent_of_biwrite_and_deletion_removes_candidate_
         let switched = h.api_post("/api/config", json!({"source_mode":"manual","policy":{"strategy":"random"}})).send().await.unwrap();
         assert_eq!(switched.status(), StatusCode::OK);
         assert!(h.state.settings().source_mode == SourceMode::Manual);
+        assert_eq!(h.state.settings().upstream_base_url.as_deref(), Some("https://api.example.com/v1"));
         assert_eq!(h.state.settings().policy.strategy, Strategy::Random);
         h.state.sync_source().await.unwrap();
         let accounts = h.state.scheduler.snapshot(&h.state.settings().policy);
@@ -1104,6 +1157,7 @@ async fn manual_source_is_independent_of_biwrite_and_deletion_removes_candidate_
         assert_eq!(accounts[0].models, [SOL]);
         let public_state = h.api_get("/api/state").send().await.unwrap().json::<Value>().await.unwrap();
         assert_eq!(public_state["config"]["source_mode"], "manual");
+        assert_eq!(public_state["config"]["upstream_base_url"], "https://api.example.com/v1");
         assert_eq!(public_state["config"]["policy"]["strategy"], "random");
         assert_eq!(public_state["accounts"].as_array().unwrap().len(), 1);
         assert_eq!(public_state["accounts"][0]["id"], id);
@@ -1114,11 +1168,28 @@ async fn manual_source_is_independent_of_biwrite_and_deletion_removes_candidate_
         assert!(!public_text.contains(TEST_KEY_A));
         assert!(!public_text.contains(&h.state.settings().local_token));
         // Selection proves manual source supports automatic scheduling without
-        // ever sending fixture credentials to the fixed real upstream URL.
+        // ever sending fixture credentials to the configured example upstream URL.
         let selection = Selection { model: SOL.into(), ..Selection::default() };
         let lease = h.state.scheduler.try_acquire(&selection, &h.state.settings().policy).unwrap();
         assert_eq!(lease.account.id, id);
+        assert_eq!(lease.account.upstream, "https://api.example.com/v1");
         drop(lease);
+        // A fresh AppState has no cached automatic-source selection. Its manual
+        // sync must use the persisted endpoint while BiWrite remains absent.
+        let saved = pool_router::config::load(&h.state.config_path).unwrap();
+        assert!(saved.source_mode == SourceMode::Manual);
+        assert_eq!(saved.upstream_base_url.as_deref(), Some("https://api.example.com/v1"));
+        let restarted = AppState::new(saved, h.state.config_path.clone(), false).unwrap();
+        restarted.sync_source().await.unwrap();
+        let restarted_accounts = restarted.scheduler.snapshot(&restarted.settings().policy);
+        assert_eq!(restarted_accounts.len(), 1);
+        assert_eq!(restarted_accounts[0].id, id);
+        assert_eq!(restarted_accounts[0].models, [SOL]);
+        assert!(restarted.source.read().unwrap().last_error.is_none());
+        let lease = restarted.scheduler.try_acquire(&selection, &restarted.settings().policy).unwrap();
+        assert_eq!(lease.account.upstream, "https://api.example.com/v1");
+        drop(lease);
+        drop(restarted);
         assert!(!biwrite_dir.exists());
         assert_eq!(fs::read(parked.join("settings.json")).unwrap(), original_settings);
         assert_eq!(fs::read(parked.join("keys.json")).unwrap(), original_keys);
@@ -1143,4 +1214,1032 @@ async fn manual_source_is_independent_of_biwrite_and_deletion_removes_candidate_
         assert_eq!(fs::read(biwrite_dir.join("keys.json")).unwrap(), original_keys);
         assert_eq!(h.calls(), 0);
     }).await.expect("手动来源应独立于BiWrite并支持删除及切回自动来源");
+}
+
+fn recovery_error(status: StatusCode, code: &str) -> Reply {
+    Reply::Json(
+        status,
+        json!({"error":{"code":code,"message":"fixture rejection"}}),
+        None,
+    )
+}
+
+fn compaction_request() -> Value {
+    json!({"model":ASTRA,"input":[
+        {"role":"user","content":"retain this user message"},
+        {"type":"reasoning","id":"rs_opaque","encrypted_content":"fixture-opaque"},
+        {"type":"reasoning","id":"rs_plain","encrypted_content":"fixture-reasoning",
+            "summary":[{"type":"summary_text","text":"retain plaintext reasoning"}]},
+        {"type":"function_call","call_id":"call_fixture","name":"lookup","arguments":"{}"},
+        {"type":"function_call_output","call_id":"call_fixture","output":"retain tool result"},
+        {"type":"compaction","encrypted_content":"fixture-compaction"}
+    ]})
+}
+
+fn compact_success() -> Reply {
+    Reply::Json(
+        StatusCode::OK,
+        json!({"id":"cmp_fixture","object":"response.compaction",
+        "output":[{"type":"compaction","encrypted_content":"fixture-new-compaction"}]}),
+        None,
+    )
+}
+
+fn session_request() -> Value {
+    let mut body = Harness::request(ASTRA);
+    body["prompt_cache_key"] = json!("fixture-session");
+    body["client_metadata"] = json!({"session_id":"fixture-session","thread_id":"fixture-session"});
+    body
+}
+
+fn use_short_cooldown(h: &Harness) {
+    let mut config = h.state.config.write().unwrap();
+    config.policy.cooldown_base_ms = 100;
+    config.policy.cooldown_max_ms = 100;
+}
+
+#[tokio::test]
+async fn default_retry_budget_allows_sixteen_attempts_and_never_a_seventeenth() {
+    assert_eq!(Config::default().max_attempts, 16);
+    assert_eq!(
+        serde_json::from_value::<Config>(json!({}))
+            .unwrap()
+            .max_attempts,
+        16
+    );
+    for rejected in [15, 16] {
+        let mut script: Vec<_> = (0..rejected)
+            .map(|_| recovery_error(StatusCode::SERVICE_UNAVAILABLE, "server_error"))
+            .collect();
+        script.push(success("resp_final_allowed_attempt", ASTRA));
+        let h = Harness::new(script, 17, &[ASTRA]).await;
+        h.state.config.write().unwrap().max_attempts = Config::default().max_attempts;
+        let response = h.post(Harness::request(ASTRA)).send().await.unwrap();
+        let status = response.status();
+        let text = response.text().await.unwrap();
+        assert_eq!(h.calls(), 16);
+        assert_eq!(h.state.records.records()[0].attempts.len(), 16);
+        assert_eq!(h.in_flight(), 0);
+        if rejected == 15 {
+            assert_eq!(status, StatusCode::OK);
+            assert!(text.contains("resp_final_allowed_attempt"));
+        } else {
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!text.contains("resp_final_allowed_attempt"));
+            assert_eq!(h.mock.script.lock().unwrap().len(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn first_output_deadline_retries_heartbeat_only_attempt_on_another_key() {
+    assert_eq!(Config::default().first_output_timeout_ms, 120_000);
+    let h = Harness::new(
+        vec![
+            Reply::Heartbeats(vec![created("resp_stalled_prelude", ASTRA)]),
+            success("resp_after_first_output_timeout", ASTRA),
+        ],
+        2,
+        &[ASTRA],
+    )
+    .await;
+    h.state.config.write().unwrap().first_output_timeout_ms = 1000;
+    let started = std::time::Instant::now();
+    let response = h.post(Harness::request(ASTRA)).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = response.text().await.unwrap();
+    assert!(text.contains("resp_after_first_output_timeout"));
+    assert!(!text.contains("resp_stalled_prelude"));
+    assert!(started.elapsed() >= Duration::from_millis(900));
+    assert!(started.elapsed() < Duration::from_secs(4));
+    let seen = h.mock.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert_ne!(seen[0].authorization, seen[1].authorization);
+    drop(seen);
+    let records = h.state.records.records();
+    assert_eq!(records[0].attempts[0].reason, "first_output_timeout");
+    assert_eq!(records[0].outcome, "completed");
+    assert_eq!(h.in_flight(), 0);
+}
+
+#[tokio::test]
+async fn first_output_deadline_does_not_replay_after_visible_output() {
+    let gate = Arc::new(Notify::new());
+    let h = Harness::new(
+        vec![
+            Reply::Sse(vec![
+                (None, created("resp_started", ASTRA)),
+                (None, delta("already-visible")),
+                (Some(gate.clone()), completed("resp_started", ASTRA)),
+            ]),
+            success("resp_forbidden_replay", ASTRA),
+        ],
+        2,
+        &[ASTRA],
+    )
+    .await;
+    h.state.config.write().unwrap().first_output_timeout_ms = 1000;
+    let response = h.post(Harness::request(ASTRA)).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.bytes_stream();
+    let mut text = String::new();
+    while !text.contains("already-visible") {
+        text.push_str(&String::from_utf8_lossy(
+            &stream.next().await.unwrap().unwrap(),
+        ));
+    }
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(h.calls(), 1);
+    gate.notify_one();
+    while let Some(part) = stream.next().await {
+        text.push_str(&String::from_utf8_lossy(&part.unwrap()));
+    }
+    assert!(text.contains("response.completed"));
+    assert!(!text.contains("resp_forbidden_replay"));
+    assert_eq!(h.calls(), 1);
+    assert_eq!(h.state.records.records()[0].outcome, "completed");
+}
+
+#[tokio::test]
+async fn compaction_encrypted_content_400_repairs_once_and_preserves_plaintext_and_tools() {
+    let h = Harness::new(
+        vec![
+            recovery_error(StatusCode::BAD_REQUEST, "invalid_encrypted_content"),
+            compact_success(),
+        ],
+        2,
+        &[ASTRA],
+    )
+    .await;
+    let original = compaction_request();
+    let response = h
+        .api_post("/v1/responses/compact", original.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["object"],
+        "response.compaction"
+    );
+    let seen = h.mock.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].authorization, seen[1].authorization);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&seen[0].body).unwrap(),
+        original
+    );
+    let repaired: Value = serde_json::from_slice(&seen[1].body).unwrap();
+    let mut expected_reasoning = original["input"][2].clone();
+    expected_reasoning
+        .as_object_mut()
+        .unwrap()
+        .remove("encrypted_content");
+    assert_eq!(
+        repaired["input"],
+        json!([
+            original["input"][0],
+            expected_reasoning,
+            original["input"][3],
+            original["input"][4]
+        ])
+    );
+    drop(seen);
+    let records = h.state.records.records();
+    assert_eq!(
+        records[0]
+            .gateway_actions
+            .iter()
+            .filter(|a| a.action == "compaction_repair")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn compaction_repair_cannot_repeat_or_exceed_total_attempt_budget() {
+    for budget in [1, 4] {
+        let h = Harness::new(
+            vec![
+                recovery_error(StatusCode::BAD_REQUEST, "invalid_encrypted_content"),
+                recovery_error(StatusCode::BAD_REQUEST, "invalid_encrypted_content"),
+                compact_success(),
+            ],
+            2,
+            &[ASTRA],
+        )
+        .await;
+        h.state.config.write().unwrap().max_attempts = budget;
+        let response = h
+            .api_post("/v1/responses/compact", compaction_request())
+            .send()
+            .await
+            .unwrap();
+        assert!(!response.status().is_success());
+        response.bytes().await.unwrap();
+        assert_eq!(h.calls(), budget.min(2));
+        assert_eq!(h.state.records.records()[0].attempts.len(), budget.min(2));
+        assert!(
+            h.state.records.records()[0]
+                .gateway_actions
+                .iter()
+                .filter(|a| a.action == "compaction_repair")
+                .count()
+                <= 1
+        );
+    }
+}
+
+#[tokio::test]
+async fn encrypted_content_is_unchanged_outside_explicit_compaction_400_recovery() {
+    for (path, status, code, repair_enabled) in [
+        (
+            "/v1/responses",
+            StatusCode::BAD_REQUEST,
+            "invalid_encrypted_content",
+            true,
+        ),
+        (
+            "/v1/responses/compact",
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            true,
+        ),
+        (
+            "/v1/responses/compact",
+            StatusCode::BAD_GATEWAY,
+            "invalid_encrypted_content",
+            true,
+        ),
+        (
+            "/v1/responses/compact",
+            StatusCode::BAD_REQUEST,
+            "invalid_encrypted_content",
+            false,
+        ),
+    ] {
+        let h = Harness::new(
+            vec![recovery_error(status, code), compact_success()],
+            2,
+            &[ASTRA],
+        )
+        .await;
+        h.state.config.write().unwrap().compaction_repair_enabled = repair_enabled;
+        let original = compaction_request();
+        let response = h.api_post(path, original.clone()).send().await.unwrap();
+        response.bytes().await.unwrap();
+        let expected_calls = if status == StatusCode::BAD_GATEWAY {
+            2
+        } else {
+            1
+        };
+        let seen = h.mock.seen.lock().unwrap();
+        assert_eq!(seen.len(), expected_calls, "{path} {status} {code}");
+        for request in seen.iter() {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&request.body).unwrap(),
+                original
+            );
+        }
+        drop(seen);
+        assert!(
+            !h.state.records.records()[0]
+                .gateway_actions
+                .iter()
+                .any(|a| a.action == "compaction_repair")
+        );
+    }
+}
+
+#[tokio::test]
+async fn consecutive_429_rebuilds_session_once_on_same_key_and_reuses_mapping() {
+    let h = Harness::new(
+        vec![
+            recovery_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded"),
+            recovery_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded"),
+            success("resp_session_recovered", ASTRA),
+            success("resp_session_followup", ASTRA),
+        ],
+        1,
+        &[ASTRA],
+    )
+    .await;
+    use_short_cooldown(&h);
+    let body = session_request();
+    let response = h
+        .post(body.clone())
+        .header("session-id", "fixture-session")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("resp_session_recovered")
+    );
+    let mapped = {
+        let seen = h.mock.seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0].headers["session-id"], "fixture-session");
+        assert_eq!(seen[1].headers["session-id"], "fixture-session");
+        assert_eq!(seen[0].authorization, seen[1].authorization);
+        assert_eq!(seen[1].authorization, seen[2].authorization);
+        let mapped = seen[2].headers["session-id"].to_str().unwrap().to_owned();
+        assert_ne!(mapped, "fixture-session");
+        assert!(uuid::Uuid::parse_str(&mapped).is_ok());
+        let sent: Value = serde_json::from_slice(&seen[2].body).unwrap();
+        assert_eq!(sent["prompt_cache_key"], mapped);
+        assert_eq!(sent["client_metadata"]["session_id"], mapped);
+        assert_eq!(sent["client_metadata"]["thread_id"], mapped);
+        assert_eq!(sent["input"], body["input"]);
+        mapped
+    };
+    assert_eq!(
+        h.state.records.records()[0]
+            .gateway_actions
+            .iter()
+            .filter(|a| a.action == "session_reset")
+            .count(),
+        1
+    );
+    let mut continuation = body;
+    continuation["previous_response_id"] = json!("resp_session_recovered");
+    let response = h
+        .post(continuation)
+        .header("session-id", "fixture-session")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("resp_session_followup")
+    );
+    let seen = h.mock.seen.lock().unwrap();
+    assert_eq!(seen.len(), 4);
+    assert_eq!(seen[2].authorization, seen[3].authorization);
+    assert_eq!(seen[3].headers["session-id"], mapped);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&seen[3].body).unwrap()["previous_response_id"],
+        "resp_session_recovered"
+    );
+}
+
+#[tokio::test]
+async fn repeated_sse_rate_limits_rotate_session_at_most_once_per_request() {
+    let h = Harness::new(
+        vec![
+            Reply::Sse(vec![(None, failed("resp_hidden_first", ASTRA))]),
+            Reply::Sse(vec![(None, failed("resp_hidden_second", ASTRA))]),
+            Reply::Sse(vec![(None, failed("resp_hidden_third", ASTRA))]),
+            success("resp_single_rotation", ASTRA),
+        ],
+        1,
+        &[ASTRA],
+    )
+    .await;
+    use_short_cooldown(&h);
+    let response = h
+        .post(session_request())
+        .header("session-id", "fixture-session")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = response.text().await.unwrap();
+    assert!(text.contains("resp_single_rotation"));
+    assert!(!text.contains("resp_hidden"));
+    let seen = h.mock.seen.lock().unwrap();
+    assert_eq!(seen.len(), 4);
+    assert_eq!(seen[0].headers["session-id"], "fixture-session");
+    assert_eq!(seen[1].headers["session-id"], "fixture-session");
+    assert_ne!(seen[2].headers["session-id"], "fixture-session");
+    assert_eq!(seen[2].headers["session-id"], seen[3].headers["session-id"]);
+    assert!(
+        seen.iter()
+            .all(|r| r.authorization == seen[0].authorization)
+    );
+    drop(seen);
+    assert_eq!(
+        h.state.records.records()[0]
+            .gateway_actions
+            .iter()
+            .filter(|a| a.action == "session_reset")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn bound_resource_502_rebuilds_session_but_generic_502_and_single_429_do_not() {
+    for (status, code, enabled, expected_reset) in [
+        (StatusCode::BAD_GATEWAY, "resource_not_found", true, true),
+        (StatusCode::BAD_GATEWAY, "server_error", true, false),
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_exceeded",
+            true,
+            false,
+        ),
+        (StatusCode::BAD_GATEWAY, "resource_not_found", false, false),
+    ] {
+        let h = Harness::new(
+            vec![
+                recovery_error(status, code),
+                success("resp_session_result", ASTRA),
+            ],
+            2,
+            &[ASTRA],
+        )
+        .await;
+        use_short_cooldown(&h);
+        h.state.config.write().unwrap().session_recovery_enabled = enabled;
+        let original = session_request();
+        let response = h
+            .post(original.clone())
+            .header("session-id", "fixture-session")
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response
+                .text()
+                .await
+                .unwrap()
+                .contains("resp_session_result")
+        );
+        let seen = h.mock.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(
+            seen[1].headers["session-id"] != "fixture-session",
+            expected_reset
+        );
+        if expected_reset {
+            assert_eq!(seen[0].authorization, seen[1].authorization);
+        } else {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&seen[1].body).unwrap(),
+                original
+            );
+        }
+        drop(seen);
+        assert_eq!(
+            h.state.records.records()[0]
+                .gateway_actions
+                .iter()
+                .any(|a| a.action == "session_reset"),
+            expected_reset
+        );
+    }
+}
+
+#[tokio::test]
+async fn separated_429_errors_do_not_count_as_consecutive_session_rejections() {
+    let h = Harness::new(
+        vec![
+            recovery_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded"),
+            recovery_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
+            recovery_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded"),
+            success("resp_not_consecutive", ASTRA),
+        ],
+        1,
+        &[ASTRA],
+    )
+    .await;
+    use_short_cooldown(&h);
+    let original = session_request();
+    let response = h
+        .post(original.clone())
+        .header("session-id", "fixture-session")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("resp_not_consecutive")
+    );
+    let seen = h.mock.seen.lock().unwrap();
+    assert_eq!(seen.len(), 4);
+    for request in seen.iter() {
+        assert_eq!(request.headers["session-id"], "fixture-session");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&request.body).unwrap(),
+            original
+        );
+    }
+    drop(seen);
+    assert!(
+        !h.state.records.records()[0]
+            .gateway_actions
+            .iter()
+            .any(|a| a.action == "session_reset")
+    );
+}
+
+#[tokio::test]
+async fn session_rebuild_never_exceeds_total_attempt_budget_or_runs_without_identity() {
+    for with_identity in [true, false] {
+        let h = Harness::new(
+            vec![
+                recovery_error(StatusCode::BAD_GATEWAY, "resource_not_found"),
+                success("resp_forbidden_extra_attempt", ASTRA),
+            ],
+            2,
+            &[ASTRA],
+        )
+        .await;
+        h.state.config.write().unwrap().max_attempts = if with_identity { 1 } else { 2 };
+        let original = if with_identity {
+            session_request()
+        } else {
+            Harness::request(ASTRA)
+        };
+        let response = h.post(original.clone()).send().await.unwrap();
+        let status = response.status();
+        response.bytes().await.unwrap();
+        if with_identity {
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(h.calls(), 1);
+        } else {
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(h.calls(), 2);
+            let seen = h.mock.seen.lock().unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&seen[1].body).unwrap(),
+                original
+            );
+            assert!(!seen[1].headers.contains_key("session-id"));
+            assert!(
+                !h.state.records.records()[0]
+                    .gateway_actions
+                    .iter()
+                    .any(|a| a.action == "session_reset")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn previous_response_id_prevents_session_rebuild_for_502_and_repeated_429() {
+    for status in [StatusCode::BAD_GATEWAY, StatusCode::TOO_MANY_REQUESTS] {
+        let code = if status == StatusCode::BAD_GATEWAY {
+            "resource_not_found"
+        } else {
+            "rate_limit_exceeded"
+        };
+        let h = Harness::new(
+            vec![
+                success("resp_bound_parent", ASTRA),
+                recovery_error(status, code),
+                recovery_error(status, code),
+                recovery_error(status, code),
+            ],
+            2,
+            &[ASTRA],
+        )
+        .await;
+        use_short_cooldown(&h);
+        h.state.config.write().unwrap().max_attempts = 3;
+        let mut continuation = session_request();
+        h.post(continuation.clone())
+            .header("session-id", "fixture-session")
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        continuation["previous_response_id"] = json!("resp_bound_parent");
+        let response = h
+            .post(continuation.clone())
+            .header("session-id", "fixture-session")
+            .send()
+            .await
+            .unwrap();
+        assert!(!response.status().is_success());
+        response.bytes().await.unwrap();
+        let seen = h.mock.seen.lock().unwrap();
+        assert!(seen.len() >= 2 && seen.len() <= 4);
+        for request in seen.iter().skip(1) {
+            assert_eq!(request.authorization, seen[0].authorization);
+            assert_eq!(request.headers["session-id"], "fixture-session");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&request.body).unwrap(),
+                continuation
+            );
+        }
+        drop(seen);
+        assert!(
+            !h.state
+                .records
+                .records()
+                .iter()
+                .flat_map(|r| &r.gateway_actions)
+                .any(|a| a.action == "session_reset")
+        );
+    }
+}
+
+#[tokio::test]
+async fn rate_limit_counts_are_isolated_between_accounts_in_the_same_session() {
+    let h = Harness::new(
+        vec![
+            recovery_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded"),
+            recovery_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded"),
+            success("resp_two_independent_rejections", ASTRA),
+        ],
+        2,
+        &[ASTRA],
+    )
+    .await;
+    use_short_cooldown(&h);
+    let original = session_request();
+    let response = h
+        .post(original.clone())
+        .header("session-id", "fixture-session")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("resp_two_independent_rejections")
+    );
+    let seen = h.mock.seen.lock().unwrap();
+    assert_eq!(seen.len(), 3);
+    assert_ne!(seen[0].authorization, seen[1].authorization);
+    for request in seen.iter() {
+        assert_eq!(request.headers["session-id"], "fixture-session");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&request.body).unwrap(),
+            original
+        );
+    }
+    drop(seen);
+    assert!(
+        !h.state.records.records()[0]
+            .gateway_actions
+            .iter()
+            .any(|a| a.action == "session_reset")
+    );
+}
+
+#[tokio::test]
+async fn json_and_sse_errors_record_bounded_messages_with_all_fixture_credentials_redacted() {
+    for transport in ["json", "sse_prelude", "sse_after_output"] {
+        let h = Harness::new(vec![], 2, &[ASTRA]).await;
+        h.state.config.write().unwrap().max_attempts = 1;
+        let local_token = h.state.settings().local_token;
+        let message = format!(
+            "fixture upstream resource rejected; loaded={TEST_KEY_A} other={TEST_KEY_B} local={local_token}; \
+            Bearer opaque-fixture-value; api_key=unloaded-fixture-value; \
+            https://fixture-user:fixture-password@api.example.com/v1?credential=fixture-query; \
+            line\nwith\tcontrols\u{202e} {}",
+            "测".repeat(1500)
+        );
+        let error = json!({"code":"rate_limit_exceeded","message":message});
+        let reply = if transport == "json" {
+            Reply::Json(StatusCode::TOO_MANY_REQUESTS, json!({"error":error}), None)
+        } else {
+            let mut chunks = vec![(None, created("resp_error_details", ASTRA))];
+            if transport == "sse_after_output" {
+                chunks.push((None, delta("already-visible")));
+            }
+            chunks.push((
+                None,
+                frame(json!({"type":"response.failed","response":{
+                    "id":"resp_error_details","model":ASTRA,"status":"failed","error":error
+                }})),
+            ));
+            Reply::Sse(chunks)
+        };
+        h.mock.script.lock().unwrap().push_back(reply);
+        let response = h.post(Harness::request(ASTRA)).send().await.unwrap();
+        response.bytes().await.unwrap();
+        assert_eq!(h.calls(), 1);
+        let public = h
+            .api_get("/api/records")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let attempts = public["records"][0]["attempts"].as_array().unwrap();
+        assert_eq!(attempts.len(), 1, "{transport}");
+        let detail = attempts[0]["error_message"]
+            .as_str()
+            .expect("ordinary request error detail must reach the records API");
+        assert!(
+            detail.contains("fixture upstream resource rejected"),
+            "{transport}: {detail}"
+        );
+        assert!(detail.contains("[REDACTED]"));
+        assert!(detail.len() <= 2048);
+        assert!(!detail.chars().any(char::is_control));
+        assert!(!detail.contains('\u{202e}'));
+        let serialized = public.to_string();
+        for forbidden in [
+            TEST_KEY_A,
+            TEST_KEY_B,
+            local_token.as_str(),
+            "opaque-fixture-value",
+            "unloaded-fixture-value",
+            "fixture-user",
+            "fixture-password",
+            "fixture-query",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "{transport} exposed a fixture credential"
+            );
+        }
+        assert_eq!(
+            h.state.records.records()[0].attempts[0]
+                .error_message
+                .as_deref(),
+            Some(detail)
+        );
+    }
+}
+
+#[tokio::test]
+async fn paused_source_sync_preserves_active_pool_and_allows_explicit_sync_then_resume() {
+    let h = Harness::new(vec![success("resp_while_sync_paused", ASTRA)], 1, &[ASTRA]).await;
+    let before_id = h.state.scheduler.snapshot(&h.state.settings().policy)[0]
+        .id
+        .clone();
+    let paused = h
+        .api_post("/api/config", json!({"sync_paused":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(paused.status(), StatusCode::OK);
+    assert!(h.state.settings().sync_paused);
+    h.install_biwrite_fixture().await;
+    let dir = h.state.settings().biwrite_dir;
+    let settings_path = dir.join("settings.json");
+    let mut settings: Value = serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+    let fingerprint_b = blake3::hash(TEST_KEY_B.as_bytes()).to_hex().to_string()[..12].to_owned();
+    settings["keptKeys"]["p-auto-fixture"] = json!([fingerprint_b]);
+    fs::write(&settings_path, settings.to_string()).unwrap();
+    fs::write(
+        dir.join("keys.json"),
+        json!({"keys":{"p-auto-fixture":TEST_KEY_B}}).to_string(),
+    )
+    .unwrap();
+    let parked = h._dir.path().join("paused-biwrite-fixture");
+    fs::rename(&dir, &parked).unwrap();
+    h.state.sync_source().await.unwrap();
+    assert_eq!(
+        h.state.scheduler.snapshot(&h.state.settings().policy)[0].id,
+        before_id
+    );
+    assert!(h.state.source.read().unwrap().last_error.is_none());
+    let response = h.post(Harness::request(ASTRA)).send().await.unwrap();
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("resp_while_sync_paused")
+    );
+    assert_eq!(
+        h.mock.seen.lock().unwrap()[0].authorization,
+        format!("Bearer {TEST_KEY_A}")
+    );
+    fs::rename(&parked, &dir).unwrap();
+
+    let sync = h.api_post("/api/sync", json!({})).send().await.unwrap();
+    assert_eq!(sync.status(), StatusCode::OK);
+    assert!(h.state.settings().sync_paused);
+    let expected_b = blake3::hash(TEST_KEY_B.as_bytes()).to_hex().to_string();
+    let snapshot = h.state.scheduler.snapshot(&h.state.settings().policy);
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].id, expected_b);
+    // Source synchronization only reads fixture files. Never send an upstream
+    // request after the public example URL replaces the localhost mock address.
+    let selection = Selection {
+        model: ASTRA.into(),
+        ..Selection::default()
+    };
+    let lease = h
+        .state
+        .scheduler
+        .try_acquire(&selection, &h.state.settings().policy)
+        .unwrap();
+    assert_eq!(lease.account.id, expected_b);
+    drop(lease);
+
+    let fingerprint_a = blake3::hash(TEST_KEY_A.as_bytes()).to_hex().to_string()[..12].to_owned();
+    settings["keptKeys"]["p-auto-fixture"] = json!([fingerprint_a]);
+    fs::write(&settings_path, settings.to_string()).unwrap();
+    fs::write(
+        dir.join("keys.json"),
+        json!({"keys":{"p-auto-fixture":TEST_KEY_A}}).to_string(),
+    )
+    .unwrap();
+    h.state.sync_source().await.unwrap();
+    assert_eq!(
+        h.state.scheduler.snapshot(&h.state.settings().policy)[0].id,
+        expected_b
+    );
+    let resumed = h
+        .api_post("/api/config", json!({"sync_paused":false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resumed.status(), StatusCode::OK);
+    assert!(!h.state.settings().sync_paused);
+    assert_eq!(
+        h.state.scheduler.snapshot(&h.state.settings().policy)[0].id,
+        before_id
+    );
+    assert!(
+        !pool_router::config::load(&h.state.config_path)
+            .unwrap()
+            .sync_paused
+    );
+    assert_eq!(h.calls(), 1);
+}
+
+#[tokio::test]
+async fn previous_response_keeps_its_original_session_after_later_independent_rotations() {
+    let h = Harness::new(
+        vec![
+            success("resp_original_session", ASTRA),
+            recovery_error(StatusCode::BAD_GATEWAY, "resource_not_found"),
+            success("resp_first_rotated_session", ASTRA),
+            recovery_error(StatusCode::BAD_GATEWAY, "resource_not_found"),
+            success("resp_second_rotated_session", ASTRA),
+            success("resp_first_session_continuation", ASTRA),
+            success("resp_original_session_continuation", ASTRA),
+            success("resp_latest_independent_request", ASTRA),
+        ],
+        1,
+        &[ASTRA],
+    )
+    .await;
+    use_short_cooldown(&h);
+    let original = session_request();
+    for expected in [
+        "resp_original_session",
+        "resp_first_rotated_session",
+        "resp_second_rotated_session",
+    ] {
+        let response = h
+            .post(original.clone())
+            .header("session-id", "fixture-session")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.text().await.unwrap().contains(expected));
+    }
+    let (first_session, second_session) = {
+        let seen = h.mock.seen.lock().unwrap();
+        assert_eq!(seen.len(), 5);
+        assert_eq!(seen[0].headers["session-id"], "fixture-session");
+        assert_eq!(seen[1].headers["session-id"], "fixture-session");
+        let first = seen[2].headers["session-id"].to_str().unwrap().to_owned();
+        let second = seen[4].headers["session-id"].to_str().unwrap().to_owned();
+        assert!(uuid::Uuid::parse_str(&first).is_ok());
+        assert!(uuid::Uuid::parse_str(&second).is_ok());
+        assert_ne!(first, second);
+        assert_eq!(seen[3].headers["session-id"], first);
+        (first, second)
+    };
+    for (parent, expected) in [
+        (
+            "resp_first_rotated_session",
+            "resp_first_session_continuation",
+        ),
+        (
+            "resp_original_session",
+            "resp_original_session_continuation",
+        ),
+    ] {
+        let mut continuation = original.clone();
+        continuation["previous_response_id"] = json!(parent);
+        let response = h
+            .post(continuation)
+            .header("session-id", "fixture-session")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.text().await.unwrap().contains(expected));
+    }
+    let response = h
+        .post(original.clone())
+        .header("session-id", "fixture-session")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("resp_latest_independent_request")
+    );
+    let seen = h.mock.seen.lock().unwrap();
+    assert_eq!(seen.len(), 8);
+    for (index, expected_session, previous) in [
+        (
+            5,
+            first_session.as_str(),
+            Some("resp_first_rotated_session"),
+        ),
+        (6, "fixture-session", Some("resp_original_session")),
+        (7, second_session.as_str(), None),
+    ] {
+        assert_eq!(seen[index].authorization, seen[0].authorization);
+        assert_eq!(seen[index].headers["session-id"], expected_session);
+        let body: Value = serde_json::from_slice(&seen[index].body).unwrap();
+        assert_eq!(body["prompt_cache_key"], expected_session);
+        assert_eq!(body["client_metadata"]["session_id"], expected_session);
+        assert_eq!(body["client_metadata"]["thread_id"], expected_session);
+        assert_eq!(body["input"], original["input"]);
+        assert_eq!(body["previous_response_id"].as_str(), previous);
+    }
+}
+
+#[tokio::test]
+async fn flat_response_error_recovers_only_before_output_and_records_redacted_message() {
+    for visible_output in [false, true] {
+        let h = Harness::new(vec![], 1, &[ASTRA]).await;
+        use_short_cooldown(&h);
+        let message = format!("fixture flat resource unavailable; credential {TEST_KEY_A}");
+        let flat_error = format!(
+            "event: response.error\ndata: {}\n\n",
+            json!({"status":502,"code":"resource_not_found","message":message})
+        );
+        let mut chunks = vec![(None, created("resp_flat_error", ASTRA))];
+        if visible_output {
+            chunks.push((None, delta("already-visible")));
+        }
+        chunks.push((None, flat_error));
+        h.mock.script.lock().unwrap().extend([
+            Reply::Sse(chunks),
+            success("resp_after_flat_resource_error", ASTRA),
+        ]);
+        let response = h
+            .post(session_request())
+            .header("session-id", "fixture-session")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = response.text().await.unwrap();
+        let seen = h.mock.seen.lock().unwrap();
+        if visible_output {
+            assert_eq!(seen.len(), 1);
+            assert!(text.contains("already-visible"));
+            assert!(text.contains("event: response.error"));
+            assert!(!text.contains("resp_after_flat_resource_error"));
+        } else {
+            assert_eq!(seen.len(), 2);
+            assert_eq!(seen[0].authorization, seen[1].authorization);
+            assert_ne!(seen[1].headers["session-id"], "fixture-session");
+            assert!(text.contains("resp_after_flat_resource_error"));
+            assert!(!text.contains("resp_flat_error"));
+            assert!(!text.contains("event: response.error"));
+        }
+        drop(seen);
+        let records = h.state.records.records();
+        let record = &records[0];
+        assert_eq!(record.attempts.len(), if visible_output { 1 } else { 2 });
+        assert_eq!(record.attempts[0].reason, "resource_not_found");
+        let detail = record.attempts[0].error_message.as_deref().unwrap();
+        assert!(detail.contains("fixture flat resource unavailable"));
+        assert!(!detail.contains(TEST_KEY_A));
+        assert!(detail.contains("[REDACTED]"));
+        assert_eq!(
+            record
+                .gateway_actions
+                .iter()
+                .any(|a| a.action == "session_reset"),
+            !visible_output
+        );
+        assert_eq!(
+            record.outcome,
+            if visible_output {
+                "upstream_failed"
+            } else {
+                "completed"
+            }
+        );
+        assert_eq!(h.in_flight(), 0);
+    }
 }

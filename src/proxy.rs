@@ -2,7 +2,10 @@ use crate::{
     biwrite,
     config::{self, Config, SourceMode},
     integration, manual,
-    monitor::{self, AttemptRecord, Observation, RecordStore, RequestRecord, SseObserver},
+    monitor::{
+        self, AttemptRecord, GatewayAction, Observation, RecordStore, RequestRecord, SseObserver,
+    },
+    recovery::{self, RecoveryKind, SessionRemaps},
     scheduler::{Scheduler, SelectError, Selection},
     types::{ProviderSummary, RoutingPolicy, SourceSnapshot, now_ms},
 };
@@ -20,7 +23,7 @@ use futures_util::StreamExt;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::{self, Read},
     path::PathBuf,
     sync::{
@@ -61,6 +64,8 @@ pub struct AppState {
     pub connection_override: RwLock<Option<integration::ConnectionInfo>>,
     /// Rust-only injection for isolated transport tests. Never exposed through config or APIs.
     pub legacy_upstream_override: RwLock<Option<String>>,
+    resolved_upstream: RwLock<Option<String>>,
+    session_remaps: SessionRemaps,
     settings_lock: tokio::sync::Mutex<()>,
     source_lock: tokio::sync::Mutex<()>,
 }
@@ -100,6 +105,8 @@ impl AppState {
             counters: Counters::default(),
             connection_override: RwLock::new(None),
             legacy_upstream_override: RwLock::new(None),
+            resolved_upstream: RwLock::new(None),
+            session_remaps: SessionRemaps::default(),
             settings_lock: tokio::sync::Mutex::new(()),
             source_lock: tokio::sync::Mutex::new(()),
         }))
@@ -111,14 +118,31 @@ impl AppState {
             .clone()
     }
     pub async fn sync_source(&self) -> Result<()> {
+        self.sync_source_with_force(false).await
+    }
+    pub async fn sync_source_now(&self) -> Result<()> {
+        self.sync_source_with_force(true).await
+    }
+    async fn sync_source_with_force(&self, force: bool) -> Result<()> {
         let _lock = self.source_lock.lock().await;
         let cfg = self.settings();
+        if cfg.source_mode == SourceMode::Biwrite && cfg.sync_paused && !force {
+            return Ok(());
+        }
         let result = self.read_source(&cfg).await;
-        if cfg.source_mode != self.settings().source_mode {
+        let current = self.settings();
+        if cfg.source_mode != current.source_mode
+            || cfg.upstream_base_url != current.upstream_base_url
+            || cfg.biwrite_import_all != current.biwrite_import_all
+        {
             return Ok(());
         }
         match result {
-            Ok(snapshot) => {
+            Ok((snapshot, upstream)) => {
+                *self
+                    .resolved_upstream
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(upstream);
                 self.scheduler.sync_accounts(snapshot.accounts);
                 *self.source.write().unwrap_or_else(|e| e.into_inner()) = SourceState {
                     read_at_ms: snapshot.read_at_ms,
@@ -144,16 +168,23 @@ impl AppState {
             .unwrap_or(std::path::Path::new("."))
             .to_path_buf()
     }
-    async fn read_source(&self, cfg: &Config) -> Result<SourceSnapshot> {
+    async fn read_source(&self, cfg: &Config) -> Result<(SourceSnapshot, String)> {
         let mode = cfg.source_mode;
         let dir = if mode == SourceMode::Biwrite {
             cfg.biwrite_dir.clone()
         } else {
             self.state_dir()
         };
-        tokio::task::spawn_blocking(move || match mode {
-            SourceMode::Biwrite => biwrite::load_snapshot(&dir),
-            SourceMode::Manual => manual::load_snapshot(&dir),
+        let cfg = cfg.clone();
+        tokio::task::spawn_blocking(move || {
+            let upstream = cfg.selected_upstream()?;
+            let snapshot = match mode {
+                SourceMode::Biwrite => {
+                    biwrite::load_snapshot_with_scope(&dir, &upstream, cfg.biwrite_import_all)
+                }
+                SourceMode::Manual => manual::load_snapshot(&dir, &upstream),
+            }?;
+            Ok((snapshot, upstream))
         })
         .await?
     }
@@ -375,12 +406,58 @@ async fn api_clear(State(s): State<Arc<AppState>>) -> Response {
 }
 async fn api_config(State(s): State<Arc<AppState>>, Json(patch): Json<Value>) -> Response {
     let _lock = s.settings_lock.lock().await;
+    let _source_lock = s.source_lock.lock().await;
     let previous_config = s.settings();
-    let updated = match previous_config.patch(patch) {
+    let mut updated = match previous_config.patch(patch) {
         Ok(c) => c,
         Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_config", &e.to_string()),
     };
-    let source_changed = previous_config.source_mode != updated.source_mode;
+    // A manual pool can keep working after BiWrite closes or its files move.
+    // Persist the address already selected for automatic routing when switching.
+    if updated.source_mode == SourceMode::Manual
+        && previous_config.source_mode != SourceMode::Manual
+        && updated.upstream_base_url.is_none()
+    {
+        updated.upstream_base_url = s
+            .resolved_upstream
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+    }
+    let source_changed = previous_config.source_mode != updated.source_mode
+        || previous_config.upstream_base_url != updated.upstream_base_url
+        || (updated.source_mode == SourceMode::Biwrite
+            && previous_config.biwrite_import_all != updated.biwrite_import_all)
+        || (updated.source_mode == SourceMode::Biwrite
+            && previous_config.sync_paused
+            && !updated.sync_paused);
+    if source_changed && updated.source_mode == SourceMode::Manual {
+        let dir = s.state_dir();
+        match tokio::task::spawn_blocking(move || manual::public_accounts(&dir)).await {
+            Ok(Ok(value)) if value["accounts"].as_array().is_some_and(Vec::is_empty) => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "manual_pool_empty",
+                    "请先添加手动账号，再切换为手动号池",
+                );
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "source_unavailable",
+                    &e.to_string(),
+                );
+            }
+            Err(_) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "source_unavailable",
+                    "无法读取手动账号列表",
+                );
+            }
+        }
+    }
     let prospective = if source_changed {
         match s.read_source(&updated).await {
             Ok(snapshot) => Some(snapshot),
@@ -396,7 +473,9 @@ async fn api_config(State(s): State<Arc<AppState>>, Json(patch): Json<Value>) ->
         None
     };
     if updated.source_mode == SourceMode::Manual
-        && prospective.as_ref().is_some_and(|v| v.accounts.is_empty())
+        && prospective
+            .as_ref()
+            .is_some_and(|(v, _)| v.accounts.is_empty())
     {
         return error(
             StatusCode::BAD_REQUEST,
@@ -406,7 +485,7 @@ async fn api_config(State(s): State<Arc<AppState>>, Json(patch): Json<Value>) ->
     }
     let model = updated.model_override.as_deref();
     let model_available = |m: &str| match &prospective {
-        Some(snapshot) => snapshot
+        Some((snapshot, _)) => snapshot
             .accounts
             .iter()
             .any(|a| a.models.iter().any(|v| v == m)),
@@ -439,8 +518,17 @@ async fn api_config(State(s): State<Arc<AppState>>, Json(patch): Json<Value>) ->
         );
     }
     *s.config.write().unwrap_or_else(|e| e.into_inner()) = updated;
-    if source_changed {
-        let _ = s.sync_source().await;
+    if let Some((snapshot, upstream)) = prospective {
+        s.scheduler.sync_accounts(snapshot.accounts);
+        *s.resolved_upstream
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(upstream);
+        *s.source.write().unwrap_or_else(|e| e.into_inner()) = SourceState {
+            read_at_ms: snapshot.read_at_ms,
+            last_error: None,
+            warnings: snapshot.warnings,
+            providers: snapshot.providers,
+        };
     }
     s.scheduler.notify().notify_waiters();
     Json(json!({"ok":true,"config":s.settings().public()})).into_response()
@@ -514,7 +602,7 @@ async fn api_manual_delete(State(s): State<Arc<AppState>>, Path(id): Path<String
     }
 }
 async fn api_sync(State(s): State<Arc<AppState>>) -> Response {
-    match s.sync_source().await {
+    match s.sync_source_now().await {
         Ok(()) => Json(json!({"ok":true})).into_response(),
         Err(e) => error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -633,6 +721,19 @@ async fn api_probe(State(s): State<Arc<AppState>>, Json(v): Json<Value>) -> Resp
         );
     }
     let body = probe_payload(key, model);
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let local_token = s.settings().local_token;
+    let probe_secrets = s.scheduler.credential_snapshot();
+    let sanitize = |text: &str| {
+        crate::probe::redact_sensitive(
+            &s.scheduler.redact_sensitive(text),
+            probe_secrets
+                .iter()
+                .map(|secret| secret.as_ref())
+                .chain(std::iter::once(local_token.as_str())),
+        )
+    };
     let mut headers = HeaderMap::new();
     headers.insert("content-type", HeaderValue::from_static("application/json"));
     headers.insert("accept", HeaderValue::from_static("text/event-stream"));
@@ -644,33 +745,121 @@ async fn api_probe(State(s): State<Arc<AppState>>, Json(v): Json<Value>) -> Resp
         headers.insert("x-pool-router-key", value);
     }
     headers.insert("x-pool-router-probe", HeaderValue::from_static("1"));
-    let response = run_proxy(
-        s,
-        Uri::from_static("/v1/responses"),
-        headers,
-        Bytes::from(body.to_string()),
+    let response = tokio::time::timeout_at(
+        deadline,
+        run_proxy(
+            s.clone(),
+            Uri::from_static("/v1/responses"),
+            headers,
+            Bytes::from(body.to_string()),
+        ),
     )
     .await;
-    let status = response.status();
-    match to_bytes(response.into_body(), 8 * 1024 * 1024).await {
-        Ok(bytes) => {
-            let mut observer = SseObserver::new();
-            observer.push(&bytes);
-            observer.finish();
-            let o = observer.observation();
-            let ok = status.is_success() && o.completed && o.error_code.is_none();
-            Json(json!({"ok":ok,"status":status.as_u16(),"message":if ok{"验证成功"}else{"本次验证未成功，请查看请求记录"},"response_model":o.model,"error_code":o.error_code})).into_response()
+    let response = match response {
+        Ok(response) => response,
+        Err(_) => {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let mut collector = crate::probe::Collector::new(true);
+            collector.add_event("request_started", 0, "开始固定合成验证请求。");
+            collector.add_event("probe_timeout", elapsed_ms, "验证超过 120 秒，已停止等待。");
+            let details =
+                collector.details(None, model, elapsed_ms, Some("probe_timeout"), sanitize);
+            return Json(json!({"ok":false,"status":504,"message":"验证超时","response_model":null,"error_code":"probe_timeout","details":details})).into_response();
         }
-        Err(_) => error(
-            StatusCode::BAD_GATEWAY,
-            "probe_stream_failed",
-            "验证流未完成，请查看请求记录",
-        ),
+    };
+    let status = response.status();
+    // This is a locally generated record ID, never an arbitrary upstream header value.
+    let request_id = response
+        .headers()
+        .get("x-pool-router-request-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        .map(|value| value.to_string());
+    let is_sse = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
+    let mut collector = crate::probe::Collector::new(is_sse);
+    collector.add_event("request_started", 0, "开始固定合成验证请求。");
+    collector.add_event(
+        "response_headers",
+        started.elapsed().as_millis() as u64,
+        &format!("收到 HTTP {} 响应。", status.as_u16()),
+    );
+    let mut stream = response.into_body().into_data_stream();
+    let mut received = 0usize;
+    let mut failure = None;
+    loop {
+        let part = tokio::time::timeout_at(deadline, stream.next()).await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match part {
+            Ok(Some(Ok(bytes))) => {
+                received = received.saturating_add(bytes.len());
+                if received > crate::probe::MAX_RESPONSE_BYTES {
+                    failure = Some("probe_response_too_large");
+                    break;
+                }
+                collector.push(&bytes, elapsed_ms);
+            }
+            Ok(None) => break,
+            Ok(Some(Err(_))) => {
+                failure = Some("probe_stream_failed");
+                break;
+            }
+            Err(_) => {
+                failure = Some("probe_timeout");
+                break;
+            }
+        }
     }
+    // Dropping the body releases its request lease and cancels further upstream reads.
+    drop(stream);
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    collector.finish(elapsed_ms);
+    if let Some(code) = failure {
+        collector.add_event(code, elapsed_ms, crate::probe::error_message(Some(code)));
+    }
+    if let Some(record) = request_id.as_ref().and_then(|id| {
+        s.records
+            .records()
+            .into_iter()
+            .find(|record| &record.id == id)
+    }) {
+        collector.record_events(&record);
+    }
+    let observation = collector.observation().clone();
+    let ok = failure.is_none()
+        && status.is_success()
+        && observation.completed
+        && observation.error_code.is_none();
+    let status_code = match status.as_u16() {
+        401 => Some("authentication_error"),
+        403 => Some("permission_denied"),
+        429 => Some("rate_limit_exceeded"),
+        500..=599 => Some("upstream_error"),
+        _ => None,
+    };
+    let observed_code = collector.error_code();
+    let error_code = failure
+        .or(observed_code.filter(|code| *code != "unknown_error"))
+        .or(status_code)
+        .or(observed_code)
+        .or((!ok).then_some("probe_incomplete"))
+        .map(str::to_owned);
+    let response_model = observation.model.as_deref().map(sanitize);
+    let details = collector.details(
+        request_id,
+        model,
+        elapsed_ms,
+        error_code.as_deref(),
+        sanitize,
+    );
+    Json(json!({"ok":ok,"status":status.as_u16(),"message":if ok{"验证成功"}else{"本次验证未成功，请查看详细日志"},"response_model":response_model,"error_code":error_code,"details":details})).into_response()
 }
 
 fn probe_payload(key_id: &str, model: &str) -> Value {
-    // AnyRouter's Codex endpoint also requires a cache routing key. This is
+    // Some Responses endpoints require a cache routing key. This is
     // metadata for this short synthetic probe, never a replacement for a real
     // Codex conversation's cache key.
     let model_hash = blake3::hash(model.as_bytes()).to_hex();
@@ -679,8 +868,8 @@ fn probe_payload(key_id: &str, model: &str) -> Value {
         &key_id[..key_id.len().min(12)],
         &model_hash[..8]
     );
-    json!({"model":model,"instructions":"Reply only OK.",
-        "input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Reply only OK."}]}],
+    json!({"model":model,"instructions":crate::probe::REQUEST_TEXT,
+        "input":[{"type":"message","role":"user","content":[{"type":"input_text","text":crate::probe::REQUEST_TEXT}]}],
         "reasoning":{"effort":"low"},"include":["reasoning.encrypted_content"],
         "prompt_cache_key":cache_key,"stream":true,"store":false})
 }
@@ -917,6 +1106,7 @@ struct RequestGuard {
     started: Instant,
     recording: bool,
     finished: bool,
+    upstream_session: Option<String>,
 }
 impl RequestGuard {
     fn new(state: Arc<AppState>, record: RequestRecord, recording: bool) -> Self {
@@ -928,9 +1118,13 @@ impl RequestGuard {
             started: Instant::now(),
             recording,
             finished: false,
+            upstream_session: None,
         }
     }
     fn observe(&mut self, o: &Observation) {
+        if o.meaningful_output && self.record.first_output_ms.is_none() {
+            self.record.first_output_ms = Some(self.started.elapsed().as_millis() as u64);
+        }
         self.record.response_model = o.model.clone();
         self.record.response_effort = o.effort.clone();
         self.record.response_service_tier = o.service_tier.clone();
@@ -945,12 +1139,37 @@ impl RequestGuard {
                 &self.record.effective_model,
             )
         {
-            self.state.scheduler.bind_response(id, key, model);
+            self.state.scheduler.bind_response_with_session(
+                id,
+                key,
+                model,
+                self.upstream_session.as_deref(),
+            );
         }
     }
     fn finish(&mut self, outcome: &str) {
         self.record.outcome = outcome.into();
         self.finished = true;
+    }
+    fn action(&mut self, action: &str, attempt: usize, count: usize) {
+        if self.record.gateway_actions.len() < 32 {
+            self.record.gateway_actions.push(GatewayAction {
+                action: action.into(),
+                attempt,
+                elapsed_ms: self.started.elapsed().as_millis() as u64,
+                count,
+                ..GatewayAction::default()
+            });
+        }
+    }
+    fn error(&self, status: StatusCode, code: &str, message: &str) -> Response {
+        let mut response = error(status, code, message);
+        if let Ok(value) = HeaderValue::from_str(&self.record.id) {
+            response
+                .headers_mut()
+                .insert("x-pool-router-request-id", value);
+        }
+        response
     }
 }
 impl Drop for RequestGuard {
@@ -1043,12 +1262,36 @@ async fn run_legacy_proxy(
         ..RequestRecord::default()
     };
     let mut guard = RequestGuard::new(state.clone(), record, cfg.recording_enabled);
-    let origin = state
+    let override_origin = state
         .legacy_upstream_override
         .read()
         .unwrap_or_else(|e| e.into_inner())
-        .clone()
-        .unwrap_or_else(|| "https://anyrouter.top/v1".into());
+        .clone();
+    let origin = if let Some(origin) = override_origin {
+        Ok(origin)
+    } else {
+        let state_dir = state.state_dir();
+        tokio::task::spawn_blocking(move || -> Result<String> {
+            if let Some(origin) = integration::legacy_monitor_upstream(&state_dir)? {
+                return Ok(origin);
+            }
+            anyhow::bail!("请先在面板接入 CC Switch 兼容监控；此模式只使用接入备份中的原上游地址")
+        })
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("无法读取兼容监控的上游地址")))
+    };
+    let origin = match origin {
+        Ok(origin) => origin,
+        Err(e) => {
+            guard.record.status = Some(503);
+            guard.finish("upstream_unconfigured");
+            return guard.error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "upstream_unconfigured",
+                &e.to_string(),
+            );
+        }
+    };
     let suffix = uri
         .path_and_query()
         .map(|v| v.as_str())
@@ -1062,7 +1305,6 @@ async fn run_legacy_proxy(
         .headers(forward_headers(&headers, false))
         .bearer_auth(&key)
         .body(raw);
-    drop(key);
     let started = Instant::now();
     let upstream = match tokio::time::timeout(
         Duration::from_millis(cfg.upstream_header_timeout_ms),
@@ -1079,13 +1321,14 @@ async fn run_legacy_proxy(
             };
             guard.record.status = Some(status.as_u16());
             guard.record.attempts.push(AttemptRecord {
+                error_message: None,
                 key_id,
                 status: None,
                 reason: reason.into(),
                 duration_ms: started.elapsed().as_millis() as u64,
             });
             guard.finish(reason);
-            return error(
+            return guard.error(
                 status,
                 reason,
                 "旧供应商上游连接未完成；未重试或改用其他账号",
@@ -1168,7 +1411,9 @@ async fn run_legacy_proxy(
         let outcome = if completed { "completed" } else if transport_failed { "stream_read_failed" }
             else if !status.is_success() || observation.error_code.is_some() || (observation.terminal && !observation.completed) { "upstream_failed" }
             else { "invalid_upstream_response" };
-        guard.record.attempts.push(AttemptRecord { key_id, status: Some(status.as_u16()),
+        let error_message = observation.raw_error_message.as_deref().and_then(|message|
+            crate::probe::bounded_error_message(message, [cfg.local_token.as_str(), key.as_str()]));
+        guard.record.attempts.push(AttemptRecord { error_message, key_id, status: Some(status.as_u16()),
             reason: observation.error_code.unwrap_or_else(|| outcome.into()), duration_ms: started.elapsed().as_millis() as u64 });
         guard.finish(outcome);
         if transport_failed { yield Err(io::Error::other("旧供应商上游响应中断")); }
@@ -1182,6 +1427,100 @@ async fn run_legacy_proxy(
             .insert("x-pool-router-request-id", value);
     }
     response
+}
+
+#[derive(Default)]
+struct RequestRecovery {
+    rate_limits: HashMap<String, usize>,
+    session_reset: bool,
+    compaction_repaired: bool,
+}
+
+impl RequestRecovery {
+    fn reset_session(
+        &mut self,
+        state: &AppState,
+        cfg: &Config,
+        kind: Option<RecoveryKind>,
+        scope: Option<&str>,
+        request: (&HeaderMap, &Value),
+    ) -> bool {
+        let (headers, body) = request;
+        let Some(scope) = scope else {
+            return false;
+        };
+        let rate_limits = if kind == Some(RecoveryKind::RateLimited) {
+            let count = self.rate_limits.entry(scope.to_owned()).or_default();
+            *count += 1;
+            *count
+        } else {
+            self.rate_limits.remove(scope);
+            0
+        };
+        let persistent_rejection = kind == Some(RecoveryKind::SessionResourceUnavailable)
+            || (kind == Some(RecoveryKind::RateLimited) && rate_limits >= 2);
+        if !cfg.session_recovery_enabled || self.session_reset || !persistent_rejection {
+            return false;
+        }
+        let mut probe_headers = headers.clone();
+        let mut probe_body = body.clone();
+        if !recovery::rewrite_upstream_session(
+            &mut probe_headers,
+            &mut probe_body,
+            "00000000-0000-4000-8000-000000000001",
+        ) {
+            return false;
+        }
+        state
+            .session_remaps
+            .rotate(scope, cfg.policy.affinity_ttl_seconds.saturating_mul(1000));
+        self.session_reset = true;
+        true
+    }
+}
+
+fn session_scope(
+    headers: &HeaderMap,
+    body: &Value,
+    key: &str,
+    model: &str,
+    upstream: &str,
+) -> Option<String> {
+    let identity = monitor::conversation_id(headers, body).or_else(|| {
+        body["prompt_cache_key"]
+            .as_str()
+            .filter(|v| !v.is_empty() && v.len() <= 1024)
+            .map(str::to_owned)
+    })?;
+    Some(
+        blake3::hash(
+            json!([identity, key, model, upstream])
+                .to_string()
+                .as_bytes(),
+        )
+        .to_hex()
+        .to_string(),
+    )
+}
+
+fn recovery_reason(kind: Option<RecoveryKind>) -> Option<&'static str> {
+    kind.map(|kind| match kind {
+        RecoveryKind::RateLimited => "rate_limit_exceeded",
+        RecoveryKind::SessionResourceUnavailable => "resource_not_found",
+        RecoveryKind::IncompatibleEncryptedContent => "invalid_encrypted_content",
+    })
+}
+
+fn observed_error_message(
+    state: &AppState,
+    observation: &Observation,
+    secrets: &[&str],
+) -> Option<String> {
+    let message = observation.raw_error_message.as_deref()?;
+    crate::probe::bounded_error_message(
+        &state.scheduler.redact_sensitive(message),
+        secrets.iter().copied(),
+    )
 }
 
 pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: Bytes) -> Response {
@@ -1281,7 +1620,7 @@ pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: 
             "请求引用了前一次响应，请保持原模型完成此对话链",
         );
     }
-    let rewritten = effective_model != requested_model || effective_effort != requested_effort;
+    let mut rewritten = effective_model != requested_model || effective_effort != requested_effort;
     if rewritten {
         body["model"] = Value::String(effective_model.clone());
         if let Some(effort) = &effective_effort {
@@ -1295,7 +1634,30 @@ pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: 
             }
         }
     }
-    let payload = if rewritten {
+    let image_summary = if initial.compress_images {
+        match tokio::task::spawn_blocking(move || {
+            let summary = crate::image_compression::compress_inline_images(&mut body);
+            (body, summary)
+        })
+        .await
+        {
+            Ok((updated, summary)) => {
+                body = updated;
+                rewritten |= summary.count > 0;
+                Some(summary)
+            }
+            Err(_) => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "image_processing_failed",
+                    "图片处理未完成，请关闭图片压缩后重试",
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let mut payload = if rewritten {
         Bytes::from(body.to_string())
     } else {
         raw.clone()
@@ -1332,6 +1694,17 @@ pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: 
         ..RequestRecord::default()
     };
     let mut guard = RequestGuard::new(state.clone(), record, initial.recording_enabled);
+    if let Some(summary) = image_summary
+        && summary.count > 0
+    {
+        guard.record.gateway_actions.push(GatewayAction {
+            action: "image_compression".into(),
+            count: summary.count,
+            before_bytes: Some(summary.before_bytes as u64),
+            after_bytes: Some(summary.after_bytes as u64),
+            ..GatewayAction::default()
+        });
+    }
     let mut selection = Selection {
         model: effective_model.clone(),
         conversation,
@@ -1341,12 +1714,14 @@ pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: 
     };
     let deadline = Instant::now() + Duration::from_millis(initial.queue_timeout_ms);
     let mut attempt_count = 0usize;
-    loop {
+    let mut recovery_state = RequestRecovery::default();
+    let mut retry_same_key: Option<String> = None;
+    'attempts: loop {
         let cfg = state.settings();
         if Instant::now() >= deadline || attempt_count >= initial.max_attempts {
             guard.record.status = Some(503);
             guard.finish("pool_exhausted");
-            let mut r = error(
+            let mut r = guard.error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "pool_exhausted",
                 "当前模型候选均忙碌、冷却或重试未成功，稍后重试",
@@ -1355,11 +1730,23 @@ pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: 
                 .insert("retry-after", HeaderValue::from_static("2"));
             return r;
         }
-        let lease = match state.scheduler.try_acquire(&selection, &cfg.policy) {
-            Ok(v) => v,
+        let mut attempt_selection = selection.clone();
+        if let Some(key) = &retry_same_key {
+            attempt_selection.explicit_key = Some(key.clone());
+            attempt_selection.exclude.remove(key);
+        }
+        let lease = match state.scheduler.try_acquire(&attempt_selection, &cfg.policy) {
+            Ok(v) => {
+                retry_same_key = None;
+                v
+            }
+            Err(SelectError::NoEligible) if retry_same_key.is_some() => {
+                retry_same_key = None;
+                continue;
+            }
             Err(SelectError::UnknownResponse) => {
                 guard.finish("unknown_response");
-                return error(
+                return guard.error(
                     StatusCode::CONFLICT,
                     "unknown_response",
                     "无法确认前次响应所属账号，不能跨账号续接；请由客户端重发所需上下文",
@@ -1367,7 +1754,7 @@ pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: 
             }
             Err(SelectError::AffinityUnavailable) if selection.previous_response_id.is_some() => {
                 guard.finish("affinity_unavailable");
-                return error(
+                return guard.error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "affinity_unavailable",
                     "前次响应所属账号或模型当前不可用，已保留上下文关联",
@@ -1377,10 +1764,10 @@ pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: 
                 if selection.exclude.is_empty() =>
             {
                 guard.finish("no_candidate");
-                return error(
+                return guard.error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "no_candidate",
-                    "BiWrite 中尚无匹配模型的保活候选，或候选已被停用",
+                    "当前号池没有匹配模型的可调度账号，或账号已停用",
                 );
             }
             Err(_) => {
@@ -1393,25 +1780,90 @@ pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: 
         };
         attempt_count += 1;
         let attempt_started = Instant::now();
+        let first_output_deadline =
+            attempt_started + Duration::from_millis(cfg.first_output_timeout_ms);
         let key = lease.account.id.clone();
         guard.record.key_id = Some(key.clone());
+        let scope = session_scope(
+            &headers,
+            &body,
+            &key,
+            &effective_model,
+            &lease.account.upstream,
+        );
+        let mut attempt_headers = headers.clone();
+        let mut attempt_payload = payload.clone();
+        let mut attempt_rewritten = rewritten;
+        let mapped = if let Some(previous) = selection.previous_response_id.as_deref() {
+            match state.scheduler.response_session(
+                previous,
+                &key,
+                &effective_model,
+                &lease.account.upstream,
+                cfg.policy.affinity_ttl_seconds,
+            ) {
+                Some(mapped) => mapped,
+                None => {
+                    guard.finish("unknown_response");
+                    return guard.error(
+                        StatusCode::CONFLICT,
+                        "unknown_response",
+                        "前次响应的会话绑定已失效，请由客户端重发所需上下文",
+                    );
+                }
+            }
+        } else {
+            scope.as_deref().and_then(|scope| {
+                state
+                    .session_remaps
+                    .lookup(scope, cfg.policy.affinity_ttl_seconds.saturating_mul(1000))
+            })
+        };
+        guard.upstream_session = None;
+        if let Some(mapped) = mapped {
+            let mut mapped_body = body.clone();
+            if recovery::apply_known_upstream_session(
+                &mut attempt_headers,
+                &mut mapped_body,
+                &mapped,
+            ) {
+                attempt_payload = Bytes::from(mapped_body.to_string());
+                attempt_rewritten = true;
+                guard.upstream_session = Some(mapped);
+                guard.action("session_reused", attempt_count, 1);
+            } else if selection.previous_response_id.is_some() {
+                guard.finish("stateful_session_unavailable");
+                return guard.error(
+                    StatusCode::CONFLICT,
+                    "stateful_session_unavailable",
+                    "此响应关联的上游会话缺少可恢复的请求标识，请保持原会话配置或重发所需上下文",
+                );
+            }
+        }
+        guard.record.upstream_request_bytes = Some(attempt_payload.len() as u64);
         let suffix = uri.path().strip_prefix("/v1").unwrap_or("/responses");
         let target = format!("{}{}", lease.account.upstream.trim_end_matches('/'), suffix);
         let request = state
             .client
             .post(&target)
-            .headers(forward_headers(&headers, rewritten))
+            .headers(forward_headers(&attempt_headers, attempt_rewritten))
             .bearer_auth(lease.account.secret.as_ref())
-            .body(payload.clone());
+            .body(attempt_payload);
         let sent = tokio::time::timeout(
-            Duration::from_millis(cfg.upstream_header_timeout_ms)
-                .min(deadline.saturating_duration_since(Instant::now())),
+            Duration::from_millis(cfg.upstream_header_timeout_ms).min(
+                deadline
+                    .min(first_output_deadline)
+                    .saturating_duration_since(Instant::now()),
+            ),
             request.send(),
         )
         .await;
         let upstream = match sent {
             Ok(Ok(response)) => response,
             Ok(Err(e)) => {
+                if let Some(scope) = scope.as_deref() {
+                    recovery_state.rate_limits.remove(scope);
+                }
                 let safe_retry = e.is_connect();
                 let reason = if safe_retry {
                     "connect_failed"
@@ -1427,6 +1879,7 @@ pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: 
                     &cfg.policy,
                 );
                 guard.record.attempts.push(AttemptRecord {
+                    error_message: None,
                     key_id: key.clone(),
                     status: None,
                     reason: reason.into(),
@@ -1438,32 +1891,55 @@ pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: 
                     continue;
                 }
                 guard.finish(reason);
-                return error(
+                return guard.error(
                     StatusCode::BAD_GATEWAY,
                     reason,
                     "上游连接异常，无法确定请求是否已被处理，请由客户端决定重试",
                 );
             }
             Err(_) => {
+                if let Some(scope) = scope.as_deref() {
+                    recovery_state.rate_limits.remove(scope);
+                }
+                let reason = if Instant::now() >= first_output_deadline {
+                    "first_output_timeout"
+                } else {
+                    "header_timeout"
+                };
                 state.scheduler.mark_failure(
                     &key,
                     &effective_model,
                     None,
                     None,
-                    "header_timeout",
+                    reason,
                     &cfg.policy,
                 );
                 guard.record.attempts.push(AttemptRecord {
-                    key_id: key,
+                    error_message: None,
+                    key_id: key.clone(),
                     status: None,
-                    reason: "header_timeout".into(),
+                    reason: reason.into(),
                     duration_ms: attempt_started.elapsed().as_millis() as u64,
                 });
-                guard.finish("header_timeout");
-                return error(
+                if selection.previous_response_id.is_none() {
+                    guard.action(
+                        if reason == "first_output_timeout" {
+                            reason
+                        } else {
+                            "header_timeout_retry"
+                        },
+                        attempt_count,
+                        1,
+                    );
+                    drop(lease);
+                    selection.exclude.insert(key);
+                    continue;
+                }
+                guard.finish(reason);
+                return guard.error(
                     StatusCode::GATEWAY_TIMEOUT,
-                    "header_timeout",
-                    "等待上游响应超时，请由客户端决定重试",
+                    reason,
+                    "等待上游响应超时；带有前次响应绑定的请求未自动重放",
                 );
             }
         };
@@ -1479,10 +1955,14 @@ pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: 
         if !status.is_success() || !is_sse {
             let mut response_body = Vec::new();
             let mut body_error = false;
+            let mut first_output_timed_out = false;
             loop {
                 match tokio::time::timeout(
-                    Duration::from_millis(cfg.stream_idle_timeout_ms)
-                        .min(deadline.saturating_duration_since(Instant::now())),
+                    Duration::from_millis(cfg.stream_idle_timeout_ms).min(
+                        deadline
+                            .min(first_output_deadline)
+                            .saturating_duration_since(Instant::now()),
+                    ),
                     upstream_stream.next(),
                 )
                 .await
@@ -1497,12 +1977,45 @@ pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: 
                     Ok(None) => break,
                     _ => {
                         body_error = true;
+                        first_output_timed_out = Instant::now() >= first_output_deadline;
                         break;
                     }
                 }
             }
             if body_error {
+                if let Some(scope) = scope.as_deref() {
+                    recovery_state.rate_limits.remove(scope);
+                }
+                if first_output_timed_out && selection.previous_response_id.is_none() {
+                    state.scheduler.mark_failure(
+                        &key,
+                        &effective_model,
+                        None,
+                        None,
+                        "first_output_timeout",
+                        &cfg.policy,
+                    );
+                    guard.record.attempts.push(AttemptRecord {
+                        error_message: None,
+                        key_id: key.clone(),
+                        status: Some(status.as_u16()),
+                        reason: "first_output_timeout".into(),
+                        duration_ms: attempt_started.elapsed().as_millis() as u64,
+                    });
+                    guard.action("first_output_timeout", attempt_count, 1);
+                    drop(upstream_stream);
+                    drop(lease);
+                    selection.exclude.insert(key);
+                    continue;
+                }
                 guard.finish("response_read_failed");
+                guard.record.attempts.push(AttemptRecord {
+                    error_message: None,
+                    key_id: key.clone(),
+                    status: Some(status.as_u16()),
+                    reason: "response_read_failed".into(),
+                    duration_ms: attempt_started.elapsed().as_millis() as u64,
+                });
                 state.scheduler.mark_failure(
                     &key,
                     &effective_model,
@@ -1511,7 +2024,7 @@ pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: 
                     "response_read_failed",
                     &cfg.policy,
                 );
-                return error(
+                return guard.error(
                     StatusCode::BAD_GATEWAY,
                     "response_read_failed",
                     "上游响应未完整收到",
@@ -1523,6 +2036,7 @@ pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: 
                 .as_ref()
                 .map(monitor::inspect_json)
                 .unwrap_or_default();
+            let recovery_kind = recovery::classify_error(status.as_u16(), &response_body);
             guard.observe(&observation);
             let retryable = matches!(
                 status.as_u16(),
@@ -1539,11 +2053,18 @@ pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: 
                 || (observation.terminal && !observation.completed)
                 || invalid_success;
             let reason = if failed {
-                observation.error_code.as_deref().unwrap_or("http_error")
+                recovery_reason(recovery_kind)
+                    .or(observation.error_code.as_deref())
+                    .unwrap_or("http_error")
             } else {
                 "completed"
             };
             guard.record.attempts.push(AttemptRecord {
+                error_message: observed_error_message(
+                    &state,
+                    &observation,
+                    &[cfg.local_token.as_str(), lease.account.secret.as_ref()],
+                ),
                 key_id: key.clone(),
                 status: Some(status.as_u16()),
                 reason: reason.into(),
@@ -1560,8 +2081,50 @@ pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: 
                 );
             } else {
                 state.scheduler.mark_success(&key, &effective_model);
+                guard
+                    .record
+                    .first_output_ms
+                    .get_or_insert(guard.started.elapsed().as_millis() as u64);
+            }
+            let mut repaired = false;
+            if failed
+                && cfg.compaction_repair_enabled
+                && !recovery_state.compaction_repaired
+                && uri.path() == "/v1/responses/compact"
+                && status == StatusCode::BAD_REQUEST
+                && recovery_kind == Some(RecoveryKind::IncompatibleEncryptedContent)
+            {
+                let mut repaired_body = body.clone();
+                let count = recovery::strip_incompatible_encrypted_items(&mut repaired_body);
+                if count > 0
+                    && repaired_body["input"]
+                        .as_array()
+                        .is_some_and(|items| !items.is_empty())
+                {
+                    body = repaired_body;
+                    payload = Bytes::from(body.to_string());
+                    rewritten = true;
+                    recovery_state.compaction_repaired = true;
+                    guard.action("compaction_repair", attempt_count, count);
+                    repaired = true;
+                }
+            }
+            let session_reset = failed
+                && recovery_state.reset_session(
+                    &state,
+                    &cfg,
+                    recovery_kind,
+                    scope.as_deref(),
+                    (&headers, &body),
+                );
+            if session_reset {
+                guard.action("session_reset", attempt_count, 1);
             }
             drop(lease);
+            if repaired || session_reset {
+                retry_same_key = Some(key);
+                continue;
+            }
             if failed && retryable {
                 selection.exclude.insert(key);
                 continue;
@@ -1569,7 +2132,7 @@ pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: 
             if invalid_success {
                 guard.record.status = Some(502);
                 guard.finish("invalid_upstream_response");
-                return error(
+                return guard.error(
                     StatusCode::BAD_GATEWAY,
                     "invalid_upstream_response",
                     "上游未返回有效的完整模型响应",
@@ -1583,6 +2146,11 @@ pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: 
             let mut response = Response::new(Body::from(response_body));
             *response.status_mut() = status;
             *response.headers_mut() = response_headers(&upstream_headers);
+            if let Ok(value) = HeaderValue::from_str(&guard.record.id) {
+                response
+                    .headers_mut()
+                    .insert("x-pool-router-request-id", value);
+            }
             return response;
         }
         // Delay only the prelude. An explicit rejection before meaningful output can use another account.
@@ -1592,8 +2160,11 @@ pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: 
         let mut ended = false;
         loop {
             let chunk = tokio::time::timeout(
-                Duration::from_millis(cfg.stream_idle_timeout_ms)
-                    .min(deadline.saturating_duration_since(Instant::now())),
+                Duration::from_millis(cfg.stream_idle_timeout_ms).min(
+                    deadline
+                        .min(first_output_deadline)
+                        .saturating_duration_since(Instant::now()),
+                ),
                 upstream_stream.next(),
             )
             .await;
@@ -1606,6 +2177,12 @@ pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: 
                     observer.push(&bytes);
                     prelude.push(bytes);
                     let o = observer.observation();
+                    if o.meaningful_output {
+                        guard
+                            .record
+                            .first_output_ms
+                            .get_or_insert(guard.started.elapsed().as_millis() as u64);
+                    }
                     if o.meaningful_output || o.terminal || prelude_size >= 256 * 1024 {
                         break;
                     }
@@ -1616,6 +2193,33 @@ pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: 
                     break;
                 }
                 _ => {
+                    if let Some(scope) = scope.as_deref() {
+                        recovery_state.rate_limits.remove(scope);
+                    }
+                    if Instant::now() >= first_output_deadline
+                        && selection.previous_response_id.is_none()
+                    {
+                        state.scheduler.mark_failure(
+                            &key,
+                            &effective_model,
+                            None,
+                            None,
+                            "first_output_timeout",
+                            &cfg.policy,
+                        );
+                        guard.record.attempts.push(AttemptRecord {
+                            error_message: None,
+                            key_id: key.clone(),
+                            status: Some(status.as_u16()),
+                            reason: "first_output_timeout".into(),
+                            duration_ms: attempt_started.elapsed().as_millis() as u64,
+                        });
+                        guard.action("first_output_timeout", attempt_count, 1);
+                        drop(upstream_stream);
+                        drop(lease);
+                        selection.exclude.insert(key);
+                        continue 'attempts;
+                    }
                     state.scheduler.mark_failure(
                         &key,
                         &effective_model,
@@ -1625,7 +2229,14 @@ pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: 
                         &cfg.policy,
                     );
                     guard.finish("stream_read_failed");
-                    return error(
+                    guard.record.attempts.push(AttemptRecord {
+                        error_message: None,
+                        key_id: key.clone(),
+                        status: Some(status.as_u16()),
+                        reason: "stream_read_failed".into(),
+                        duration_ms: attempt_started.elapsed().as_millis() as u64,
+                    });
+                    return guard.error(
                         StatusCode::BAD_GATEWAY,
                         "stream_read_failed",
                         "上游流在输出前中断，未自动重复提交",
@@ -1637,10 +2248,23 @@ pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: 
         if observation.terminal {
             ended = true;
         }
-        if observation.terminal && observation.retryable && !observation.meaningful_output {
-            let reason = observation
-                .error_code
-                .as_deref()
+        let recovery_kind = if observation.terminal && !observation.meaningful_output {
+            let bounded_error: Vec<u8> = prelude
+                .iter()
+                .flat_map(|part| part.iter().copied())
+                .take(256 * 1024)
+                .collect();
+            recovery::classify_error(status.as_u16(), &bounded_error)
+        } else {
+            None
+        };
+        if observation.terminal
+            && !observation.meaningful_output
+            && (observation.retryable
+                || recovery_kind == Some(RecoveryKind::SessionResourceUnavailable))
+        {
+            let reason = recovery_reason(recovery_kind)
+                .or(observation.error_code.as_deref())
                 .unwrap_or("upstream_rejected");
             state.scheduler.mark_failure(
                 &key,
@@ -1651,14 +2275,33 @@ pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: 
                 &cfg.policy,
             );
             guard.record.attempts.push(AttemptRecord {
+                error_message: observed_error_message(
+                    &state,
+                    &observation,
+                    &[cfg.local_token.as_str(), lease.account.secret.as_ref()],
+                ),
                 key_id: key.clone(),
                 status: Some(status.as_u16()),
                 reason: reason.into(),
                 duration_ms: attempt_started.elapsed().as_millis() as u64,
             });
+            let session_reset = recovery_state.reset_session(
+                &state,
+                &cfg,
+                recovery_kind,
+                scope.as_deref(),
+                (&headers, &body),
+            );
+            if session_reset {
+                guard.action("session_reset", attempt_count, 1);
+            }
             drop(lease);
             drop(upstream_stream);
-            selection.exclude.insert(key);
+            if session_reset {
+                retry_same_key = Some(key);
+            } else {
+                selection.exclude.insert(key);
+            }
             continue;
         }
         guard.record.transport = "sse".into();
@@ -1672,20 +2315,24 @@ pub async fn run_proxy(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: 
             record_guard.observe(observer.observation());
             for bytes in prelude {record_guard.record.response_bytes+=bytes.len() as u64;yield Ok::<Bytes,io::Error>(bytes);}
             let mut transport_failed=false;
+            let mut output_timed_out=false;
             if !ended {
                 loop {
-                    match tokio::time::timeout(Duration::from_millis(idle),upstream_stream.next()).await {
+                    let timeout = if observer.observation().meaningful_output { Duration::from_millis(idle) }
+                        else { Duration::from_millis(idle).min(first_output_deadline.saturating_duration_since(Instant::now())) };
+                    match tokio::time::timeout(timeout,upstream_stream.next()).await {
                         Ok(Some(Ok(bytes)))=>{observer.push(&bytes);record_guard.observe(observer.observation());record_guard.record.response_bytes+=bytes.len() as u64;yield Ok(bytes);if observer.observation().terminal{break;}},
                         Ok(None)=>break,
-                        _=>{transport_failed=true;yield Err(io::Error::other("上游流连接中断"));break;}
+                        _=>{transport_failed=true;output_timed_out=!observer.observation().meaningful_output && Instant::now()>=first_output_deadline;yield Err(io::Error::other("上游流连接中断"));break;}
                     }
                 }
             }
             observer.finish();let final_observation=observer.observation();record_guard.observe(final_observation);
             let completed=final_observation.completed && final_observation.error_code.is_none() && !transport_failed;
-            let reason=if completed{"completed"}else{final_observation.error_code.as_deref().unwrap_or("incomplete_stream")};
+            let reason=if completed{"completed"}else if output_timed_out{"first_output_timeout"}else{final_observation.error_code.as_deref().unwrap_or("incomplete_stream")};
             if completed {state.scheduler.mark_success(&key,&effective_model);}else{state.scheduler.mark_failure(&key,&effective_model,Some(health_status(status.as_u16(),final_observation)),retry_delay,reason,&policy);}
-            record_guard.record.attempts.push(AttemptRecord{key_id:key,status:Some(status.as_u16()),reason:reason.into(),duration_ms:attempt_started.elapsed().as_millis() as u64});
+            let error_message=observed_error_message(&state,final_observation,&[cfg.local_token.as_str(),_lease.account.secret.as_ref()]);
+            record_guard.record.attempts.push(AttemptRecord{error_message,key_id:key,status:Some(status.as_u16()),reason:reason.into(),duration_ms:attempt_started.elapsed().as_millis() as u64});
             record_guard.finish(if completed{"completed"}else{"upstream_failed"});
         };
         let mut response = Response::new(Body::from_stream(stream));
@@ -1718,5 +2365,129 @@ mod probe_tests {
         assert!(!p["prompt_cache_key"].as_str().unwrap().is_empty());
         assert!(p["prompt_cache_key"].as_str().unwrap().len() <= 64);
         assert!(p.get("max_output_tokens").is_none());
+    }
+
+    #[tokio::test]
+    async fn probe_details_accept_json_and_sse_without_exposing_loaded_credentials() {
+        use crate::types::Account;
+        use std::collections::HashMap;
+        use std::sync::atomic::AtomicUsize;
+        for sse in [false, true] {
+            let key = "opaque-primary-fixture-credential";
+            let other_key = "opaque-other-fixture-credential";
+            let local_token = "local-fixture-token-at-least-32-characters";
+            let visible = format!(
+                "OK {key} {other_key} {local_token} sk-unloaded-fixture Bearer unknown-fixture https://user:password@example.com/private"
+            );
+            let result = json!({"id":"resp_probe_fixture","object":"response","model":"test-model","status":"completed",
+                "output":[{"type":"reasoning","encrypted_content":"private-encrypted-fixture"},
+                    {"type":"message","content":[{"type":"output_text","text":visible}]}],
+                "usage":{"input_tokens":7,"output_tokens":3}});
+            let count = Arc::new(AtomicUsize::new(0));
+            let seen = count.clone();
+            let app = Router::new().route(
+                "/v1/responses",
+                post(move |headers: HeaderMap, Json(request): Json<Value>| {
+                    let result = result.clone();
+                    let seen = seen.clone();
+                    async move {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(request["instructions"], crate::probe::REQUEST_TEXT);
+                        assert_eq!(
+                            request["input"][0]["content"][0]["text"],
+                            crate::probe::REQUEST_TEXT
+                        );
+                        assert_eq!(headers["authorization"], format!("Bearer {key}"));
+                        let text = if sse {
+                            format!(
+                                "data: {}\n\n",
+                                json!({"type":"response.completed","response":result})
+                            )
+                        } else {
+                            result.to_string()
+                        };
+                        Response::builder()
+                            .header(
+                                "content-type",
+                                if sse {
+                                    "text/event-stream"
+                                } else {
+                                    "application/json"
+                                },
+                            )
+                            .header("x-private-fixture", "header-never-displayed")
+                            .body(Body::from(text))
+                            .unwrap()
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream = format!("http://{}/v1", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let config = Config {
+                local_token: local_token.into(),
+                max_attempts: 1,
+                ..Config::default()
+            };
+            let state = AppState::new(config, dir.path().join("config.json"), false).unwrap();
+            state.scheduler.sync_accounts(
+                [("a".repeat(64), key), ("b".repeat(64), other_key)]
+                    .into_iter()
+                    .map(|(id, secret)| Account {
+                        id,
+                        secret: Arc::from(secret),
+                        upstream: upstream.clone(),
+                        label: "fixture".into(),
+                        models: vec!["test-model".into()],
+                        provider_ids: vec!["fixture".into()],
+                        source_max_concurrency: 1,
+                        model_concurrency: HashMap::from([("test-model".into(), 1)]),
+                        last_source_success_ms: None,
+                        model_source_success_ms: HashMap::new(),
+                    })
+                    .collect(),
+            );
+            let response = api_probe(
+                State(state.clone()),
+                Json(json!({"key_id":"a".repeat(64),"model":"test-model"})),
+            )
+            .await;
+            let bytes = to_bytes(response.into_body(), 512 * 1024).await.unwrap();
+            let result: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(result["ok"], true);
+            assert_eq!(result["status"], 200);
+            assert_eq!(result["details"]["usage"]["input_tokens"], 7);
+            assert!(
+                result["details"]["response_text"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("OK ")
+            );
+            let serialized = String::from_utf8(bytes.to_vec()).unwrap();
+            for forbidden in [
+                key,
+                other_key,
+                local_token,
+                "sk-unloaded-fixture",
+                "unknown-fixture",
+                "user:password",
+                "private-encrypted-fixture",
+                "header-never-displayed",
+            ] {
+                assert!(!serialized.contains(forbidden), "probe leaked fixture data");
+            }
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+            assert!(
+                state
+                    .scheduler
+                    .snapshot(&state.settings().policy)
+                    .iter()
+                    .all(|account| account.in_flight == 0)
+            );
+            server.abort();
+        }
     }
 }

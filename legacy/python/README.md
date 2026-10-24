@@ -1,5 +1,7 @@
 # Codex Wiretap
 
+本文说明历史 Python 实现。新安装请使用仓库根目录的 [Rust 版本](../../README.md)。以下命令在 `legacy/python/` 中执行；BiWrite 号池、账号验证和号池重试等 Rust 功能不适用于此版本。Rust 的 CC Switch 兼容监控不会启动或依赖本服务。
+
 [![Tests](https://github.com/qzkinhit/codex-wiretap/actions/workflows/tests.yml/badge.svg)](https://github.com/qzkinhit/codex-wiretap/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -10,12 +12,6 @@ A local HTTP/SSE/WebSocket observer for Codex model and reasoning metadata. The 
 仓库另附一个 Claude Code skill，用于把画图、定理审查和规格明确的执行任务派给 Codex CLI，见 [Claude Code 子代理 skill](#claude-code-子代理-skill)。
 
 **想知道请求有没有被改参数，可以用它观察字段差异。想证明中转站实际运行了哪个模型或多少计算量，仅靠这个工具做不到。**
-
-## 系统界面
-
-![Codex Wiretap 在线监测面板](docs/images/dashboard.jpg)
-
-上图为经使用者授权公开的实际在线面板截图，包含请求统计、记录开关、模型与强度对照及用量信息，不包含 API Key 或对话正文。它只展示截图时的观测状态；其中的中转站地址不是推荐服务，字段差异也不是对该服务实际执行模型的独立鉴定。
 
 ## 你会看到什么
 
@@ -67,7 +63,7 @@ A local HTTP/SSE/WebSocket observer for Codex model and reasoning metadata. The 
 
 ```bash
 git clone https://github.com/qzkinhit/codex-wiretap.git
-cd codex-wiretap
+cd codex-wiretap/legacy/python
 python3 --version
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt

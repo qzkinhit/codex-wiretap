@@ -382,7 +382,7 @@ pub fn connect_cc_legacy(base_url: &str, token: &str, state_dir: &Path) -> Resul
     )
 }
 
-/// Enable monitoring for the selected CC Switch Anyrouter provider without changing its key.
+/// Enable monitoring for the selected CC Switch provider without changing its key.
 pub fn connect_legacy_monitor(base_url: &str, state_dir: &Path) -> Result<String> {
     connect_monitor_at(
         base_url,
@@ -398,25 +398,26 @@ fn read_cc_database(path: &Path) -> Result<Connection> {
     Ok(db)
 }
 
-fn anyrouter_source(raw: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(raw) else {
-        return false;
-    };
-    url.scheme() == "https"
-        && url.host_str() == Some("anyrouter.top")
-        && url.port_or_known_default() == Some(443)
-        && url.path().trim_end_matches('/') == "/v1"
-        && url.username().is_empty()
-        && url.password().is_none()
-        && url.query().is_none()
-        && url.fragment().is_none()
-}
-
 fn read_monitor_backup(state_dir: &Path) -> Result<MonitorBackup> {
     serde_json::from_slice(
         &fs::read(state_dir.join(MONITOR_JOURNAL)).context("未找到 CC Switch 监控接入备份")?,
     )
     .map_err(|_| anyhow::anyhow!("CC Switch 监控接入备份格式无效"))
+}
+
+/// Resolve the original monitored upstream from its private journal, never from a key pool.
+/// The journal keeps the original spelling so restoring the provider remains lossless.
+pub fn legacy_monitor_upstream(state_dir: &Path) -> Result<Option<String>> {
+    let bytes = match fs::read(state_dir.join(MONITOR_JOURNAL)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => bail!("无法读取 CC Switch 监控接入备份"),
+    };
+    let backup: MonitorBackup = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("CC Switch 监控接入备份格式无效"))?;
+    let upstream = crate::upstream::normalize_base_url(&backup.before_url)
+        .map_err(|_| anyhow::anyhow!("CC Switch 监控备份中的原上游地址无效"))?;
+    Ok(Some(upstream))
 }
 
 fn monitor_managed_fields_match(doc: &DocumentMut, backup: &MonitorBackup) -> Result<()> {
@@ -459,10 +460,11 @@ fn connect_monitor_at(base_url: &str, state_dir: &Path, database: &Path) -> Resu
         monitor_managed_fields_match(&doc, &backup)?;
         return Ok("CC Switch 当前供应商已经接入同一监控入口，真实密钥及其他设置保持原值，无需重复修改。运行时是否读取新目标仍需请求验证。".into());
     }
-    ensure!(
-        anyrouter_source(&previous_url),
-        "手动密钥监控只接入 https://anyrouter.top/v1 供应商；未知本地代理可能形成循环，未修改配置"
-    );
+    crate::upstream::normalize_base_url(&previous_url).map_err(|_| {
+        anyhow::anyhow!(
+            "手动密钥监控要求使用公共 HTTPS 上游，端口为 443，路径为根路径或 /v1，地址不得包含凭证、查询或片段；未修改配置"
+        )
+    })?;
     ensure!(
         string_toml_field(&doc, &provider_key, "wire_api")?.as_deref() == Some("responses"),
         "手动密钥监控只支持 Responses 供应商，未修改协议或模型配置"
@@ -510,7 +512,7 @@ fn connect_monitor_at(base_url: &str, state_dir: &Path, database: &Path) -> Resu
     ensure!(tx.execute("UPDATE providers SET settings_config=?1 WHERE app_type='codex' AND id=?2 AND is_current=1 AND settings_config=?3", params![updated,row.id,row.settings])? == 1,
         "CC Switch 供应商配置发生变化，未覆盖；监控备份保留");
     tx.commit()?;
-    Ok("已将 CC Switch 当前 Anyrouter 供应商接入本地监控，只修改转发地址并关闭 WebSocket。真实密钥、模型、推理强度、当前供应商选择及 Codex 配置均未改动。CC Switch 是否实时采用新目标仍需实际请求验证。".into())
+    Ok("已将 CC Switch 当前供应商接入本地监控，只修改转发地址并关闭 WebSocket。真实密钥、模型、推理强度、当前供应商选择及 Codex 配置均未改动。CC Switch 是否实时采用新目标仍需实际请求验证。".into())
 }
 
 fn monitor_settings(db: &Connection, backup: &MonitorBackup) -> Result<String> {
@@ -1353,13 +1355,17 @@ mod tests {
     }
 
     fn monitor_fixture() -> (tempfile::TempDir, PathBuf) {
+        monitor_fixture_with_url("https://api.example.com/v1")
+    }
+
+    fn monitor_fixture_with_url(upstream: &str) -> (tempfile::TempDir, PathBuf) {
         let (dir, state) = fixture(true);
         let db = Connection::open(dir.path().join(".cc-switch/cc-switch.db")).unwrap();
         let (mut settings, mut doc) =
             settings_document(&current_provider(&db).unwrap().unwrap().settings).unwrap();
         doc["model"] = value("gpt-6-sol");
         doc["model_reasoning_effort"] = value("high");
-        doc["model_providers"]["custom"]["base_url"] = value("https://anyrouter.top/v1");
+        doc["model_providers"]["custom"]["base_url"] = value(upstream);
         doc["model_providers"]["custom"]["supports_websockets"] = value(true);
         doc["model_providers"]["custom"]["experimental_bearer_token"] =
             value("original-provider-token-fixture");
@@ -1370,6 +1376,98 @@ mod tests {
         )
         .unwrap();
         (dir, state)
+    }
+
+    #[test]
+    fn legacy_monitor_upstream_without_journal_does_not_create_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("absent-state");
+        assert_eq!(legacy_monitor_upstream(&state).unwrap(), None);
+        assert!(!state.exists());
+        fs::create_dir(&state).unwrap();
+        assert_eq!(legacy_monitor_upstream(&state).unwrap(), None);
+        assert_eq!(fs::read_dir(&state).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn manual_monitor_keeps_each_original_upstream_and_restores_exact_url() {
+        for (original, normalized) in [
+            ("https://api.example.com/v1", "https://api.example.com/v1"),
+            ("https://api.example.org/v1", "https://api.example.org/v1"),
+            ("https://API.EXAMPLE.ORG:443/", "https://api.example.org/v1"),
+            ("https://api.example.org", "https://api.example.org/v1"),
+            ("https://api.example.org/v1/", "https://api.example.org/v1"),
+        ] {
+            let (dir, state) = monitor_fixture_with_url(original);
+            let path = dir.path().join(".cc-switch/cc-switch.db");
+            let db = Connection::open(&path).unwrap();
+            let before = current_provider(&db).unwrap().unwrap();
+            connect_monitor_at(TARGET, &state, &path).unwrap();
+            assert_eq!(read_monitor_backup(&state).unwrap().before_url, original);
+            assert_eq!(
+                legacy_monitor_upstream(&state).unwrap().as_deref(),
+                Some(normalized)
+            );
+            restore_legacy_monitor(&state).unwrap();
+            assert_eq!(
+                current_provider(&db).unwrap().unwrap().settings,
+                before.settings
+            );
+            assert_eq!(legacy_monitor_upstream(&state).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn legacy_monitor_upstream_reads_original_journal_without_database_or_credentials() {
+        let (dir, state) = monitor_fixture();
+        let database = dir.path().join(".cc-switch/cc-switch.db");
+        connect_monitor_at(TARGET, &state, &database).unwrap();
+        // The unchanged journal schema is the only source needed at request time.
+        fs::remove_file(database).unwrap();
+        assert_eq!(
+            legacy_monitor_upstream(&state).unwrap().as_deref(),
+            Some("https://api.example.com/v1")
+        );
+    }
+
+    #[test]
+    fn legacy_monitor_upstream_rejects_invalid_journals_without_echoing_sensitive_data() {
+        let (dir, state) = monitor_fixture();
+        let database = dir.path().join(".cc-switch/cc-switch.db");
+        connect_monitor_at(TARGET, &state, &database).unwrap();
+        let path = state.join(MONITOR_JOURNAL);
+        let mut backup = read_monitor_backup(&state).unwrap();
+        for invalid in [
+            "https://user:private-token-fixture@api.example.com/v1",
+            "https://api.example.com/v1?key=private-token-fixture",
+            "https://api.example.com/v1#private-token-fixture",
+            "https://127.0.0.1/v1",
+            "https://10.0.0.1/v1",
+            "https://service.local/v1",
+            "https://api.example.com:444/v1",
+            "https://api.example.com/unsupported",
+        ] {
+            backup.before_url = invalid.into();
+            let bytes = serde_json::to_vec(&backup).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            let error = format!("{:#}", legacy_monitor_upstream(&state).unwrap_err());
+            assert!(!error.contains(invalid));
+            assert!(!error.contains("private-token-fixture"));
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+        for invalid in [
+            "private-token-fixture",
+            r#"{"before_url":"https://api.example.com/v1","auth":"private-token-fixture"}"#,
+        ] {
+            fs::write(&path, invalid).unwrap();
+            let error = format!("{:#}", legacy_monitor_upstream(&state).unwrap_err());
+            assert!(!error.contains("private-token-fixture"));
+            assert!(!error.contains("api.example.com"));
+            assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
+        }
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(legacy_monitor_upstream(&state).is_err());
     }
 
     #[test]
@@ -1472,7 +1570,10 @@ mod tests {
             doc["model_providers"]["custom"]["user_added"].as_bool(),
             Some(true)
         );
-        assert_eq!(active_endpoint(&doc).unwrap().1, "https://anyrouter.top/v1");
+        assert_eq!(
+            active_endpoint(&doc).unwrap().1,
+            "https://api.example.com/v1"
+        );
         assert_eq!(
             bool_toml_field(&doc, "custom", "supports_websockets").unwrap(),
             Some(true)
@@ -1597,7 +1698,10 @@ mod tests {
             restored["auth"]["OPENAI_API_KEY"],
             "post-install-key-fixture"
         );
-        assert_eq!(active_endpoint(&doc).unwrap().1, "https://anyrouter.top/v1");
+        assert_eq!(
+            active_endpoint(&doc).unwrap().1,
+            "https://api.example.com/v1"
+        );
         assert!(!state.join(JOURNAL).exists() && !state.join(MONITOR_JOURNAL).exists());
         assert!(!inspect_at(TARGET, dir.path()).unwrap().configured);
     }

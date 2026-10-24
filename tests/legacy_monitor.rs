@@ -16,6 +16,7 @@ use pool_router::{
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, VecDeque},
+    fs,
     io::Write,
     sync::{Arc, Mutex},
     time::Duration,
@@ -204,6 +205,96 @@ impl Harness {
 }
 fn raw_request() -> Vec<u8> {
     br#"{ "model" : "gpt-6.1-sol", "reasoning":{"effort":"low"}, "service_tier":"priority", "previous_response_id":"resp_external", "input":[{"role":"user","content":"PRIVATE PROMPT"}], "store":false }"#.to_vec()
+}
+
+#[tokio::test]
+async fn legacy_without_explicit_upstream_or_monitor_backup_never_uses_pool_origin() {
+    let h = Harness::new(vec![], true).await;
+    *h.state.legacy_upstream_override.write().unwrap() = None;
+    assert!(h.state.settings().upstream_base_url.is_none());
+    assert!(!h._temp.path().join("cc-monitor-backup.json").exists());
+    assert_eq!(
+        h.state.scheduler.snapshot(&h.state.settings().policy).len(),
+        1
+    );
+
+    let response = h
+        .send("POST", "/v1/responses", CALLER, raw_request(), &[])
+        .await;
+    let (status, body) = Harness::consume(response).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let body = serde_json::from_slice::<Value>(&body).unwrap();
+    assert_eq!(body["error"]["code"], "upstream_unconfigured");
+    assert_eq!(h.calls(), 0);
+    let records = h.state.records.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].status, Some(503));
+    assert_eq!(records[0].outcome, "upstream_unconfigured");
+    assert!(records[0].attempts.is_empty());
+    h.assert_no_pool_health();
+    h.assert_private_records();
+    for key in [CALLER, STORED] {
+        assert!(!body.to_string().contains(key));
+    }
+}
+
+#[tokio::test]
+async fn invalid_monitor_backup_rejects_even_with_a_valid_explicit_upstream() {
+    // The reserved example endpoint is syntax-only fixture data. Both invalid
+    // journals must fail before URL resolution or any outbound HTTP request.
+    for invalid_before_url in [None, Some(format!("https://{CALLER}@api.example.com/v1"))] {
+        let h = Harness::new(vec![], true).await;
+        *h.state.legacy_upstream_override.write().unwrap() = None;
+        h.state.config.write().unwrap().upstream_base_url =
+            Some("https://api.example.com/v1".into());
+        let before_config = h.state.settings();
+        before_config.validate().unwrap();
+        pool_router::config::save(&h.state.config_path, &before_config).unwrap();
+        let config_bytes = fs::read(&h.state.config_path).unwrap();
+        let journal = h._temp.path().join("cc-monitor-backup.json");
+        let journal_bytes = match invalid_before_url {
+            Some(before_url) => serde_json::to_vec(&json!({
+                "database": h._temp.path().join("fixture.db"),
+                "provider_id": "fixture-provider",
+                "provider_key": "fixture-provider-key",
+                "before_url": before_url,
+                "after_url": "http://127.0.0.1:10813/v1",
+                "before_websockets": null,
+                "after_websockets": false
+            }))
+            .unwrap(),
+            None => format!("invalid journal containing {CALLER}").into_bytes(),
+        };
+        fs::write(&journal, &journal_bytes).unwrap();
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            h.send("POST", "/v1/responses", CALLER, raw_request(), &[]),
+        )
+        .await
+        .expect("无效监控备份必须在尝试上游请求之前立即拒绝");
+        let (status, body) = Harness::consume(response).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let body = serde_json::from_slice::<Value>(&body).unwrap();
+        assert_eq!(body["error"]["code"], "upstream_unconfigured");
+        assert_eq!(h.calls(), 0);
+        assert_eq!(fs::read(&journal).unwrap(), journal_bytes);
+        assert_eq!(fs::read(&h.state.config_path).unwrap(), config_bytes);
+        assert_eq!(
+            serde_json::to_value(h.state.settings()).unwrap(),
+            serde_json::to_value(before_config).unwrap()
+        );
+        let records = h.state.records.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, "upstream_unconfigured");
+        assert_eq!(records[0].status, Some(503));
+        assert!(records[0].attempts.is_empty());
+        h.assert_no_pool_health();
+        h.assert_private_records();
+        for key in [CALLER, STORED] {
+            assert!(!body.to_string().contains(key));
+        }
+    }
 }
 
 #[tokio::test]

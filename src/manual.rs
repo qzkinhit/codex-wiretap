@@ -17,7 +17,6 @@ use std::{
 };
 
 const FILE_NAME: &str = "manual-keys.json";
-const UPSTREAM: &str = "https://anyrouter.top/v1";
 const MAX_ACCOUNTS: usize = 256;
 const MAX_MODELS: usize = 20;
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
@@ -71,11 +70,14 @@ fn valid_key(key: &str) -> bool {
 }
 
 fn valid_label(label: &str, key: &str) -> bool {
-    !label.is_empty()
+    !label.trim().is_empty()
+        && label.len() <= 256
         && label.chars().count() <= 80
-        && !label.chars().any(char::is_control)
-        && !label.to_ascii_lowercase().contains("sk-")
-        && !label.contains(key)
+        && !label.chars().any(|character| {
+            character.is_control()
+                || matches!(character, '\u{00ad}' | '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}')
+        })
+        && crate::probe::redact_sensitive(label, [key]) == label
 }
 
 fn valid_models(models: &[String], key: &str) -> bool {
@@ -92,6 +94,18 @@ fn validate_account(account: &StoredAccount) -> bool {
         && valid_label(&account.label, &account.key)
         && valid_models(&account.models, &account.key)
         && (1..=64).contains(&account.max_concurrency)
+}
+
+fn metadata_contains_stored_key(stored: &Stored) -> bool {
+    stored.accounts.iter().any(|account| {
+        stored.accounts.iter().any(|secret_account| {
+            account.label.contains(&secret_account.key)
+                || account
+                    .models
+                    .iter()
+                    .any(|model| model.contains(&secret_account.key))
+        })
+    })
 }
 
 fn read_store(state_dir: &Path) -> Result<Stored> {
@@ -124,6 +138,7 @@ fn read_store(state_dir: &Path) -> Result<Stored> {
             .accounts
             .iter()
             .any(|account| !validate_account(account) || !ids.insert(account_id(&account.key)))
+        || metadata_contains_stored_key(&stored)
     {
         bail!("手动账号文件包含不支持的版本或无效记录，未修改原文件");
     }
@@ -154,13 +169,14 @@ pub fn add(state_dir: &Path, input: Value) -> Result<String> {
     if !valid_models(&input.models, &key) {
         bail!("请填写 1 至 20 个有效模型名称，模型字段不能包含密钥");
     }
-    let label = input.label.map(|label| label.trim().to_owned());
-    if label
+    if input
+        .label
         .as_ref()
         .is_some_and(|label| !valid_label(label, &key))
     {
-        bail!("昵称须为 1 至 80 个字符，不能含控制字符、密钥或 sk- 字样");
+        bail!("昵称须为 1 至 80 个字符，不能含控制字符、隐藏字符、密钥或凭据字段");
     }
+    let label = input.label.map(|label| label.trim().to_owned());
     let max_concurrency = input.max_concurrency.unwrap_or(1);
     if !(1..=64).contains(&max_concurrency) {
         bail!("单模型并发上限须为 1 至 64");
@@ -199,6 +215,9 @@ pub fn add(state_dir: &Path, input: Value) -> Result<String> {
             max_concurrency,
         });
     }
+    if metadata_contains_stored_key(&stored) {
+        bail!("账号昵称或模型字段不能包含任何已保存的密钥，未修改原账号");
+    }
     write_store(state_dir, &stored)?;
     Ok(id)
 }
@@ -235,7 +254,8 @@ pub fn public_accounts(state_dir: &Path) -> Result<Value> {
 }
 
 /// A manual account is only a user-supplied candidate, never a live health claim.
-pub fn load_snapshot(state_dir: &Path) -> Result<SourceSnapshot> {
+pub fn load_snapshot(state_dir: &Path, upstream: &str) -> Result<SourceSnapshot> {
+    let upstream = crate::upstream::normalize_base_url(upstream)?;
     let stored = read_store(state_dir)?;
     let mut model_counts = BTreeMap::<String, usize>::new();
     let accounts = stored
@@ -248,7 +268,7 @@ pub fn load_snapshot(state_dir: &Path) -> Result<SourceSnapshot> {
             Account {
                 id: account_id(&account.key),
                 secret: Arc::from(account.key),
-                upstream: UPSTREAM.into(),
+                upstream: upstream.clone(),
                 label: account.label,
                 provider_ids: account
                     .models
@@ -294,6 +314,7 @@ mod tests {
     use std::fs;
 
     const KEY: &str = "sk-manual-test-fixture-123456789";
+    const UPSTREAM: &str = "https://api.example.com/v1";
     const ASTRA: &str = "gpt-6-astra";
     const SOL: &str = "gpt-6.1-sol";
 
@@ -304,7 +325,12 @@ mod tests {
     #[test]
     fn missing_file_is_empty_and_reading_or_removing_does_not_create_it() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(load_snapshot(dir.path()).unwrap().accounts.is_empty());
+        assert!(
+            load_snapshot(dir.path(), UPSTREAM)
+                .unwrap()
+                .accounts
+                .is_empty()
+        );
         assert_eq!(
             public_accounts(dir.path()).unwrap(),
             json!({"accounts": []})
@@ -322,7 +348,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(id, account_id(KEY));
-        let snapshot = load_snapshot(dir.path()).unwrap();
+        let snapshot = load_snapshot(dir.path(), UPSTREAM).unwrap();
         assert_eq!(snapshot.accounts.len(), 1);
         let account = &snapshot.accounts[0];
         assert_eq!(account.secret.as_ref(), KEY);
@@ -356,7 +382,7 @@ mod tests {
         assert_eq!(public["accounts"].as_array().unwrap().len(), 1);
         assert_eq!(public["accounts"][0]["models"], json!([ASTRA, SOL]));
         assert_eq!(public["accounts"][0]["label"], "新昵称");
-        let snapshot = load_snapshot(dir.path()).unwrap();
+        let snapshot = load_snapshot(dir.path(), UPSTREAM).unwrap();
         assert_eq!(snapshot.accounts[0].model_concurrency[ASTRA], 3);
         assert_eq!(snapshot.accounts[0].model_concurrency[SOL], 3);
         add(dir.path(), input(KEY)).unwrap();
@@ -442,7 +468,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            load_snapshot(dir.path()).unwrap().accounts.len(),
+            load_snapshot(dir.path(), UPSTREAM).unwrap().accounts.len(),
             MAX_ACCOUNTS
         );
     }
@@ -454,7 +480,7 @@ mod tests {
         let b = add(dir.path(), input("sk-other-manual-fixture-123456789")).unwrap();
         assert!(remove(dir.path(), &a).unwrap());
         assert!(!remove(dir.path(), &a).unwrap());
-        let snapshot = load_snapshot(dir.path()).unwrap();
+        let snapshot = load_snapshot(dir.path(), UPSTREAM).unwrap();
         assert_eq!(snapshot.accounts.len(), 1);
         assert_eq!(snapshot.accounts[0].id, b);
         assert!(remove(dir.path(), "invalid-id").is_err());
@@ -469,7 +495,7 @@ mod tests {
             add(dir.path(), input(KEY)).err().unwrap(),
             remove(dir.path(), &account_id(KEY)).err().unwrap(),
             public_accounts(dir.path()).err().unwrap(),
-            load_snapshot(dir.path()).err().unwrap(),
+            load_snapshot(dir.path(), UPSTREAM).err().unwrap(),
         ] {
             assert!(!error.to_string().contains(KEY));
         }
@@ -518,6 +544,93 @@ mod tests {
                 });
             }
         });
-        assert_eq!(load_snapshot(dir.path()).unwrap().accounts.len(), 8);
+        assert_eq!(
+            load_snapshot(dir.path(), UPSTREAM).unwrap().accounts.len(),
+            8
+        );
+    }
+
+    #[test]
+    fn metadata_cannot_expose_another_stored_key_or_a_newly_added_key() {
+        let first = "opaque-first-account-fixture";
+        let second = "opaque-second-account-fixture";
+        for metadata in [
+            json!({"label":format!("copy {first}")}),
+            json!({"models":[first]}),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            add(dir.path(), input(first)).unwrap();
+            let before = fs::read(dir.path().join(FILE_NAME)).unwrap();
+            let mut candidate = input(second);
+            for (field, value) in metadata.as_object().unwrap() {
+                candidate[field] = value.clone();
+            }
+            let error = add(dir.path(), candidate).unwrap_err().to_string();
+            assert!(!error.contains(first));
+            assert!(!error.contains(second));
+            assert_eq!(before, fs::read(dir.path().join(FILE_NAME)).unwrap());
+        }
+        let dir = tempfile::tempdir().unwrap();
+        add(
+            dir.path(),
+            json!({"key":first,"models":[ASTRA],"label":format!("copy {second}")}),
+        )
+        .unwrap();
+        let before = fs::read(dir.path().join(FILE_NAME)).unwrap();
+        assert!(add(dir.path(), input(second)).is_err());
+        assert_eq!(before, fs::read(dir.path().join(FILE_NAME)).unwrap());
+    }
+
+    #[test]
+    fn unsafe_manual_nickname_characters_and_credential_fields_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        for label in [
+            "\n昵称",
+            "昵称\u{202e}",
+            "Bearer opaque-fixture-token",
+            "api_key=opaque-fixture-token",
+        ] {
+            let error = add(
+                dir.path(),
+                json!({"key":KEY,"models":[ASTRA],"label":label}),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(!error.contains(KEY));
+            assert!(!error.contains("opaque-fixture-token"));
+        }
+        assert!(!dir.path().join(FILE_NAME).exists());
+    }
+
+    #[test]
+    fn externally_edited_metadata_cannot_echo_another_accounts_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let second = "opaque-second-account-fixture";
+        let stored = Stored {
+            version: 1,
+            accounts: vec![
+                StoredAccount {
+                    key: KEY.into(),
+                    label: second.into(),
+                    models: vec![ASTRA.into()],
+                    max_concurrency: 1,
+                },
+                StoredAccount {
+                    key: second.into(),
+                    label: "fixture".into(),
+                    models: vec![ASTRA.into()],
+                    max_concurrency: 1,
+                },
+            ],
+        };
+        write_store(dir.path(), &stored).unwrap();
+        let before = fs::read(dir.path().join(FILE_NAME)).unwrap();
+        for error in [
+            public_accounts(dir.path()).unwrap_err(),
+            load_snapshot(dir.path(), UPSTREAM).err().unwrap(),
+        ] {
+            assert!(!error.to_string().contains(second));
+        }
+        assert_eq!(before, fs::read(dir.path().join(FILE_NAME)).unwrap());
     }
 }

@@ -1,4 +1,4 @@
-//! 白名单元数据观察。解析器从不持有日志正文，也不参与代理转发。
+//! 元数据与错误观察。成功正文和工具参数不进入日志；错误消息须由调用方脱敏。
 use anyhow::{Context, Result};
 use http::HeaderMap;
 use serde::{Deserialize, Serialize};
@@ -19,7 +19,19 @@ pub struct AttemptRecord {
     pub key_id: String,
     pub status: Option<u16>,
     pub reason: String,
+    pub error_message: Option<String>,
     pub duration_ms: u64,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GatewayAction {
+    pub action: String,
+    pub attempt: usize,
+    pub elapsed_ms: u64,
+    pub count: usize,
+    pub before_bytes: Option<u64>,
+    pub after_bytes: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -44,17 +56,20 @@ pub struct RequestRecord {
     pub status: Option<u16>,
     pub duration_ms: u64,
     pub ttfb_ms: Option<u64>,
+    pub first_output_ms: Option<u64>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
     pub request_bytes: u64,
+    pub upstream_request_bytes: Option<u64>,
     pub response_bytes: u64,
     pub has_previous_response_id: bool,
     pub input_items: Option<usize>,
     pub store: Option<bool>,
     pub outcome: String,
     pub attempts: Vec<AttemptRecord>,
+    pub gateway_actions: Vec<GatewayAction>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -64,6 +79,8 @@ pub struct Observation {
     pub service_tier: Option<String>,
     pub response_id: Option<String>,
     pub error_code: Option<String>,
+    /// Transient upstream error text. Never serialize before credential redaction.
+    pub raw_error_message: Option<String>,
     pub retryable: bool,
     pub meaningful_output: bool,
     pub terminal: bool,
@@ -120,6 +137,11 @@ fn allowed_error(value: &Value) -> Option<String> {
             | "unsupported_model"
             | "previous_response_not_found"
             | "response_not_found"
+            | "invalid_encrypted_content"
+            | "incompatible_encrypted_content"
+            | "resource_not_found"
+            | "deployment_not_found"
+            | "first_output_timeout"
             | "content_filter"
             | "max_output_tokens"
             | "incomplete" => code,
@@ -179,7 +201,7 @@ fn meaningful_item(item: &Value) -> bool {
     }
 }
 
-/// 只提取模型、用量、错误类别与流状态，不保留文本或工具参数。
+/// 只提取模型、用量、错误与流状态，不保留成功正文或工具参数。
 pub fn inspect_json(data: &Value) -> Observation {
     let response = data
         .get("response")
@@ -191,7 +213,7 @@ pub fn inspect_json(data: &Value) -> Observation {
         .get("error")
         .filter(|v| v.is_object())
         .or_else(|| data.get("error").filter(|v| v.is_object()))
-        .or_else(|| (kind == "error").then_some(data));
+        .or_else(|| matches!(kind, "error" | "response.error").then_some(data));
     let error_code = error
         .map(|e| {
             ["code", "type"]
@@ -217,10 +239,13 @@ pub fn inspect_json(data: &Value) -> Observation {
             | "response.failed"
             | "response.incomplete"
             | "error"
+            | "response.error"
     ) || matches!(status, "completed" | "failed" | "incomplete" | "cancelled")
         || error.is_some();
-    let failed = matches!(kind, "response.failed" | "response.incomplete" | "error")
-        || matches!(status, "failed" | "incomplete" | "cancelled")
+    let failed = matches!(
+        kind,
+        "response.failed" | "response.incomplete" | "error" | "response.error"
+    ) || matches!(status, "failed" | "incomplete" | "cancelled")
         || error.is_some();
     let completed = !failed
         && (matches!(kind, "response.completed" | "response.done") || status == "completed");
@@ -266,6 +291,16 @@ pub fn inspect_json(data: &Value) -> Observation {
             .or_else(|| label(&response["reasoning_effort"])),
         response_id: label(&response["id"]).or_else(|| label(&data["response_id"])),
         error_code,
+        raw_error_message: error
+            .and_then(|value| value["message"].as_str())
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| {
+                if text.len() <= 16 * 1024 {
+                    text.to_owned()
+                } else {
+                    "上游错误详情超过观察上限，已省略。".into()
+                }
+            }),
         retryable: retryable_error,
         meaningful_output,
         terminal,
@@ -295,6 +330,7 @@ impl Observation {
             effort,
             response_id,
             error_code,
+            raw_error_message,
             input_tokens,
             output_tokens,
             cached_tokens,
@@ -518,7 +554,7 @@ impl RecordStore {
                                 .map(|n| n + 1)
                                 .unwrap_or(buf.len());
                             let end = buf[n - 1] == b'\n';
-                            if line.len() + n > 64 * 1024 {
+                            if line.len() + n > 128 * 1024 {
                                 oversized = true;
                             }
                             if !oversized {
@@ -607,10 +643,33 @@ fn sanitize(mut row: RequestRecord) -> RequestRecord {
     row.response_service_tier = clean_option(row.response_service_tier);
     row.key_id = clean_option(row.key_id);
     row.outcome = clean(row.outcome);
-    row.attempts.truncate(32);
+    row.attempts.truncate(100);
+    row.gateway_actions.retain(|action| {
+        matches!(
+            action.action.as_str(),
+            "session_reset"
+                | "session_reused"
+                | "compaction_repair"
+                | "image_compression"
+                | "first_output_timeout"
+                | "header_timeout_retry"
+        )
+    });
+    row.gateway_actions.truncate(32);
+    let mut remaining_error_bytes = 16 * 1024;
     for attempt in &mut row.attempts {
         attempt.key_id = clean(std::mem::take(&mut attempt.key_id));
         attempt.reason = clean(std::mem::take(&mut attempt.reason));
+        attempt.error_message = attempt.error_message.take().and_then(|message| {
+            let mut message = crate::probe::bounded_error_message(&message, std::iter::empty())?;
+            let mut end = message.len().min(remaining_error_bytes);
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            message.truncate(end);
+            remaining_error_bytes -= end;
+            (!message.is_empty()).then_some(message)
+        });
     }
     row
 }

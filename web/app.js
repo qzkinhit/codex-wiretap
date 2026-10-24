@@ -11,6 +11,7 @@ function classifyRequestOutcome(record) {
     unknown_response: "响应状态未知",
     connect_failed: "连接失败",
     header_timeout: "响应超时",
+    first_output_timeout: "首段输出超时",
     response_read_failed: "响应读取失败",
     upstream_failed: "上游失败",
     stream_read_failed: "流读取失败",
@@ -28,7 +29,7 @@ function manualAccountPayload(fields) {
   const key = String(fields.key || "").trim();
   const models = [...new Set(String(fields.models || "").split(/[,，\n]+/).map((model) => model.trim()).filter(Boolean))];
   const maxConcurrency = Number(fields.max_concurrency ?? 1);
-  if (!key) throw new Error("请输入要添加或更新的 AnyRouter Key。");
+  if (!key) throw new Error("请输入要添加或更新的上游 Key。");
   if (!models.length || models.some((model) => !/^[a-zA-Z0-9._:/-]+$/.test(model))) throw new Error("请输入有效模型 ID，多个模型用逗号分隔。");
   if (!Number.isInteger(maxConcurrency) || maxConcurrency < 1 || maxConcurrency > 128) throw new Error("每模型并发上限必须是 1 到 128 的整数。");
   const payload = { key, models, max_concurrency: maxConcurrency };
@@ -73,7 +74,143 @@ function matchesServiceTierFilter(record, filter) {
   return true;
 }
 
-if (typeof module !== "undefined" && module.exports) module.exports = { classifyRequestOutcome, manualAccountPayload, requestRouteMode, classifyServiceTier, recordServiceTier, matchesServiceTierFilter };
+function accountModels(currentState) {
+  return [...new Set([
+    ...(Array.isArray(currentState?.models) ? currentState.models : []),
+    ...(currentState?.accounts || []).flatMap((account) => account.models || []),
+    ...(currentState?.source?.providers || []).map((provider) => provider.model),
+  ].filter((model) => typeof model === "string" && model))].sort();
+}
+
+function filterAccounts(accounts, model = "") {
+  return (accounts || []).filter((account) => account.present !== false && (!model || account.models?.includes(model)));
+}
+
+function filterModelHealth(account, model = "") {
+  return (Array.isArray(account.model_health) ? account.model_health : []).filter((health) => !model || health.model === model);
+}
+
+function syncConfigPatch(action, config) {
+  if (action === "pause") return { sync_paused: config?.sync_paused !== true };
+  if (action === "scope") return { source_mode: "biwrite", biwrite_import_all: config?.source_mode !== "biwrite" || config?.biwrite_import_all !== true };
+  throw new Error("未知同步操作");
+}
+
+function redactSensitiveText(value, secrets = []) {
+  let text = typeof value === "string" ? value : value == null ? "" : String(value);
+  for (const secret of secrets) if (typeof secret === "string" && secret) text = text.split(secret).join("[已隐藏凭证]");
+  return text.replace(/sk-[a-zA-Z0-9_-]{8,}/gi, "[已隐藏密钥]")
+    .replace(/\bBearer\s+[a-zA-Z0-9._~+\/-]+/gi, "[已隐藏授权信息]")
+    .replace(/\b(?:authorization|api[_-]?key|access[_-]?token)\s*[:=]\s*[^\r\n,;]+/gi, "[已隐藏授权信息]");
+}
+
+function normalizeProbeResult(result, model, elapsedMs = 0, secrets = []) {
+  const data = result && typeof result === "object" ? result : {};
+  const details = data.details && typeof data.details === "object" ? data.details : {};
+  const clean = (value, limit = 2048) => redactSensitiveText(value, secrets).slice(0, limit);
+  const number = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+  const usage = details.usage || {};
+  return {
+    pending: false,
+    ok: data.ok === true,
+    status: number(data.status),
+    message: clean(data.message || (data.ok === true ? "本次验证成功" : "本次验证未成功")),
+    response_model: clean(data.response_model, 200),
+    error_code: clean(data.error_code, 200),
+    details: {
+      request_id: clean(details.request_id, 200),
+      requested_model: clean(details.requested_model || model, 200),
+      requested_effort: clean(details.requested_effort || "low", 40),
+      request_text: clean(details.request_text || "Reply only OK.", 4096),
+      elapsed_ms: number(details.elapsed_ms) ?? elapsedMs,
+      response_text: clean(details.response_text, 65536),
+      error_message: clean(details.error_message),
+      events: (Array.isArray(details.events) ? details.events : []).slice(0, 100).map((event) => ({ type: clean(event.type, 100), elapsed_ms: number(event.elapsed_ms), detail: clean(event.detail) })),
+      usage: { input_tokens: number(usage.input_tokens), output_tokens: number(usage.output_tokens), cached_tokens: number(usage.cached_tokens), reasoning_tokens: number(usage.reasoning_tokens) },
+      truncated: details.truncated === true || (typeof details.response_text === "string" && details.response_text.length > 65536) || (Array.isArray(details.events) && details.events.length > 100),
+    },
+  };
+}
+
+function gatewayActionRows(record) {
+  const names = { session_reset: "重置会话", session_reused: "复用恢复后的会话", compaction_repair: "修复压缩上下文", image_compression: "压缩图片", first_output_timeout: "等待首段输出超时", header_timeout_retry: "响应头超时后重试" };
+  return (Array.isArray(record.gateway_actions) ? record.gateway_actions : []).map((action) => ({
+    label: Object.hasOwn(names, action.action) ? names[action.action] : "其他网关处理",
+    attempt: Number.isInteger(action.attempt) && action.attempt >= 0 ? action.attempt : null,
+    elapsed_ms: action.elapsed_ms,
+    count: action.count,
+    before_bytes: action.before_bytes,
+    after_bytes: action.after_bytes,
+  }));
+}
+
+function attemptErrorDetails(attempt) {
+  return {
+    reason: redactSensitiveText(attempt.reason).slice(0, 180),
+    message: redactSensitiveText(attempt.error_message).slice(0, 2048),
+  };
+}
+
+function effectiveOutputWait(record) {
+  return typeof record.first_output_ms === "number" && Number.isFinite(record.first_output_ms) && record.first_output_ms >= 0 ? record.first_output_ms : null;
+}
+
+function sourceProviderRows(source, importAll = false) {
+  const providers = Array.isArray(source?.providers) ? source.providers : [];
+  const keyCount = (value) => Number.isInteger(value) && value >= 0 ? value : null;
+  return providers.map((provider) => {
+    const kept = keyCount(provider.kept_keys);
+    const imported = keyCount(provider.imported_keys);
+    return {
+      model: provider.model || "未提供模型",
+      total_keys: keyCount(provider.total_keys),
+      kept_keys: kept,
+      imported_keys: imported,
+      description: importAll ? imported > 0 ? "已同步全部 Key，可用性待请求确认" : imported === 0 ? "已读取配置，当前无可导入 Key" : "等待来源同步结果" : kept === 0 ? "已读取配置，当前无保活候选" : imported === 0 ? "候选未导入，请检查来源状态" : imported > 0 ? "已导入候选，实时可用性待请求确认" : "等待来源同步结果",
+    };
+  });
+}
+
+function draftFromConfig(config) {
+  return {
+    source_mode: config?.source_mode === "manual" ? "manual" : "biwrite",
+    upstream_base_url: config?.upstream_base_url || "",
+    strategy: config?.policy?.strategy || "sticky",
+    pinned_key: config?.policy?.pinned_key || "",
+    max_concurrency_per_key: config?.policy?.max_concurrency_per_key ?? 1,
+    shared_account_concurrency: config?.policy?.shared_account_concurrency ?? 0,
+    model_override: config?.model_override || "",
+    reasoning_override: config?.reasoning_override || "",
+    max_retries: (config?.max_attempts ?? 16) - 1,
+    queue_timeout: (config?.queue_timeout_ms ?? 600000) / 1000,
+    recording_enabled: config?.recording_enabled !== false,
+    legacy_monitor_enabled: config?.legacy_monitor_enabled !== false,
+    session_recovery_enabled: config?.session_recovery_enabled !== false,
+    compaction_repair_enabled: config?.compaction_repair_enabled !== false,
+    compress_images: config?.compress_images === true,
+    first_output_timeout: (config?.first_output_timeout_ms ?? 120000) / 1000,
+  };
+}
+
+function routingConfigPayload(draft, latestConfig) {
+  return {
+    source_mode: draft.source_mode,
+    upstream_base_url: String(draft.upstream_base_url || "").trim() || null,
+    policy: { ...latestConfig?.policy, strategy: draft.strategy, pinned_key: draft.pinned_key || null, max_concurrency_per_key: draft.max_concurrency_per_key, shared_account_concurrency: draft.shared_account_concurrency || null },
+    model_override: draft.model_override || null,
+    reasoning_override: draft.reasoning_override || null,
+    max_attempts: draft.max_retries + 1,
+    queue_timeout_ms: Math.round(draft.queue_timeout * 1000),
+    recording_enabled: draft.recording_enabled,
+    legacy_monitor_enabled: draft.legacy_monitor_enabled,
+    session_recovery_enabled: draft.session_recovery_enabled,
+    compaction_repair_enabled: draft.compaction_repair_enabled,
+    compress_images: draft.compress_images,
+    first_output_timeout_ms: Math.round(draft.first_output_timeout * 1000),
+  };
+}
+
+if (typeof module !== "undefined" && module.exports) module.exports = { classifyRequestOutcome, manualAccountPayload, requestRouteMode, classifyServiceTier, recordServiceTier, matchesServiceTierFilter, sourceProviderRows, draftFromConfig, routingConfigPayload, accountModels, filterAccounts, filterModelHealth, syncConfigPatch, redactSensitiveText, normalizeProbeResult, gatewayActionRows, attemptErrorDetails, effectiveOutputWait };
 
 if (typeof document !== "undefined") (() => {
   const $ = (id) => document.getElementById(id);
@@ -103,6 +240,8 @@ if (typeof document !== "undefined") (() => {
   let recordSignature = "";
   let mutationQueue = Promise.resolve();
   let probeAccountId = null;
+  let accountModelFilter = "";
+  const probeResults = new Map();
   let openedRecordId = null;
   const pendingActions = new Set();
   const dateFormatter = new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
@@ -110,12 +249,7 @@ if (typeof document !== "undefined") (() => {
   const numberFormatter = new Intl.NumberFormat("zh-CN");
 
   function safeText(value) {
-    const source = String(value ?? "");
-    const enteredKey = $("manual-key")?.value;
-    const filtered = enteredKey ? source.split(enteredKey).join("[已隐藏密钥]") : source;
-    return (sessionToken ? filtered.split(sessionToken).join("[已隐藏令牌]") : filtered)
-      .replace(/sk-[a-zA-Z0-9_-]{8,}/g, "[已隐藏密钥]")
-      .replace(/(Bearer\s+)[a-zA-Z0-9._~+\/-]{8,}/gi, "$1[已隐藏令牌]");
+    return redactSensitiveText(value, [$("manual-key")?.value, sessionToken]);
   }
 
   function node(tag, className, content) {
@@ -177,6 +311,7 @@ if (typeof document !== "undefined") (() => {
       let data = null;
       try { data = await response.json(); } catch (_) { /* Empty response is permitted. */ }
       if (!response.ok) {
+        if (options.probeDetails && data) return { ...data, ok: false, status: data.status ?? response.status, error_code: data.error_code || data.error?.code, message: data.message || (typeof data.error === "string" ? data.error : data.error?.message) || `本地服务返回 HTTP ${response.status}` };
         if (response.status === 401 || response.status === 403) throw new Error("控制台授权已失效。请使用本地服务提供的带令牌地址重新打开控制台。");
         const detail = typeof data?.error === "string" ? data.error : data?.error?.message || data?.message;
         throw new Error(detail ? safeText(detail).slice(0, 220) : `本地服务返回 HTTP ${response.status}`);
@@ -224,7 +359,7 @@ if (typeof document !== "undefined") (() => {
     if ((asNumber(account.cooldown_until_ms) || 0) > Date.now()) return { label: `冷却 ${Math.ceil((account.cooldown_until_ms - Date.now()) / 1000)}s`, style: "amber", ready: false };
     const limit = account.max_concurrency ?? state?.config?.policy?.max_concurrency_per_key ?? 1;
     if ((account.in_flight || 0) >= limit || account.status === "busy") return { label: "繁忙", style: "blue", ready: false };
-    if (account.last_ok_ms || account.status === "healthy") return { label: "已验证", style: "green", ready: true };
+    if (account.last_ok_ms || account.status === "healthy") return { label: "曾成功", style: "neutral", ready: true };
     return { label: "待验证", style: "neutral", ready: true };
   }
 
@@ -257,7 +392,7 @@ if (typeof document !== "undefined") (() => {
     text("base-url", state.connection?.base_url || "未提供接入地址");
     $("copy-url").disabled = !state.connection?.base_url;
     text("connect-button", state.connection?.configured ? "检查接入" : "直接接入 Codex");
-    $("connect-button").title = state.connection?.configured ? "检查 Codex → Pool Router → Anyrouter 的直接接入配置" : "直接配置 Codex 使用 Pool Router";
+    $("connect-button").title = state.connection?.configured ? "检查 Codex → Pool Router → 上游服务 的直接接入配置" : "直接配置 Codex 使用 Pool Router";
     showAlert("connection-note", !state.connection?.configured ? "点击「直接接入 Codex」完成本地配置，后续由 Pool Router 自动分配号池。" : "");
     const legacyEnabled = state.config?.legacy_monitor_enabled !== false;
     $("legacy-status").className = `badge badge-${legacyEnabled ? "green" : "neutral"}`;
@@ -265,11 +400,21 @@ if (typeof document !== "undefined") (() => {
     text("legacy-scope", legacyEnabled ? "仅能监控经过本地入口的请求，无法查看未经过代理的 HTTPS 流量。" : "旧方式监控已关闭，可在路由设置开启并保存。本地令牌号池模式不受影响。");
     text("source-time", state.source?.read_at_ms ? `最近同步 ${timestamp(state.source.read_at_ms)}` : "等待首次同步");
     const manualMode = state.config?.source_mode === "manual";
-    if (!$("sync-button").disabled) text("sync-button", manualMode ? "↻ 刷新手动池" : "↻ 同步 BiWrite");
-    text("source-heading", manualMode ? "手动维护号池" : "BiWrite 保活候选");
-    text("source-description", manualMode ? "当前使用本地自定义池。可在路由设置中管理账号，模型健康与并发分别计算。" : "每 1.5 秒自动读取 BiWrite 候选号池，无须复制 Key。可用性以探测或实际代理请求的结果为准。");
-    text("accounts-empty-title", manualMode ? "当前手动池没有可用账号" : "还没有同步到号池");
-    text("accounts-empty-description", manualMode ? "可在路由设置的手动池管理中添加账号，或保存切换为自动读取 BiWrite。" : "先在 BiWrite 配置 AnyRouter 并运行保活，Pool Router 每 1.5 秒自动读取候选号池，无须复制 Key。也可点击「同步 BiWrite」立即重新读取。");
+    const importAll = state.config?.biwrite_import_all === true;
+    const paused = state.config?.sync_paused === true;
+    if (!$("sync-button").disabled) text("sync-button", manualMode ? "↻ 刷新手动池" : "↻ 单次同步");
+    text("pause-sync-button", paused ? "恢复同步" : "暂停同步");
+    $("pause-sync-button").disabled = manualMode || pendingActions.has("sync-config");
+    $("pause-sync-button").title = manualMode ? "当前使用手动来源，未自动读取 BiWrite" : "仅控制 BiWrite 的自动读取，当前号池仍可使用";
+    $("sync-scope-button").disabled = pendingActions.has("sync-config");
+    text("sync-scope-button", !manualMode && importAll ? "仅同步保活候选" : "持续同步全部 Key");
+    text("sync-mode-status", manualMode ? "手动来源" : `${paused ? "自动同步已暂停" : "自动同步中"} · ${importAll ? "全部 Key" : "保活候选"}`);
+    $("sync-mode-status").className = `badge badge-${!manualMode && paused ? "amber" : "neutral"}`;
+    text("sync-mode-description", manualMode ? "可切换为 BiWrite 持续同步全部 Key，切换后立即生效。" : `${paused ? "暂停只停止自动读取，当前号池仍可使用；单次同步不会恢复自动同步。" : "每 1.5 秒读取来源，单次同步可立即重新读取。"}${importAll ? "当前持续包含全部 Key，包括未保活、忽略和停止的 Key。" : "当前只包含保活候选，并排除忽略和停止的 Key。"}`);
+    text("source-heading", manualMode ? "手动维护号池" : importAll ? "BiWrite 全部 Key" : "BiWrite 保活候选");
+    text("source-description", manualMode ? "当前使用本地自定义池。可在路由设置中管理账号，模型健康与并发分别计算。" : "自动读取 BiWrite 号池及 Key 昵称。导入仅表示可参与调度，可用性以本次探测或实际请求结果为准。");
+    text("accounts-empty-title", manualMode ? "当前手动池没有可用账号" : sourceProviderRows(state.source).length ? "当前没有可导入候选" : "还没有同步到号池");
+    text("accounts-empty-description", manualMode ? "可在路由设置的手动池管理中添加账号，或保存切换为自动读取 BiWrite。" : importAll ? "当前上游尚无可读取的 Key，请检查 BiWrite 配置和来源同步状态。" : "可在 BiWrite 运行保活，或选择持续同步全部 Key。来源同步中可查看尚无候选的模型。");
     text("manual-effect-note", manualMode ? "当前已使用手动来源，添加、更新和删除会影响后续请求。相同 Key 再次提交会更新该账号。" : "当前使用自动来源，增删手动池不会改变当前路由。相同 Key 再次提交会更新该账号。");
     const warnings = [];
     if (state.source?.last_error) warnings.push(state.source.last_error);
@@ -277,6 +422,41 @@ if (typeof document !== "undefined") (() => {
     showAlert("source-warning", warnings.join("；"));
     $("recording-status").className = `badge badge-${state.config?.recording_enabled ? "green" : "neutral"}`;
     text("recording-status", state.config?.recording_enabled ? "正在记录" : "记录已暂停");
+  }
+
+  function renderSourceProviders() {
+    const importAll = state.config?.biwrite_import_all === true;
+    const providers = state.config?.source_mode === "manual" ? [] : sourceProviderRows(state.source, importAll);
+    $("source-sync").hidden = providers.length === 0;
+    text("source-sync-description", importAll ? "当前持续同步全部 Key，保活数量仅供参考。已导入不等于本次请求可用。" : "当前只同步保活候选。保活候选与历史成功均不保证实时可用。");
+    const rows = providers.map((provider) => {
+      const row = node("tr");
+      for (const value of [provider.model, provider.total_keys, provider.kept_keys, provider.imported_keys]) row.append(node("td", "", value ?? "—"));
+      row.append(node("td", (importAll ? provider.imported_keys === 0 : provider.kept_keys === 0) ? "source-no-candidates" : "", provider.description));
+      return row;
+    });
+    $("source-provider-list").replaceChildren(...rows);
+  }
+
+  function renderAccountFilters() {
+    const models = accountModels(state);
+    if (accountModelFilter && !models.includes(accountModelFilter)) models.push(accountModelFilter);
+    const signature = JSON.stringify([models, accountModelFilter]);
+    const container = $("account-model-filter");
+    if (container.dataset.signature === signature) return;
+    container.dataset.signature = signature;
+    container.replaceChildren(...["", ...models].map((model) => {
+      const button = node("button", "model-filter-button", model || "全部模型");
+      button.type = "button";
+      button.setAttribute("aria-pressed", String(model === accountModelFilter));
+      button.addEventListener("click", () => {
+        accountModelFilter = model;
+        renderAccountFilters();
+        renderAccounts(true);
+        [...container.children].find((element) => element.getAttribute("aria-pressed") === "true")?.focus({ preventScroll: true });
+      });
+      return button;
+    }));
   }
 
   function accountButton(label, action, accountId, extraClass = "", model = null) {
@@ -291,8 +471,9 @@ if (typeof document !== "undefined") (() => {
   }
 
   function renderAccounts(force = false) {
-    const accounts = state.accounts || [];
-    const signature = JSON.stringify([accounts, state.config?.policy, Math.floor(Date.now() / 15000), accounts.some((a) => (a.cooldown_until_ms || 0) > Date.now() || availableModelHealth(a).some((health) => (health.cooldown_until_ms || 0) > Date.now())) ? Math.floor(Date.now() / 1000) : 0, [...pendingActions]]);
+    const allAccounts = filterAccounts(state.accounts);
+    const accounts = filterAccounts(allAccounts, accountModelFilter);
+    const signature = JSON.stringify([accounts, accountModelFilter, state.config?.policy, Math.floor(Date.now() / 15000), accounts.some((a) => (a.cooldown_until_ms || 0) > Date.now() || availableModelHealth(a).some((health) => (health.cooldown_until_ms || 0) > Date.now())) ? Math.floor(Date.now() / 1000) : 0, [...pendingActions], [...probeResults.keys()]]);
     if (!force && signature === accountSignature) return;
     accountSignature = signature;
     const focusedAction = document.activeElement?.dataset?.action;
@@ -308,7 +489,7 @@ if (typeof document !== "undefined") (() => {
       subtitle.append(node("span", "", shortId(account.id)));
       if (state.config?.policy?.strategy === "pinned" && state.config.policy.pinned_key === account.id) subtitle.append(node("span", "pin-marker", "· 已指定"));
       title.append(heading, subtitle);
-      const healthRows = availableModelHealth(account);
+      const healthRows = filterModelHealth(account, accountModelFilter);
       const readyModels = healthRows.filter((health) => modelStatus(account, health).ready).length;
       const status = account.present === false || account.enabled === false || !healthRows.length ? accountStatus(account) : { label: `${readyModels}/${healthRows.length} 模型可调度`, style: readyModels ? "blue" : "amber" };
       header.append(node("div", "account-avatar", String(index + 1).padStart(2, "0")), title, badge(status.label, status.style));
@@ -332,7 +513,7 @@ if (typeof document !== "undefined") (() => {
           models.append(row);
         }
       } else if (Array.isArray(account.models) && account.models.length) {
-        for (const model of account.models) models.append(node("span", "model-tag", model));
+        for (const model of account.models.filter((model) => !accountModelFilter || model === accountModelFilter)) models.append(node("span", "model-tag", model));
       } else models.append(node("span", "model-tag", "暂无模型信息"));
       const metrics = node("div", "account-metrics");
       const values = [
@@ -347,12 +528,17 @@ if (typeof document !== "undefined") (() => {
       else if (account.source_last_ok_ms) observation.textContent = `BiWrite 保活记录 · ${relativeTime(account.source_last_ok_ms)}`;
       else observation.textContent = "尚无代理请求记录，可发送小请求验证";
       const actions = node("div", "account-actions");
-      const probe = accountButton("验证", "probe", account.id);
+      const probe = accountButton("验证", "probe", account.id, "", accountModelFilter || null);
       probe.title = "向上游发送一个小请求以验证此号池";
       probe.disabled = probe.disabled || account.present === false;
       const pin = accountButton("固定使用", "pin", account.id);
       pin.disabled = pin.disabled || account.present === false || account.enabled === false;
       actions.append(probe, pin);
+      if (probeResults.has(account.id)) {
+        const log = accountButton("查看验证日志", "probe-log", account.id);
+        log.disabled = false;
+        actions.append(log);
+      }
       if (!healthRows.length && (account.cooldown_until_ms || 0) > Date.now()) actions.append(accountButton("解除冷却", "reset", account.id));
       const toggle = accountButton(account.enabled === false ? "启用" : "已启用", "toggle", account.id, "account-toggle");
       toggle.setAttribute("aria-pressed", String(account.enabled !== false));
@@ -363,42 +549,33 @@ if (typeof document !== "undefined") (() => {
       return card;
     });
     $("account-list").replaceChildren(...cards);
-    $("accounts-empty").hidden = accounts.length > 0;
+    $("accounts-empty").hidden = allAccounts.length > 0;
+    $("accounts-filter-empty").hidden = !allAccounts.length || accounts.length > 0;
+    text("account-filter-summary", `显示 ${accounts.length} / ${allAccounts.length} 个号池${accountModelFilter ? ` · ${accountModelFilter}` : ""}。筛选仅影响视图，不改变路由。`);
     if (focusedAction && focusedAccount) {
       const replacement = [...$("account-list").querySelectorAll("button")].find((button) => button.dataset.action === focusedAction && button.dataset.account === focusedAccount && button.dataset.model === focusedModel);
       replacement?.focus({ preventScroll: true });
     }
   }
 
-  function draftFromConfig(config) {
-    return {
-      source_mode: config?.source_mode === "manual" ? "manual" : "biwrite",
-      strategy: config?.policy?.strategy || "sticky",
-      pinned_key: config?.policy?.pinned_key || "",
-      max_concurrency_per_key: config?.policy?.max_concurrency_per_key ?? 1,
-      shared_account_concurrency: config?.policy?.shared_account_concurrency ?? 0,
-      model_override: config?.model_override || "",
-      reasoning_override: config?.reasoning_override || "",
-      max_attempts: config?.max_attempts ?? 20,
-      queue_timeout: (config?.queue_timeout_ms ?? 120000) / 1000,
-      recording_enabled: config?.recording_enabled !== false,
-      legacy_monitor_enabled: config?.legacy_monitor_enabled !== false,
-    };
-  }
-
   function readDraft() {
     return {
       source_mode: document.querySelector('input[name="source_mode"]:checked')?.value || "biwrite",
+      upstream_base_url: $("upstream-base-url").value,
       strategy: document.querySelector('input[name="strategy"]:checked')?.value || "sticky",
       pinned_key: $("pinned-key").value,
       max_concurrency_per_key: Number($("max-concurrency").value),
       shared_account_concurrency: Number($("shared-concurrency").value),
       model_override: $("model-override").value,
       reasoning_override: $("reasoning-override").value,
-      max_attempts: Number($("max-attempts").value),
+      max_retries: Number($("max-retries").value),
       queue_timeout: Number($("queue-timeout").value),
       recording_enabled: $("recording-enabled").checked,
       legacy_monitor_enabled: $("legacy-monitor-enabled").checked,
+      session_recovery_enabled: $("session-recovery-enabled").checked,
+      compaction_repair_enabled: $("compaction-repair-enabled").checked,
+      compress_images: $("compress-images").checked,
+      first_output_timeout: Number($("first-output-timeout").value),
     };
   }
 
@@ -434,13 +611,18 @@ if (typeof document !== "undefined") (() => {
     const accounts = draftAccounts();
     updateOptions($("pinned-key"), accounts.map((account) => ({ value: account.id, label: `${account.label || "号池"} · ${shortId(account.id)}${account.enabled === false ? "（已停用）" : ""}` })), "请选择号池", draft.pinned_key);
     updateOptions($("model-override"), [...new Set(accounts.flatMap((account) => account.models || []))].sort(), "跟随 Codex", draft.model_override);
+    $("upstream-base-url").value = draft.upstream_base_url;
     $("reasoning-override").value = draft.reasoning_override;
     $("max-concurrency").value = draft.max_concurrency_per_key;
     $("shared-concurrency").value = draft.shared_account_concurrency;
-    $("max-attempts").value = draft.max_attempts;
+    $("max-retries").value = draft.max_retries;
     $("queue-timeout").value = draft.queue_timeout;
     $("recording-enabled").checked = draft.recording_enabled;
     $("legacy-monitor-enabled").checked = draft.legacy_monitor_enabled;
+    $("session-recovery-enabled").checked = draft.session_recovery_enabled;
+    $("compaction-repair-enabled").checked = draft.compaction_repair_enabled;
+    $("compress-images").checked = draft.compress_images;
+    $("first-output-timeout").value = draft.first_output_timeout;
     $("pinned-field").hidden = draft.strategy !== "pinned";
     baselineDraft = readDraft();
     setDirty(false);
@@ -455,7 +637,10 @@ if (typeof document !== "undefined") (() => {
     showAlert("connection-error", "");
     text("last-update", `状态更新于 ${clockTime(Date.now())}`);
     renderStats();
+    renderSourceProviders();
+    renderAccountFilters();
     renderAccounts();
+    if ($("probe-dialog").open && probeResults.get(probeAccountId)?.pending) renderProbeResult();
     if (!formDirty) fillForm();
     else updateFormOptions();
   }
@@ -529,8 +714,9 @@ if (typeof document !== "undefined") (() => {
 
   async function handleAccountAction(action, id, model = null) {
     const account = state?.accounts?.find((item) => item.id === id);
+    if (account && action === "probe-log") { openProbe(account, probeResults.get(id)?.details?.requested_model); return; }
     if (!account || pendingActions.has(id)) return;
-    if (action === "probe") { openProbe(account); return; }
+    if (action === "probe") { openProbe(account, model); return; }
     pendingActions.add(id);
     renderAccounts(true);
     try {
@@ -557,13 +743,65 @@ if (typeof document !== "undefined") (() => {
     finally { pendingActions.delete(id); if (state) renderAccounts(true); }
   }
 
-  function openProbe(account) {
+  function openProbe(account, preferredModel = null) {
     probeAccountId = account.id;
     text("probe-description", `验证 ${account.label || "号池"}（${shortId(account.id)}）的当前可用性。`);
     const models = Array.isArray(account.models) && account.models.length ? account.models : allModels();
-    updateOptions($("probe-model"), models, null, models[0] || "");
+    updateOptions($("probe-model"), models, null, models.includes(preferredModel) ? preferredModel : models[0] || "");
     $("submit-probe").disabled = !models.length || pendingActions.has(account.id);
-    $("probe-dialog").showModal();
+    $("probe-model").disabled = pendingActions.has(account.id);
+    text("submit-probe", pendingActions.has(account.id) ? "验证中…" : probeResults.has(account.id) ? "再次发送验证请求" : "发送验证请求");
+    renderProbeResult();
+    if (!$("probe-dialog").open) $("probe-dialog").showModal();
+  }
+
+  function renderProbeResult() {
+    const result = probeResults.get(probeAccountId);
+    $("probe-result").hidden = !result;
+    if (!result) { $("probe-result-content").replaceChildren(); return; }
+    const details = result.details || {};
+    const label = result.pending ? "验证进行中" : result.ok ? "本次验证成功" : "本次验证失败";
+    text("probe-result-status", `${label}${result.status ? ` · HTTP ${result.status}` : ""}`);
+    $("probe-result-status").className = `badge badge-${result.pending ? "blue" : result.ok ? "green" : "red"}`;
+    const grid = node("div", "detail-grid");
+    grid.append(
+      detail("验证模型", details.requested_model || "未提供"),
+      detail("推理强度", details.requested_effort || "low"),
+      detail("耗时", duration(result.pending ? Date.now() - result.started_at_ms : details.elapsed_ms)),
+      detail("返回模型（上游声明）", result.response_model || "未提供"),
+      detail("请求 ID", details.request_id || "未提供"),
+      detail("错误类型", result.error_code || "无"),
+    );
+    const blocks = [grid];
+    const addBlock = (title, content) => {
+      const block = node("section", "probe-text-block");
+      block.append(node("h4", "", title), node("pre", "", content));
+      blocks.push(block);
+    };
+    addBlock("本次固定验证请求", details.request_text || "Reply only OK.");
+    addBlock("返回内容", details.response_text || (result.pending ? "正在等待上游响应。关闭窗口后仍可从账号卡片查看本次结果。" : "上游未返回可显示的文本。"));
+    if (result.message || details.error_message) addBlock(result.ok ? "结果说明" : "状态与错误详情", [result.message, details.error_message].filter(Boolean).filter((value, index, array) => array.indexOf(value) === index).join("\n"));
+    if (!result.pending) {
+      const usage = details.usage || {};
+      const tokens = node("div", "detail-grid");
+      tokens.append(detail("输入 / 输出 token", `${count(usage.input_tokens)} / ${count(usage.output_tokens)}`), detail("缓存 token", count(usage.cached_tokens)), detail("推理 token", count(usage.reasoning_tokens)));
+      blocks.push(tokens);
+    }
+    const events = node("section", "probe-text-block");
+    events.append(node("h4", "", "请求事件"));
+    const list = node("ol", "probe-events");
+    for (const event of details.events || []) {
+      const item = node("li", "probe-event");
+      const content = node("div");
+      content.append(node("strong", "", event.type || "事件"), node("p", "", event.detail || ""));
+      item.append(node("time", "", duration(event.elapsed_ms)), content);
+      list.append(item);
+    }
+    events.append(list);
+    if (!list.children.length) events.append(node("p", "subtle-note", result.pending ? "完整事件将在请求结束后显示。" : "没有返回事件明细。"));
+    blocks.push(events);
+    if (details.truncated) blocks.push(node("p", "subtle-note", "返回内容或事件达到显示上限，已截断。"));
+    $("probe-result-content").replaceChildren(...blocks);
   }
 
   function conversationNode(id, compact = false) {
@@ -623,7 +861,7 @@ if (typeof document !== "undefined") (() => {
         stackedCell(route.label, `${accountLabel(record.key_id)} · ${record.transport || "—"}`),
         tierCell,
         statusCell,
-        stackedCell(duration(record.duration_ms), `首 token ${duration(record.ttfb_ms)}`),
+        stackedCell(duration(record.duration_ms), `有效输出 ${duration(effectiveOutputWait(record))}`),
         stackedCell(`${count(record.input_tokens)} / ${count(record.output_tokens)}`, "token"),
         stackedCell(count(record.cached_tokens)),
       );
@@ -632,7 +870,7 @@ if (typeof document !== "undefined") (() => {
     $("records-body").replaceChildren(...rows);
     $("records-empty").hidden = filtered.length > 0;
     $("records-empty").querySelector("h3").textContent = records.length ? "没有符合筛选条件的记录" : "尚无请求记录";
-    $("records-empty").querySelector("p").textContent = records.length ? "调整模型、对话 ID、状态或档位后重试。" : state?.config?.recording_enabled === false ? "记录已暂停，可在路由设置中启用请求元数据记录。" : "请求经过 Pool Router 后，号池调度或旧方式监控的元数据会显示在这里。";
+    $("records-empty").querySelector("p").textContent = records.length ? "调整模型、对话 ID、状态或档位后重试。" : state?.config?.recording_enabled === false ? "记录已暂停，可在路由设置中启用请求监控。" : "请求经过 Pool Router 后，路由情况与诊断信息会显示在这里。";
     text("record-count", `${filtered.length} 条记录${filtered.length !== records.length ? ` / 共 ${records.length} 条` : ""}`);
     if (openedRecordId && $("record-dialog").open) {
       const updated = records.find((record) => String(record.id) === openedRecordId);
@@ -684,12 +922,15 @@ if (typeof document !== "undefined") (() => {
       detail("档位说明", "Fast 与 priority 归为同一展示组，原始字段分别保留。仅完成的请求可比较上游声明；档位字段不能独立证明实际调度或服务质量。", true),
       detail(route.mode === "legacy" ? "上游账号标识" : "使用号池", `${accountLabel(record.key_id)} · ${shortId(record.key_id)}`),
       detail("总耗时", duration(record.duration_ms)),
-      detail("首 token 耗时", duration(record.ttfb_ms)),
+      detail("首段有效输出等待", duration(effectiveOutputWait(record))),
+      detail("首个响应数据耗时", duration(record.ttfb_ms)),
       detail("输入 token", count(record.input_tokens)),
       detail("输出 token", count(record.output_tokens)),
       detail("缓存 token", count(record.cached_tokens)),
       detail("推理 token", count(record.reasoning_tokens)),
       detail("请求 / 响应体积", `${bytes(record.request_bytes)} / ${bytes(record.response_bytes)}`),
+      detail("最后一次上游请求体积", bytes(record.upstream_request_bytes)),
+      detail("输出耗时说明", "有效输出单独记录，不使用 SSE 心跳、首包或累计请求耗时代替。未记录时显示未知。", true),
       detail("输入项数量", count(record.input_items)),
       detail("携带 previous_response_id", record.has_previous_response_id == null ? "未提供" : record.has_previous_response_id ? "是" : "否"),
       detail("store 字段", record.store == null ? "未提供" : String(record.store)),
@@ -697,7 +938,7 @@ if (typeof document !== "undefined") (() => {
     );
     const attemptSection = node("section", "attempt-section");
     const attempts = Array.isArray(record.attempts) ? record.attempts : [];
-    attemptSection.append(node("h3", "", `路由尝试 · ${attempts.length} 次`));
+    attemptSection.append(node("h3", "", `路由尝试与上游错误 · ${attempts.length} 次尝试`));
     if (attempts.length) {
       const list = node("ol", "attempt-list");
       attempts.forEach((attempt, index) => {
@@ -706,13 +947,33 @@ if (typeof document !== "undefined") (() => {
         const title = node("div", "attempt-title");
         title.append(node("span", "", accountLabel(attempt.key_id)), node("span", "", attempt.status == null ? "无 HTTP 状态" : `HTTP ${attempt.status}`));
         content.append(title);
-        if (attempt.reason) content.append(node("div", "attempt-reason", attempt.reason));
+        const error = attemptErrorDetails(attempt);
+        if (error.reason) content.append(node("div", "attempt-reason", error.reason === "completed" ? "本次尝试完成" : `错误类型 · ${error.reason}`));
+        if (error.message) content.append(node("div", "attempt-error-message", error.message));
         item.append(node("span", "attempt-number", index + 1), content, node("span", "attempt-duration", duration(attempt.duration_ms)));
         list.append(item);
       });
       attemptSection.append(list);
     } else attemptSection.append(node("div", "subtle-note", "尚无尝试明细。"));
-    $("record-details").replaceChildren(grid, attemptSection);
+    const gatewaySection = node("section", "attempt-section");
+    gatewaySection.append(node("h3", "", "恢复与网关处理"));
+    const gatewayActions = gatewayActionRows(record);
+    if (gatewayActions.length) {
+      const list = node("ol", "attempt-list");
+      for (const action of gatewayActions) {
+        const item = node("li", "attempt-item");
+        const content = node("div", "attempt-content");
+        content.append(node("div", "attempt-title", `${action.label}${action.attempt === 0 ? " · 首次发送前" : action.attempt !== null ? ` · 第 ${action.attempt} 次尝试` : ""}`));
+        const note = [];
+        if (asNumber(action.count) !== null) note.push(`处理数量 ${count(action.count)}`);
+        if (asNumber(action.before_bytes) !== null || asNumber(action.after_bytes) !== null) note.push(`体积 ${bytes(action.before_bytes)} → ${bytes(action.after_bytes)}`);
+        if (note.length) content.append(node("div", "attempt-reason", note.join(" · ")));
+        item.append(content, node("span", "attempt-duration", duration(action.elapsed_ms)));
+        list.append(item);
+      }
+      gatewaySection.append(list);
+    } else gatewaySection.append(node("p", "subtle-note", "没有记录网关处理动作。"));
+    $("record-details").replaceChildren(grid, gatewaySection, attemptSection);
   }
 
   function openRecord(record) {
@@ -769,16 +1030,7 @@ if (typeof document !== "undefined") (() => {
     try {
       await serializeMutation(async () => {
         const latest = await api("/api/state");
-        await api("/api/config", { method: "POST", body: {
-          source_mode: draft.source_mode,
-          policy: { ...latest.config.policy, strategy: draft.strategy, pinned_key: draft.pinned_key || null, max_concurrency_per_key: draft.max_concurrency_per_key, shared_account_concurrency: draft.shared_account_concurrency || null },
-          model_override: draft.model_override || null,
-          reasoning_override: draft.reasoning_override || null,
-          max_attempts: draft.max_attempts,
-          queue_timeout_ms: Math.round(draft.queue_timeout * 1000),
-          recording_enabled: draft.recording_enabled,
-          legacy_monitor_enabled: draft.legacy_monitor_enabled,
-        } });
+        await api("/api/config", { method: "POST", body: routingConfigPayload(draft, latest.config) });
       });
       if (JSON.stringify(readDraft()) === JSON.stringify(draft)) setDirty(false);
       else { baselineDraft = draft; setDirty(true); }
@@ -821,13 +1073,29 @@ if (typeof document !== "undefined") (() => {
     }
   });
 
+  async function updateSyncConfig(action) {
+    if (!state || pendingActions.has("sync-config")) return;
+    const patch = syncConfigPatch(action, state.config);
+    pendingActions.add("sync-config");
+    renderStats();
+    try {
+      await serializeMutation(() => api("/api/config", { method: "POST", body: patch }));
+      await refreshState();
+      toast(action === "pause" ? patch.sync_paused ? "自动同步已暂停，当前号池仍可使用。" : "自动同步已恢复。" : patch.biwrite_import_all ? `已切换为持续同步全部 Key。${state?.config?.sync_paused ? "自动同步仍处于暂停状态，可单次同步或恢复。" : ""}` : "已切换为仅同步保活候选。", "success");
+      if (action === "scope" && formDirty) toast("路由表单仍有未保存的修改，请在保存前检查来源选择。");
+    } catch (error) { toast(error.message, "error"); }
+    finally { pendingActions.delete("sync-config"); if (state) renderStats(); }
+  }
+  $("pause-sync-button").addEventListener("click", () => updateSyncConfig("pause"));
+  $("sync-scope-button").addEventListener("click", () => updateSyncConfig("scope"));
+
   $("sync-button").addEventListener("click", async () => {
     const button = $("sync-button");
     button.disabled = true;
     text("sync-button", "正在同步…");
-    try { await api("/api/sync", { method: "POST", body: {} }); await refreshState(); toast(state?.config?.source_mode === "manual" ? "已重新读取当前手动池。" : "已重新读取 BiWrite 保活候选。", "success"); }
+    try { await serializeMutation(() => api("/api/sync", { method: "POST", body: {} })); await refreshState(); toast(state?.config?.source_mode === "manual" ? "已重新读取当前手动池。" : `已按当前范围完成单次同步。${state?.config?.sync_paused ? "自动同步仍处于暂停状态。" : ""}`, "success"); }
     catch (error) { toast(error.message, "error"); }
-    finally { button.disabled = false; text("sync-button", state?.config?.source_mode === "manual" ? "↻ 刷新手动池" : "↻ 同步 BiWrite"); }
+    finally { button.disabled = false; text("sync-button", state?.config?.source_mode === "manual" ? "↻ 刷新手动池" : "↻ 单次同步"); }
   });
 
   $("connect-button").addEventListener("click", async () => {
@@ -882,15 +1150,30 @@ if (typeof document !== "undefined") (() => {
     const model = $("probe-model").value;
     if (!id || !model || pendingActions.has(id)) return;
     pendingActions.add(id);
-    $("probe-dialog").close();
+    const startedAt = Date.now();
+    probeResults.set(id, { pending: true, started_at_ms: startedAt, details: { requested_model: model, requested_effort: "low", request_text: "Reply only OK.", events: [{ type: "请求已提交", elapsed_ms: 0, detail: "使用所选账号和模型发送固定验证请求。" }] } });
+    $("submit-probe").disabled = true;
+    $("probe-model").disabled = true;
+    text("submit-probe", "验证中…");
+    renderProbeResult();
     renderAccounts(true);
-    toast("验证请求已发送，正在等待上游响应。");
     try {
-      const result = await api("/api/probe", { method: "POST", body: { key_id: id, model }, timeout: 180000 });
-      if (result.ok === false || result.success === false) throw new Error(safeText(result.message || result.error?.message || result.error || "本次验证失败，请查看请求监控。"));
-      toast(result.message || "验证请求已完成，请查看号池状态和请求监控。", "success");
-    } catch (error) { toast(error.message, "error"); }
-    finally { pendingActions.delete(id); await refreshState(); await refreshRecords(); if (state) renderAccounts(true); }
+      const result = await api("/api/probe", { method: "POST", body: { key_id: id, model }, timeout: Math.max(180000, (state?.config?.queue_timeout_ms ?? 600000) + 180000), probeDetails: true });
+      probeResults.set(id, normalizeProbeResult(result, model, Date.now() - startedAt, [sessionToken, $("manual-key")?.value]));
+    } catch (error) {
+      probeResults.set(id, normalizeProbeResult({ ok: false, message: error.message, error_code: "local_request_failed", details: { error_message: "未取得完整验证结果，不能据此确认上游未执行。" } }, model, Date.now() - startedAt, [sessionToken, $("manual-key")?.value]));
+    } finally {
+      pendingActions.delete(id);
+      if (probeAccountId === id) {
+        $("submit-probe").disabled = false;
+        $("probe-model").disabled = false;
+        text("submit-probe", "再次发送验证请求");
+        renderProbeResult();
+      }
+      await refreshState();
+      await refreshRecords();
+      if (state) renderAccounts(true);
+    }
   });
 
   $("close-record-dialog").addEventListener("click", () => $("record-dialog").close());
@@ -911,6 +1194,8 @@ if (typeof document !== "undefined") (() => {
     text("service-status-text", "需要授权");
     showAlert("connection-error", "此页面缺少控制台令牌。请使用 Pool Router 启动时提供的控制台地址打开，令牌会仅保存在当前浏览器会话中。");
     $("sync-button").disabled = true;
+    $("pause-sync-button").disabled = true;
+    $("sync-scope-button").disabled = true;
     $("connect-button").disabled = true;
     $("refresh-records").disabled = true;
     $("save-manual-account").disabled = true;

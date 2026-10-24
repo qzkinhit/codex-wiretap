@@ -45,6 +45,8 @@ struct ModelState {
 struct Binding {
     key_id: String,
     model: String,
+    upstream: String,
+    upstream_session: Option<String>,
     created_at_ms: u64,
 }
 
@@ -154,16 +156,53 @@ impl Scheduler {
         self.changed.clone()
     }
 
+    pub(crate) fn credential_snapshot(&self) -> Vec<Arc<str>> {
+        self.lock()
+            .accounts
+            .values()
+            .map(|entry| entry.account.secret.clone())
+            .collect()
+    }
+
+    /// Redact all loaded credentials, including accounts retained for in-flight leases.
+    /// Unknown upstream text still requires allowlisted diagnostics at the call site.
+    pub fn redact_sensitive(&self, text: &str) -> String {
+        let secrets = self.credential_snapshot();
+        crate::probe::redact_sensitive(text, secrets.iter().map(|secret| secret.as_ref()))
+    }
+
     /// IDs must be stable hashes of physical keys, as guaranteed by the source layer.
-    /// Updating source metadata never resets runtime concurrency or health.
+    /// Metadata changes retain health; changing upstream waits for existing leases
+    /// to drain, then starts with fresh health on the next synchronization.
     pub fn sync_accounts(&self, accounts: Vec<Account>) {
+        let mut upstreams = HashMap::new();
+        let mut conflicting_ids = HashSet::new();
+        for account in &accounts {
+            if let Some(upstream) = upstreams.insert(account.id.clone(), account.upstream.clone())
+                && upstream != account.upstream
+            {
+                conflicting_ids.insert(account.id.clone());
+            }
+        }
         let mut state = self.lock();
         for entry in state.accounts.values_mut() {
             entry.present = false;
         }
         for account in accounts {
             let id = account.id.clone();
+            // Reject the entire ambiguous ID, regardless of its order in the snapshot.
+            if conflicting_ids.contains(&id) {
+                continue;
+            }
             if let Some(entry) = state.accounts.get_mut(&id) {
+                if entry.account.upstream != account.upstream {
+                    // Existing requests still report health and response IDs against
+                    // this entry. Keep their original upstream until every lease ends.
+                    if total_in_flight(entry) > 0 {
+                        continue;
+                    }
+                    entry.model_states.clear();
+                }
                 if entry.present {
                     // Defensive de-duplication when several providers share one key.
                     for model in account.models {
@@ -216,10 +255,11 @@ impl Scheduler {
             }
         }
         for entry in state.accounts.values_mut() {
-            if entry.present {
-                for model in &entry.account.models {
-                    entry.model_states.entry(model.clone()).or_default();
-                }
+            if !entry.present {
+                continue;
+            }
+            for model in &entry.account.models {
+                entry.model_states.entry(model.clone()).or_default();
             }
             // A model can disappear independently of another model using the same key.
             entry.model_states.retain(|model, runtime| {
@@ -258,7 +298,12 @@ impl Scheduler {
                 state.responses.remove(response_id);
                 return Err(SelectError::UnknownResponse);
             }
-            if binding.model != selection.model {
+            if binding.model != selection.model
+                || state
+                    .accounts
+                    .get(&binding.key_id)
+                    .is_none_or(|entry| entry.account.upstream != binding.upstream)
+            {
                 return Err(SelectError::AffinityUnavailable);
             }
             let key = binding.key_id.clone();
@@ -326,6 +371,9 @@ impl Scheduler {
                         })
                         .filter(|binding| now.saturating_sub(binding.created_at_ms) < ttl)
                         .filter(|binding| available.contains(&binding.key_id))
+                        .filter(|binding| {
+                            state.accounts[&binding.key_id].account.upstream == binding.upstream
+                        })
                         .map(|binding| binding.key_id.clone());
                     if let Some(id) = sticky {
                         id
@@ -395,6 +443,8 @@ impl Scheduler {
                 Binding {
                     key_id: chosen,
                     model: selection.model.clone(),
+                    upstream: account.upstream.clone(),
+                    upstream_session: None,
                     created_at_ms: now,
                 },
             );
@@ -468,15 +518,44 @@ impl Scheduler {
         self.signal();
     }
 
-    /// A response ID can never be rebound to a different physical key or model.
+    /// A response ID can never be rebound to a different physical key, model, or upstream.
     pub fn bind_response(&self, response_id: &str, key_id: &str, model: &str) {
+        self.bind_response_with_session(response_id, key_id, model, None);
+    }
+
+    /// Bind the session actually used by this response. A later scope rotation
+    /// must never change an existing response's session, including an original
+    /// unmodified session represented by `None`.
+    pub fn bind_response_with_session(
+        &self,
+        response_id: &str,
+        key_id: &str,
+        model: &str,
+        upstream_session: Option<&str>,
+    ) {
         if response_id.is_empty() || response_id.len() > 1_024 {
             return;
         }
+        let upstream_session = match upstream_session {
+            Some(value) => {
+                let Ok(id) = Uuid::parse_str(value) else {
+                    return;
+                };
+                if value.len() != 36 || id.is_nil() {
+                    return;
+                }
+                Some(id.hyphenated().to_string())
+            }
+            None => None,
+        };
         let mut state = self.lock();
         if state.responses.contains_key(response_id) {
             return;
         }
+        let Some(entry) = state.accounts.get(key_id) else {
+            return;
+        };
+        let upstream = entry.account.upstream.clone();
         let response_id = response_id.to_owned();
         evict_oldest_if_full(&mut state.responses, &response_id);
         state.responses.insert(
@@ -484,9 +563,34 @@ impl Scheduler {
             Binding {
                 key_id: key_id.to_owned(),
                 model: model.to_owned(),
+                upstream,
+                upstream_session,
                 created_at_ms: now_ms(),
             },
         );
+    }
+
+    /// The outer `None` means missing, expired or mismatched account/model/origin.
+    /// `Some(None)` preserves a response made with the original session; the
+    /// caller must not substitute a newer scope mapping in that case.
+    pub fn response_session(
+        &self,
+        response_id: &str,
+        key_id: &str,
+        model: &str,
+        upstream: &str,
+        ttl_seconds: u64,
+    ) -> Option<Option<String>> {
+        let mut state = self.lock();
+        let binding = state.responses.get(response_id)?;
+        if now_ms().saturating_sub(binding.created_at_ms) >= bounded_affinity_ttl_ms(ttl_seconds) {
+            state.responses.remove(response_id);
+            return None;
+        }
+        if binding.key_id != key_id || binding.model != model || binding.upstream != upstream {
+            return None;
+        }
+        Some(binding.upstream_session.clone())
     }
 
     pub fn clear_cooldown(&self, id: &str, model: Option<&str>) -> bool {
@@ -693,8 +797,11 @@ fn shared_capacity_full(entry: &Entry, policy: &RoutingPolicy) -> bool {
 }
 
 fn affinity_ttl_ms(policy: &RoutingPolicy) -> u64 {
-    policy
-        .affinity_ttl_seconds
+    bounded_affinity_ttl_ms(policy.affinity_ttl_seconds)
+}
+
+fn bounded_affinity_ttl_ms(ttl_seconds: u64) -> u64 {
+    ttl_seconds
         .saturating_mul(1_000)
         .clamp(1_000, MAX_AFFINITY_MS)
 }
@@ -948,6 +1055,312 @@ mod tests {
         assert_eq!(scheduler.snapshot(&policy)[0].in_flight, 0);
         scheduler.sync_accounts(vec![]);
         assert!(scheduler.snapshot(&policy).is_empty());
+    }
+
+    #[test]
+    fn idle_upstream_change_resets_health_and_rejects_old_response_binding() {
+        let scheduler = Scheduler::new();
+        let policy = RoutingPolicy::default();
+        scheduler.sync_accounts(vec![account("a", "astra", 1)]);
+        scheduler.mark_success("a", "astra");
+        scheduler.mark_failure(
+            "a",
+            "astra",
+            Some(429),
+            Some(120_000),
+            "rate_limit",
+            &policy,
+        );
+        scheduler.bind_response("resp_old", "a", "astra");
+        let mut replacement = account("a", "astra", 1);
+        replacement.upstream = "https://api.example.org/v1".into();
+        scheduler.sync_accounts(vec![replacement]);
+        let view = scheduler.snapshot(&policy).remove(0);
+        assert_eq!(view.status, "untested");
+        assert_eq!(view.successes, 0);
+        assert_eq!(view.failures, 0);
+        assert_eq!(view.cooldown_until_ms, None);
+        assert_eq!(view.last_ok_ms, None);
+        assert_eq!(view.last_error, None);
+        let mut continuation = selection();
+        continuation.previous_response_id = Some("resp_old".into());
+        assert_eq!(
+            error(scheduler.try_acquire(&continuation, &policy)),
+            SelectError::AffinityUnavailable
+        );
+        // A coincident response ID from the replacement must not overwrite the old binding.
+        scheduler.bind_response("resp_old", "a", "astra");
+        assert_eq!(
+            error(scheduler.try_acquire(&continuation, &policy)),
+            SelectError::AffinityUnavailable
+        );
+        let lease = scheduler.try_acquire(&selection(), &policy).unwrap();
+        assert_eq!(lease.account.upstream, "https://api.example.org/v1");
+    }
+
+    #[test]
+    fn upstream_change_waits_for_all_leases_and_a_fresh_sync_before_replacement() {
+        let scheduler = Scheduler::new();
+        let policy = RoutingPolicy {
+            max_concurrency_per_key: 2,
+            ..RoutingPolicy::default()
+        };
+        let original = account("a", "astra", 2);
+        let mut replacement = original.clone();
+        replacement.upstream = "https://api.example.org/v1".into();
+        scheduler.sync_accounts(vec![original.clone()]);
+        let first = scheduler.try_acquire(&selection(), &policy).unwrap();
+        let second = scheduler.try_acquire(&selection(), &policy).unwrap();
+        scheduler.sync_accounts(vec![replacement.clone()]);
+        assert_eq!(scheduler.snapshot(&policy)[0].status, "removed");
+        assert_eq!(scheduler.snapshot(&policy)[0].in_flight, 2);
+        assert_eq!(
+            error(scheduler.try_acquire(&selection(), &policy)),
+            SelectError::NoEligible
+        );
+        scheduler.mark_success("a", "astra");
+        scheduler.bind_response("resp_late", "a", "astra");
+        drop(first);
+        scheduler.sync_accounts(vec![replacement.clone()]);
+        assert_eq!(
+            scheduler.lock().accounts["a"].account.upstream,
+            original.upstream
+        );
+        assert_eq!(scheduler.snapshot(&policy)[0].in_flight, 1);
+        scheduler.mark_failure(
+            "a",
+            "astra",
+            Some(429),
+            Some(120_000),
+            "rate_limit",
+            &policy,
+        );
+        assert_eq!(scheduler.snapshot(&policy)[0].successes, 1);
+        assert_eq!(scheduler.snapshot(&policy)[0].failures, 1);
+        drop(second);
+        assert_eq!(
+            error(scheduler.try_acquire(&selection(), &policy)),
+            SelectError::NoEligible
+        );
+        scheduler.sync_accounts(vec![replacement]);
+        let view = scheduler.snapshot(&policy).remove(0);
+        assert_eq!(view.status, "untested");
+        assert_eq!(view.successes, 0);
+        assert_eq!(view.failures, 0);
+        assert_eq!(view.cooldown_until_ms, None);
+        let mut continuation = selection();
+        continuation.previous_response_id = Some("resp_late".into());
+        assert_eq!(
+            error(scheduler.try_acquire(&continuation, &policy)),
+            SelectError::AffinityUnavailable
+        );
+        let lease = scheduler.try_acquire(&selection(), &policy).unwrap();
+        assert_eq!(lease.account.upstream, "https://api.example.org/v1");
+    }
+
+    #[test]
+    fn conflicting_upstreams_for_one_id_are_rejected_in_both_snapshot_orders() {
+        let policy = RoutingPolicy::default();
+        let original = account("a", "astra", 1);
+        let mut other = account("a", "sol", 1);
+        other.upstream = "https://api.example.org/v1".into();
+        for conflicting in [
+            vec![original.clone(), other.clone()],
+            vec![other.clone(), original.clone()],
+        ] {
+            let scheduler = Scheduler::new();
+            scheduler.sync_accounts(conflicting.clone());
+            assert!(scheduler.snapshot(&policy).is_empty());
+            assert_eq!(
+                error(scheduler.try_acquire(&selection(), &policy)),
+                SelectError::NoEligible
+            );
+            scheduler.sync_accounts(vec![original.clone()]);
+            let lease = scheduler.try_acquire(&selection(), &policy).unwrap();
+            scheduler.sync_accounts(conflicting.clone());
+            let view = scheduler.snapshot(&policy).remove(0);
+            assert_eq!(view.status, "removed");
+            assert_eq!(view.models, vec!["astra"]);
+            assert_eq!(view.in_flight, 1);
+            assert_eq!(
+                error(scheduler.try_acquire(&sol_selection(), &policy)),
+                SelectError::NoEligible
+            );
+            drop(lease);
+            scheduler.sync_accounts(conflicting);
+            assert!(scheduler.snapshot(&policy).is_empty());
+        }
+    }
+
+    #[test]
+    fn same_upstream_label_update_retains_health_and_active_lease() {
+        let scheduler = Scheduler::new();
+        let policy = RoutingPolicy::default();
+        let original = account("a", "astra", 1);
+        scheduler.sync_accounts(vec![original.clone()]);
+        let lease = scheduler.try_acquire(&selection(), &policy).unwrap();
+        scheduler.mark_success("a", "astra");
+        scheduler.mark_failure(
+            "a",
+            "astra",
+            Some(429),
+            Some(120_000),
+            "rate_limit",
+            &policy,
+        );
+        scheduler.bind_response("resp_same", "a", "astra");
+        let before = scheduler.snapshot(&policy).remove(0);
+        let mut renamed = original;
+        renamed.label = "new-key-label".into();
+        scheduler.sync_accounts(vec![renamed]);
+        let after = scheduler.snapshot(&policy).remove(0);
+        assert_eq!(after.label, "new-key-label");
+        assert_eq!(after.in_flight, 1);
+        assert_eq!(
+            serde_json::to_value(after.model_health).unwrap(),
+            serde_json::to_value(before.model_health).unwrap()
+        );
+        drop(lease);
+        scheduler.clear_cooldown("a", None);
+        let mut continuation = selection();
+        continuation.previous_response_id = Some("resp_same".into());
+        assert!(scheduler.try_acquire(&continuation, &policy).is_ok());
+    }
+
+    #[test]
+    fn sticky_binding_from_old_upstream_does_not_override_current_load() {
+        let scheduler = Scheduler::new();
+        let policy = RoutingPolicy {
+            max_concurrency_per_key: 2,
+            ..RoutingPolicy::default()
+        };
+        let original = account("a", "astra", 2);
+        scheduler.sync_accounts(vec![original.clone()]);
+        let mut conversation = selection();
+        conversation.conversation = Some("chat_old_upstream".into());
+        drop(scheduler.try_acquire(&conversation, &policy).unwrap());
+        let mut replacement = original;
+        replacement.upstream = "https://api.example.org/v1".into();
+        let mut alternate = account("b", "astra", 2);
+        alternate.upstream = replacement.upstream.clone();
+        scheduler.sync_accounts(vec![replacement, alternate]);
+        let mut pinned = selection();
+        pinned.explicit_key = Some("a".into());
+        let held = scheduler.try_acquire(&pinned, &policy).unwrap();
+        let routed = scheduler.try_acquire(&conversation, &policy).unwrap();
+        assert_eq!(routed.account.id, "b");
+        drop(routed);
+        drop(held);
+    }
+
+    #[test]
+    fn response_binding_requires_an_existing_account() {
+        let scheduler = Scheduler::new();
+        let policy = RoutingPolicy::default();
+        scheduler.bind_response("resp_missing", "a", "astra");
+        scheduler.sync_accounts(vec![account("a", "astra", 1)]);
+        let mut continuation = selection();
+        continuation.previous_response_id = Some("resp_missing".into());
+        assert_eq!(
+            error(scheduler.try_acquire(&continuation, &policy)),
+            SelectError::UnknownResponse
+        );
+    }
+
+    #[test]
+    fn response_sessions_remain_fixed_across_later_rotations() {
+        const FIRST: &str = "c7f478a4-7b88-45a3-9780-d5c507e0cb10";
+        const SECOND: &str = "1e87098b-7e8a-4da4-bbe5-97c594f6ba26";
+        let scheduler = Scheduler::new();
+        let source = account("a", "astra", 1);
+        let upstream = source.upstream.clone();
+        scheduler.sync_accounts(vec![source]);
+        scheduler.bind_response_with_session("resp_1", "a", "astra", Some(FIRST));
+        scheduler.bind_response_with_session("resp_2", "a", "astra", Some(SECOND));
+        scheduler.bind_response_with_session("resp_1", "a", "astra", Some(SECOND));
+        scheduler.bind_response("resp_1", "a", "astra");
+        assert_eq!(
+            scheduler.response_session("resp_1", "a", "astra", &upstream, 86_400),
+            Some(Some(FIRST.into()))
+        );
+        assert_eq!(
+            scheduler.response_session("resp_2", "a", "astra", &upstream, 86_400),
+            Some(Some(SECOND.into()))
+        );
+
+        scheduler.bind_response("resp_original", "a", "astra");
+        scheduler.bind_response_with_session("resp_original", "a", "astra", Some(SECOND));
+        assert_eq!(
+            scheduler.response_session("resp_original", "a", "astra", &upstream, 86_400),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn response_sessions_validate_identity_and_expire_without_extending_lifetime() {
+        let scheduler = Scheduler::new();
+        let source = account("a", "astra", 1);
+        let upstream = source.upstream.clone();
+        scheduler.sync_accounts(vec![source]);
+        scheduler.bind_response("resp_bound", "a", "astra");
+        for (response, key, model, origin) in [
+            ("resp_missing", "a", "astra", upstream.as_str()),
+            ("resp_bound", "b", "astra", upstream.as_str()),
+            ("resp_bound", "a", "sol", upstream.as_str()),
+            ("resp_bound", "a", "astra", "https://api.example.org/v1"),
+        ] {
+            assert_eq!(
+                scheduler.response_session(response, key, model, origin, 60),
+                None
+            );
+        }
+        assert!(scheduler.lock().responses.contains_key("resp_bound"));
+        scheduler
+            .lock()
+            .responses
+            .get_mut("resp_bound")
+            .unwrap()
+            .created_at_ms = now_ms().saturating_sub(61_000);
+        // Re-observing an existing response must not refresh its TTL.
+        scheduler.bind_response("resp_bound", "a", "astra");
+        assert_eq!(
+            scheduler.response_session("resp_bound", "a", "astra", &upstream, 60),
+            None
+        );
+        assert!(!scheduler.lock().responses.contains_key("resp_bound"));
+
+        scheduler.bind_response("resp_max_age", "a", "astra");
+        scheduler
+            .lock()
+            .responses
+            .get_mut("resp_max_age")
+            .unwrap()
+            .created_at_ms = now_ms().saturating_sub(MAX_AFFINITY_MS + 1);
+        assert_eq!(
+            scheduler.response_session("resp_max_age", "a", "astra", &upstream, u64::MAX),
+            None
+        );
+        assert!(!scheduler.lock().responses.contains_key("resp_max_age"));
+    }
+
+    #[test]
+    fn response_sessions_reject_invalid_session_values_before_binding() {
+        let scheduler = Scheduler::new();
+        let source = account("a", "astra", 1);
+        let upstream = source.upstream.clone();
+        scheduler.sync_accounts(vec![source]);
+        for value in ["not-a-session", "00000000-0000-0000-0000-000000000000"] {
+            scheduler.bind_response_with_session("resp_invalid", "a", "astra", Some(value));
+            assert_eq!(
+                scheduler.response_session("resp_invalid", "a", "astra", &upstream, 60),
+                None
+            );
+        }
+        scheduler.bind_response_with_session("resp_invalid", "a", "astra", None);
+        assert_eq!(
+            scheduler.response_session("resp_invalid", "a", "astra", &upstream, 60),
+            Some(None)
+        );
     }
 
     #[test]
