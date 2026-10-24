@@ -86,6 +86,14 @@ Mac 打开 `~/Applications/Pool Router.app`；Windows 从开始菜单打开 **Po
 
 首次使用按上述默认直连流程即可。仍需要由 CC Switch 维护 Key 时，再阅读后面的“可选流程：兼容 CC Switch 监控”。
 
+## 检查并安装更新
+
+1. 在 Pool Router 面板顶部点击 **“检查更新”**，查看当前版本和 GitHub 最新正式 Release 版本。
+2. 确认有适合本机的新版本后，点击 **“下载并打开安装包”**。本地服务会从本仓库的正式 Release 下载安装包，校验 SHA256 后打开它；下载期间不要重复提交。
+3. Mac 在打开的 DMG 中双击 `安装.command`；Windows 完成打开的安装向导。现有配置保留，安装完成后刷新面板确认版本。更新会重启本软件，宜等当前请求完成后再安装。
+
+此功能检查正式 Release，不会把仓库 `main` 分支中的源码改动直接安装到本机，也不会静默替换程序。当前版本等于或高于最新正式版时不提供降级安装。没有当前平台安装包或缺少可靠校验信息时，可从窗口中的 GitHub 发行页面查看说明。GitHub 不可达时，请检查网络后重新点击“检查更新”。
+
 ## 常见问题
 
 ### 为什么没有账号，或者某个模型没有账号？
@@ -109,6 +117,24 @@ Mac 打开 `~/Applications/Pool Router.app`，Windows 从开始菜单打开 **Po
 仅名称缺失时，仍可通过 ID 查找。程序只查询本机可读 Codex 数据库中的明确对话 ID；其他设备的对话或缺失的本地索引可能没有名称。如果新请求完全没有记录，先确认服务在线、记录已启用，以及发出请求的 Codex 会话已加载本地接入配置。此程序只监控经过本地入口的请求。
 
 ## 安装与命令行参考
+
+### 维护者构建安装包
+
+以下工具仅用于从源码构建发行包，用户安装 DMG 或 EXE 不需要运行这些命令。macOS 在仓库目录依次执行：
+
+```bash
+cargo build --release --locked --bin pool-router
+python3 scripts/package-release.py --output dist/macos
+python3 scripts/macos-package-dmg.py dist/macos/PoolRouter-macOS-arm64.zip dist/macos/PoolRouter-macOS-arm64.dmg
+```
+
+Windows 在具备 Rust 和安装器构建工具的 PowerShell 环境中执行：
+
+```powershell
+./scripts/windows/build.ps1 -ReleaseTag v1.0.0
+```
+
+也可运行 GitHub Actions 的 **Build Windows installer**，填写 `release_tag`。发布标签已创建时，留空 `source_ref` 即从该标签构建；标签创建前需显式填写要构建的提交或分支，例如 `main`。构建结果应对应最终发布标签，不应把未经核对的分支结果当作已发布版本。
 
 ### 旧版 ZIP 与 DMG 复现
 

@@ -2,7 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { conversationInfo, matchesConversationFilter, classifyRequestOutcome, manualAccountPayload, requestRouteMode, classifyServiceTier, recordServiceTier, matchesServiceTierFilter, sourceProviderRows, draftFromConfig, routingConfigPayload, accountModels, filterAccounts, filterModelHealth, syncConfigPatch, normalizeProbeResult, gatewayActionRows, attemptErrorDetails, effectiveOutputWait } = require("./app.js");
+const { compareReleaseVersions, safeReleaseUrl, updateActionState, conversationInfo, matchesConversationFilter, classifyRequestOutcome, manualAccountPayload, requestRouteMode, classifyServiceTier, recordServiceTier, matchesServiceTierFilter, sourceProviderRows, draftFromConfig, routingConfigPayload, accountModels, filterAccounts, filterModelHealth, syncConfigPatch, normalizeProbeResult, gatewayActionRows, attemptErrorDetails, effectiveOutputWait } = require("./app.js");
 
 test("retry settings distinguish fifteen retries from sixteen total attempts and support both boundaries", () => {
   const defaults = draftFromConfig({});
@@ -337,4 +337,32 @@ test("conversation links only use complete UUIDs and never derive URLs from titl
   for (const invalid of ["javascript:alert(1)", `codex://threads/${id}`, `${id}/other`, `${id}?action=delete`, `${id}#fragment`, ` ${id}`, `${id}\n`, '<img src=x onerror="alert(1)">', { toString: () => id }]) {
     assert.equal(conversationInfo({ conversation_id: invalid, conversation_title: "正常名称" }).href, null);
   }
+});
+
+
+test("release versions compare numeric components and reject ambiguous or prerelease formats", () => {
+  assert.equal(compareReleaseVersions("1.9.9", "v1.10.0"), -1);
+  assert.equal(compareReleaseVersions("v1.0.0", "1.0.0"), 0);
+  assert.equal(compareReleaseVersions("2.0.0", "1.99.99"), 1);
+  assert.equal(compareReleaseVersions("1.0.9007199254740993", "1.0.9007199254740992"), 1);
+  for (const value of [undefined, null, "", "1.0", "01.0.0", "1.0.1-beta", "1.0.1+build", " 1.0.1", "1.0.1/../../", "v" + "1".repeat(70) + ".0.0"]) assert.equal(compareReleaseVersions("1.0.0", value), null, String(value));
+});
+
+test("update actions need both a newer version and server approval and suppress duplicate downloads", () => {
+  const info = { current_version: "1.0.0", latest_version: "1.1.0", update_available: true, download_supported: true };
+  assert.equal(updateActionState(info, "ready").canDownload, true);
+  assert.equal(updateActionState(info, "error").canDownload, true);
+  for (const phase of ["checking", "downloading", "opened"]) assert.equal(updateActionState(info, phase).canDownload, false, phase);
+  assert.equal(updateActionState(info, "downloading").busy, true);
+  for (const patch of [{ current_version: "1.1.0" }, { current_version: "2.0.0" }, { latest_version: null }, { latest_version: "1.1.0-rc.1" }, { update_available: false }, { download_supported: false }, { download_supported: "true" }]) assert.equal(updateActionState({ ...info, ...patch }, "ready").canDownload, false, JSON.stringify(patch));
+  assert.equal(updateActionState(null).canDownload, false);
+});
+
+test("update release links stay on this repository without credentials or token-bearing URL parts", () => {
+  const root = "https://github.com/qzkinhit/codex-wiretap/releases";
+  for (const suffix of ["", "/", "/latest", "/tag/v1.0.1", "/tag/2.10.0"]) assert.equal(safeReleaseUrl(root + suffix), root + suffix);
+  for (const value of ["http://github.com/qzkinhit/codex-wiretap/releases", "https://github.com.evil.test/qzkinhit/codex-wiretap/releases", "https://github.com/other/repo/releases", "https://user:secret@github.com/qzkinhit/codex-wiretap/releases", root + "?token=local-secret", root + "#local-secret", root + "/../issues", root + "/download/v1.0.1/installer.exe", root + "/tag/v1.0.1%2f..", "javascript:alert(1)", "//github.com/qzkinhit/codex-wiretap/releases", null]) assert.equal(safeReleaseUrl(value), null, String(value));
+  const state = updateActionState({ current_version: "1.0.0", latest_version: "1.1.0", update_available: true, download_supported: false, release_url: root + "/tag/v1.1.0" });
+  assert.equal(state.canDownload, false);
+  assert.equal(state.releaseUrl, root + "/tag/v1.1.0");
 });

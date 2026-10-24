@@ -86,6 +86,14 @@ Use the record for the request you just sent.
 
 For first-time setup, complete the direct workflow above. Read Optional CC Switch Monitoring below only if you intend to keep maintaining keys in CC Switch.
 
+## Check for and install updates
+
+1. Click **Check for Updates (`检查更新`)** at the top of the Pool Router dashboard to view the current version and the latest official GitHub Release.
+2. When a newer package is available for your computer, click **Download and Open Installer (`下载并打开安装包`)**. The local service downloads it from this repository’s official Release, verifies its SHA256, and opens it. Do not submit another download while it is running.
+3. On macOS, double-click `安装.command` in the opened DMG. On Windows, complete the opened installation wizard. Existing configuration is preserved. Refresh the dashboard after installation to confirm the version. Updating restarts this application, so install after current requests finish.
+
+This checks official Releases; it does not install source changes directly from `main` or silently replace the running application. Equal or older release versions are not offered as downgrades. If no package or reliable checksum is available for the current platform, use the GitHub release-page link in the dialog for instructions. If GitHub cannot be reached, check the network connection and click Check for Updates again.
+
 ## Frequently asked questions
 
 ### Why are there no accounts, or no accounts for a particular model?
@@ -109,6 +117,24 @@ Send a new request and inspect its label in Request Monitor. Pool Routing (`号�
 If only the name is missing, use the ID. The application looks up explicit conversation IDs in readable local Codex databases; conversations on other devices or missing local indexes may have no name. If the request has no record at all, check that the service is online, recording is enabled, and the sending Codex conversation has loaded the local connection configuration. Only requests passing through the local endpoint are monitored.
 
 ## Installation and command-line reference
+
+### Build release packages as a maintainer
+
+These tools are for building release packages from source. Users installing a DMG or EXE do not need to run them. On macOS, run these commands in the repository in order:
+
+```bash
+cargo build --release --locked --bin pool-router
+python3 scripts/package-release.py --output dist/macos
+python3 scripts/macos-package-dmg.py dist/macos/PoolRouter-macOS-arm64.zip dist/macos/PoolRouter-macOS-arm64.dmg
+```
+
+On Windows, use PowerShell with Rust and the installer build tools available:
+
+```powershell
+./scripts/windows/build.ps1 -ReleaseTag v1.0.0
+```
+
+Alternatively, run the **Build Windows installer** GitHub Actions workflow and supply `release_tag`. After creating the release tag, leave `source_ref` empty to build that tag. To build before tagging, explicitly supply the intended commit or branch, such as `main`. The resulting package must correspond to the final release tag; an unchecked branch build is not evidence of a published release.
 
 ### Older ZIP package and DMG reproduction
 

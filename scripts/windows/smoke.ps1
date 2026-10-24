@@ -24,7 +24,9 @@ $launcher = Join-Path $installDir 'pool-router-launcher.exe'
 $maintenance = Join-Path $installDir 'maintenance.ps1'
 $uninstaller = Join-Path $installDir 'unins000.exe'
 $otherProcess = $null
+$token = ''
 $otherService = Join-Path $scratch 'Other Installation\pool-router.exe'
+$script:smokeStage = 'initializing fixtures'
 $oldEnvironment = @{}
 foreach ($name in @('LOCALAPPDATA', 'APPDATA', 'USERPROFILE', 'CODEX_HOME')) {
     $oldEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
@@ -39,7 +41,9 @@ function Invoke-Executable([string]$FilePath, [string[]]$Arguments) {
     # forever for the background service created by the launcher.
     $process = Start-Process -FilePath $FilePath -ArgumentList ($quoted -join ' ') -PassThru -WindowStyle Hidden
     try {
-        if (-not $process.WaitForExit(180000)) { throw 'A smoke test executable timed out.' }
+        if (-not $process.WaitForExit(180000)) {
+            throw "Smoke stage '$script:smokeStage' timed out waiting for $([IO.Path]::GetFileName($FilePath))."
+        }
         return $process.ExitCode
     }
     finally { $process.Dispose() }
@@ -47,7 +51,35 @@ function Invoke-Executable([string]$FilePath, [string[]]$Arguments) {
 
 function Invoke-Checked([string]$FilePath, [string[]]$Arguments) {
     $exitCode = Invoke-Executable $FilePath $Arguments
-    if ($exitCode -ne 0) { throw "A smoke test executable failed with exit code $exitCode." }
+    if ($exitCode -ne 0) { throw "Smoke stage '$script:smokeStage' failed in $([IO.Path]::GetFileName($FilePath)) with exit code $exitCode." }
+}
+
+function Set-SmokeStage([string]$Name) {
+    $script:smokeStage = $Name
+    Write-Host "SMOKE: $Name"
+}
+
+function Write-FixtureDiagnostics {
+    # Only inspect this script's isolated application files. Never print config,
+    # browser URLs, arbitrary environment values or any real user directories.
+    foreach ($name in @('service.log', 'launcher.log')) {
+        $path = Join-Path $stateDir "logs\$name"
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            Write-Host "Fixture $name (last 30 lines):"
+            foreach ($line in (Get-Content -LiteralPath $path -Tail 30)) {
+                $safeLine = $line
+                if ($token) { $safeLine = $safeLine -replace [regex]::Escape($token), '[fixture-token-redacted]' }
+                $safeLine = $safeLine -replace 'https?://\S+', '[url-redacted]'
+                Write-Host $safeLine
+            }
+        }
+    }
+    foreach ($name in @('pool-router.exe', 'pool-router-launcher.exe')) {
+        $processes = @(Get-CimInstance Win32_Process -Filter "Name='$name'" -ErrorAction SilentlyContinue | Where-Object {
+            $_.ExecutablePath -and [IO.Path]::GetFullPath($_.ExecutablePath).StartsWith($scratch + '\', [StringComparison]::OrdinalIgnoreCase)
+        })
+        Write-Host "Fixture process $name count: $($processes.Count)"
+    }
 }
 
 function Wait-Healthy([string]$BaseUrl) {
@@ -81,7 +113,9 @@ try {
     $token = 'ci_' + [guid]::NewGuid().ToString('N')
     $config = @{
         source_mode = 'manual'
-        upstream_base_url = 'http://127.0.0.1:9/v1'
+        # The production validator requires a public HTTPS endpoint. This is
+        # metadata only: the empty manual pool never sends an upstream request.
+        upstream_base_url = 'https://api.example.com/v1'
         listen = "127.0.0.1:$port"
         biwrite_dir = (Join-Path $roamingDir 'app.biwrite.desktop')
         local_token = $token
@@ -94,25 +128,30 @@ try {
     [IO.File]::WriteAllText($codexPath, $originalCodex, [Text.UTF8Encoding]::new($false))
 
     # /DIR isolates application files; optional desktop/startup tasks stay disabled.
+    Set-SmokeStage 'installing application'
     Invoke-Checked $Installer @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/DIR=$installDir", '/TASKS=')
     foreach ($name in @('pool-router.exe', 'pool-router-launcher.exe', 'LICENSE.txt', 'THIRD-PARTY-NOTICES.txt', 'maintenance.ps1', 'unins000.exe')) {
         if (-not (Test-Path -LiteralPath (Join-Path $installDir $name))) { throw "Missing installed file: $name" }
     }
     if (([IO.File]::ReadAllText($codexPath)) -cne $originalCodex) { throw 'Installation changed Codex configuration.' }
+    Set-SmokeStage 'starting background service'
     Invoke-Checked $launcher @('--background', '--config', $configPath)
     Wait-Healthy $baseUrl
     $headers = @{ Authorization = "Bearer $token" }
+    Set-SmokeStage 'reading authenticated API and dashboard'
     $state = Invoke-RestMethod -Uri "$baseUrl/api/state" -Headers $headers -TimeoutSec 5
     if ($null -eq $state) { throw 'The authenticated state API returned no data.' }
     $page = Invoke-WebRequest -Uri "$baseUrl/" -Headers $headers -UseBasicParsing -TimeoutSec 5
     if ($page.StatusCode -ne 200 -or $page.Content -notmatch '<html') { throw 'The dashboard did not load.' }
     # Exercise the actual launcher -> service open -> default browser path. This
     # verifies successful process handoff; it does not claim a visual browser test.
+    Set-SmokeStage 'opening dashboard through the launcher'
     Invoke-Checked $launcher @('--config', $configPath)
     Wait-Healthy $baseUrl
 
     # A second executable with the same name in a different directory must survive
     # update/uninstall of this installation. Both services use empty fixture pools.
+    Set-SmokeStage 'starting unrelated fixture installation'
     $otherDirectory = Split-Path -Parent $otherService
     New-Item -ItemType Directory -Path $otherDirectory | Out-Null
     Copy-Item -LiteralPath $service -Destination $otherService
@@ -128,21 +167,25 @@ try {
     Wait-Healthy "http://127.0.0.1:$otherPort"
 
     # Upgrade must preserve the saved configuration and allow a clean restart.
+    Set-SmokeStage 'upgrading the installed application'
     $configBeforeUpgrade = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
     Invoke-Checked $Installer @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/DIR=$installDir", '/TASKS=')
     if ($otherProcess.HasExited) { throw 'Upgrade stopped an unrelated installation.' }
     if ((Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash -cne $configBeforeUpgrade) { throw 'Upgrade changed user configuration.' }
+    Set-SmokeStage 'starting the upgraded service'
     Invoke-Checked $launcher @('--background', '--config', $configPath)
     Wait-Healthy $baseUrl
 
     # Test a conflict with a fake Codex configuration. A rejected restore must
     # preserve both the backup and the running service before uninstall removes files.
+    Set-SmokeStage 'connecting the isolated Codex fixture'
     Invoke-Checked $service @('connect', '--config', $configPath)
     $connectedCodex = [IO.File]::ReadAllText($codexPath)
     if ($connectedCodex -notmatch 'pool_router') { throw 'The fixture did not connect.' }
     $conflictedCodex = $connectedCodex.Replace($token, 'fixture-conflict-token-with-at-least-32-characters')
     if ($conflictedCodex -ceq $connectedCodex) { throw 'The conflict fixture did not change a managed field.' }
     [IO.File]::WriteAllText($codexPath, $conflictedCodex, [Text.UTF8Encoding]::new($false))
+    Set-SmokeStage 'verifying uninstall conflict protection'
     $maintenanceExit = Invoke-Executable 'powershell.exe' @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $maintenance, '-Action', 'Uninstall', '-InstallDir', $installDir)
     if ($maintenanceExit -ne 20) { throw 'Conflicting restore did not abort uninstall maintenance.' }
     if (([IO.File]::ReadAllText($codexPath)) -cne $conflictedCodex) { throw 'Conflict handling overwrote Codex configuration.' }
@@ -150,6 +193,7 @@ try {
     Wait-Healthy $baseUrl
 
     # Remove the synthetic conflict and let the real uninstaller restore its backup.
+    Set-SmokeStage 'uninstalling and restoring the Codex fixture'
     [IO.File]::WriteAllText($codexPath, $connectedCodex, [Text.UTF8Encoding]::new($false))
     Invoke-Checked $uninstaller @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART')
     if ($otherProcess.HasExited) { throw 'Uninstall stopped an unrelated installation.' }
@@ -158,7 +202,15 @@ try {
     if (([IO.File]::ReadAllText($codexPath)) -cne $originalCodex) { throw 'Uninstall did not restore the original Codex fixture.' }
     Write-Host 'PASS: install, isolated service startup, health, authenticated dashboard, browser handoff, upgrade, process path isolation, conflict preservation and uninstall restoration.'
 }
+catch {
+    $failure = $_
+    Write-Host "FAIL: $script:smokeStage"
+    try { Write-FixtureDiagnostics }
+    catch { Write-Host 'Fixture diagnostics could not be fully collected.' }
+    throw $failure
+}
 finally {
+    Set-SmokeStage 'cleaning up fixture processes'
     if (Test-Path -LiteralPath $maintenance) {
         $null = Invoke-Executable 'powershell.exe' @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $maintenance, '-Action', 'Stop', '-InstallDir', $installDir)
     }

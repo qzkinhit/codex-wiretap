@@ -10,4 +10,5 @@ pub mod proxy;
 pub mod recovery;
 pub mod scheduler;
 pub mod types;
+pub mod updates;
 pub mod upstream;

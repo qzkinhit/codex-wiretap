@@ -9,6 +9,7 @@ use crate::{
     recovery::{self, RecoveryKind, SessionRemaps},
     scheduler::{Scheduler, SelectError, Selection},
     types::{ProviderSummary, RoutingPolicy, SourceSnapshot, now_ms},
+    updates::UpdateService,
 };
 use anyhow::Result;
 use axum::{
@@ -21,7 +22,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use futures_util::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -58,6 +59,7 @@ pub struct AppState {
     pub records: RecordStore,
     /// Local display metadata only. Titles never enter the persisted request log.
     pub conversations: Arc<ConversationIndex>,
+    pub updates: UpdateService,
     pub source: RwLock<SourceState>,
     pub client: reqwest::Client,
     legacy_client: reqwest::Client,
@@ -83,6 +85,12 @@ impl AppState {
                 .join("records.jsonl")
         });
         let records = RecordStore::new(data_path, config.record_limit)?;
+        let updates = UpdateService::new(
+            config_path
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .to_path_buf(),
+        );
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
@@ -102,6 +110,7 @@ impl AppState {
             scheduler: Scheduler::new(),
             records,
             conversations: Arc::new(ConversationIndex::from_environment()),
+            updates,
             source: RwLock::new(SourceState::default()),
             client,
             legacy_client,
@@ -225,6 +234,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/state", get(api_state))
         .route("/api/records", get(api_records))
         .route("/api/records/clear", post(api_clear))
+        .route("/api/update/check", post(api_update_check))
+        .route("/api/update/download", post(api_update_download))
         .route("/api/config", post(api_config))
         .route("/api/sync", post(api_sync))
         .route("/api/accounts/{id}/reset", post(api_reset))
@@ -424,6 +435,76 @@ async fn api_records(State(s): State<Arc<AppState>>) -> Json<Value> {
         .collect::<Vec<_>>();
     Json(json!({"records":records}))
 }
+async fn api_update_check(State(s): State<Arc<AppState>>) -> Response {
+    match s.updates.check().await {
+        Ok(info) => Json(info).into_response(),
+        Err(error_info) => error(
+            StatusCode::BAD_GATEWAY,
+            "update_check_failed",
+            &error_info.to_string(),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateDownloadRequest {
+    version: String,
+}
+
+async fn api_update_download(
+    State(s): State<Arc<AppState>>,
+    Json(request): Json<UpdateDownloadRequest>,
+) -> Response {
+    let download = match s.updates.download(&request.version).await {
+        Ok(download) => download,
+        Err(error_info) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "update_download_failed",
+                &error_info.to_string(),
+            );
+        }
+    };
+    #[cfg(target_os = "macos")]
+    let mut opener = {
+        let mut command = std::process::Command::new("/usr/bin/open");
+        command.arg(&download.path);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut opener = std::process::Command::new(&download.path);
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut opener = {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(&download.path);
+        command
+    };
+    match opener
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => {
+            drop(child);
+            Json(json!({
+                "ok": true,
+                "opened": true,
+                "version": download.version,
+                "filename": download.filename,
+                "message": "安装包已通过 SHA-256 校验，已请求系统打开。完成安装后刷新控制台，现有配置会保留。"
+            }))
+            .into_response()
+        }
+        Err(_) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "update_open_failed",
+            "安装包已通过校验，但系统未能打开；请重试或从 GitHub Release 手动下载安装。",
+        ),
+    }
+}
+
 async fn api_clear(State(s): State<Arc<AppState>>) -> Response {
     match s.records.clear() {
         Ok(()) => Json(json!({"ok":true})).into_response(),

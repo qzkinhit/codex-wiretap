@@ -38,6 +38,39 @@ function matchesConversationFilter(record, query = "") {
   return !term || [conversation.title, conversation.id].some((value) => value.toLowerCase().includes(term));
 }
 
+function compareReleaseVersions(left, right) {
+  const parse = (value) => {
+    if (typeof value !== "string" || value.length > 64) return null;
+    const match = /^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.exec(value);
+    return match ? match.slice(1).map(BigInt) : null;
+  };
+  const a = parse(left), b = parse(right);
+  if (!a || !b) return null;
+  for (let index = 0; index < 3; index++) {
+    if (a[index] !== b[index]) return a[index] > b[index] ? 1 : -1;
+  }
+  return 0;
+}
+
+function safeReleaseUrl(value) {
+  if (typeof value !== "string" || value !== value.trim()) return null;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.hostname !== "github.com" || url.port || url.username || url.password || url.search || url.hash) return null;
+    return /^\/qzkinhit\/codex-wiretap\/releases(?:\/latest|\/tag\/v?(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))?\/?$/.test(url.pathname) ? url.href : null;
+  } catch (_) { return null; }
+}
+
+function updateActionState(info, phase = "idle") {
+  const busy = phase === "checking" || phase === "downloading";
+  const newer = compareReleaseVersions(info?.current_version, info?.latest_version) === -1;
+  return {
+    busy,
+    canDownload: !busy && phase !== "opened" && newer && info?.update_available === true && info?.download_supported === true,
+    releaseUrl: safeReleaseUrl(info?.release_url),
+  };
+}
+
 function manualAccountPayload(fields) {
   const key = String(fields.key || "").trim();
   const models = [...new Set(String(fields.models || "").split(/[,，\n]+/).map((model) => model.trim()).filter(Boolean))];
@@ -223,7 +256,7 @@ function routingConfigPayload(draft, latestConfig) {
   };
 }
 
-if (typeof module !== "undefined" && module.exports) module.exports = { conversationInfo, matchesConversationFilter, classifyRequestOutcome, manualAccountPayload, requestRouteMode, classifyServiceTier, recordServiceTier, matchesServiceTierFilter, sourceProviderRows, draftFromConfig, routingConfigPayload, accountModels, filterAccounts, filterModelHealth, syncConfigPatch, redactSensitiveText, normalizeProbeResult, gatewayActionRows, attemptErrorDetails, effectiveOutputWait };
+if (typeof module !== "undefined" && module.exports) module.exports = { compareReleaseVersions, safeReleaseUrl, updateActionState, conversationInfo, matchesConversationFilter, classifyRequestOutcome, manualAccountPayload, requestRouteMode, classifyServiceTier, recordServiceTier, matchesServiceTierFilter, sourceProviderRows, draftFromConfig, routingConfigPayload, accountModels, filterAccounts, filterModelHealth, syncConfigPatch, redactSensitiveText, normalizeProbeResult, gatewayActionRows, attemptErrorDetails, effectiveOutputWait };
 
 if (typeof document !== "undefined") (() => {
   const $ = (id) => document.getElementById(id);
@@ -256,6 +289,7 @@ if (typeof document !== "undefined") (() => {
   let accountModelFilter = "";
   const probeResults = new Map();
   let openedRecordId = null;
+  let updateState = { info: null, phase: "idle", message: "" };
   const pendingActions = new Set();
   const dateFormatter = new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
   const timeFormatter = new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
@@ -1159,6 +1193,60 @@ if (typeof document !== "undefined") (() => {
   $("legacy-connect-button").addEventListener("click", () => updateLegacyConnection("connect"));
   $("legacy-restore-button").addEventListener("click", () => updateLegacyConnection("restore"));
 
+  function renderUpdate() {
+    const { info, phase, message } = updateState;
+    const actions = updateActionState(info, phase);
+    text("update-current-version", info?.current_version || state?.version || "未知");
+    text("update-latest-version", info?.latest_version || "尚未取得");
+    text("update-asset-name", info ? info.asset_name || "此版本未提供当前平台安装包" : "检查后显示适合本机的安装包");
+    text("update-message", message || info?.message || "检查 GitHub 最新正式 Release，确认是否有适合本机的更新。");
+    $("update-message").classList.toggle("update-error", phase === "error");
+    $("update-progress").hidden = !actions.busy;
+    $("update-progress").setAttribute("aria-label", phase === "downloading" ? "正在下载并校验安装包" : "正在检查更新");
+    $("update-recheck").disabled = actions.busy || !sessionToken;
+    $("update-download").disabled = !actions.canDownload || !sessionToken;
+    const link = $("update-release-link");
+    link.hidden = !actions.releaseUrl;
+    if (actions.releaseUrl) link.href = actions.releaseUrl;
+    else link.removeAttribute("href");
+  }
+
+  async function checkUpdate() {
+    if (!sessionToken || updateActionState(updateState.info, updateState.phase).busy) return;
+    updateState = { info: null, phase: "checking", message: "正在检查 GitHub 最新正式 Release…" };
+    renderUpdate();
+    try {
+      const info = await api("/api/update/check", { method: "POST", body: {}, timeout: 310000 });
+      updateState = { info, phase: "ready", message: "" };
+    } catch (error) {
+      updateState = { info: null, phase: "error", message: `${error.message} 请检查本机服务与 GitHub 网络连接，然后点击“检查更新”重试。` };
+    }
+    renderUpdate();
+  }
+
+  $("check-updates-button").addEventListener("click", () => {
+    if (!$("update-dialog").open) $("update-dialog").showModal();
+    renderUpdate();
+    checkUpdate();
+  });
+  $("update-recheck").addEventListener("click", checkUpdate);
+  $("close-update-dialog").addEventListener("click", () => $("update-dialog").close());
+  $("update-download").addEventListener("click", async () => {
+    if (!sessionToken || !updateActionState(updateState.info, updateState.phase).canDownload) return;
+    const info = updateState.info;
+    updateState = { info, phase: "downloading", message: "正在下载并校验安装包，请稍候。完成后会打开本机安装包。" };
+    renderUpdate();
+    try {
+      const result = await api("/api/update/download", { method: "POST", body: { version: info.latest_version }, timeout: 930000 });
+      if (result.ok !== true || result.opened !== true || compareReleaseVersions(result.version, info.latest_version) !== 0) throw new Error(result.message || "尚未确认安装包已打开，请检查更新后重试。");
+      const instruction = result.filename === "PoolRouter-macOS-arm64.dmg" ? "请双击 DMG 中的“安装.command”完成安装。" : result.filename === "PoolRouter-Windows-x64-Setup.exe" ? "请在打开的 Windows 安装向导中完成安装。" : "请按已打开安装包的提示完成安装。";
+      updateState = { info, phase: "opened", message: `安装包已校验并打开。${instruction}现有配置会保留；安装完成后刷新此页面查看版本。` };
+    } catch (error) {
+      updateState = { info, phase: "error", message: `${error.message} 请检查网络后重试；如果安装包已经打开，请先完成安装。` };
+    }
+    renderUpdate();
+  });
+
   $("copy-url").addEventListener("click", async () => {
     const url = state?.connection?.base_url;
     if (!url) return;
@@ -1202,7 +1290,7 @@ if (typeof document !== "undefined") (() => {
   $("record-dialog").addEventListener("close", () => { openedRecordId = null; });
   $("close-probe-dialog").addEventListener("click", () => $("probe-dialog").close());
   $("cancel-probe").addEventListener("click", () => $("probe-dialog").close());
-  for (const id of ["record-dialog", "probe-dialog"]) {
+  for (const id of ["record-dialog", "probe-dialog", "update-dialog"]) {
     $(id).addEventListener("click", (event) => { if (event.target !== $(id)) return; const rect = $(id).getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) $(id).close(); });
   }
   for (const id of ["filter-model", "filter-status", "filter-tier"]) $(id).addEventListener("change", () => renderRecords(true));
@@ -1215,6 +1303,7 @@ if (typeof document !== "undefined") (() => {
     $("service-status").className = "live-status offline";
     text("service-status-text", "需要授权");
     showAlert("connection-error", "此页面缺少控制台令牌。请使用 Pool Router 启动时提供的控制台地址打开，令牌会仅保存在当前浏览器会话中。");
+    $("check-updates-button").disabled = true;
     $("sync-button").disabled = true;
     $("pause-sync-button").disabled = true;
     $("sync-scope-button").disabled = true;

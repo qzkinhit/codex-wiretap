@@ -315,7 +315,10 @@ mod windows {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
         let powershell = system_root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
-        let shown = Command::new(powershell)
+        // The launcher reports failure through its exit code immediately. A
+        // separate dialog process may wait for user input without holding up an
+        // installer, a login task, or another program invoking the launcher.
+        let notification_started = Command::new(powershell)
             .creation_flags(CREATE_NO_WINDOW)
             .args([
                 "-NoLogo",
@@ -328,9 +331,9 @@ mod windows {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
-        if !shown {
+            .spawn()
+            .is_ok();
+        if !notification_started {
             let _ = Command::new(system_root.join("System32/notepad.exe"))
                 .arg(log_path)
                 .spawn();

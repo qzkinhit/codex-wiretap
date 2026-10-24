@@ -98,16 +98,36 @@ async fn run() -> Result<()> {
             let mut opener = std::process::Command::new("open");
             #[cfg(target_os = "windows")]
             let mut opener = {
-                let mut c = std::process::Command::new("rundll32");
+                use std::os::windows::process::CommandExt;
+                use std::process::Stdio;
+                let system_root = std::env::var_os("SystemRoot")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+                let mut c = std::process::Command::new(system_root.join("System32/rundll32.exe"));
                 c.arg("url.dll,FileProtocolHandler");
+                c.creation_flags(0x0800_0000)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
                 c
             };
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             let mut opener = std::process::Command::new("xdg-open");
-            if !opener.arg(url).status()?.success() {
-                bail!("无法打开浏览器");
+            #[cfg(target_os = "windows")]
+            {
+                // The shell URL handler may stay alive for the lifetime of the
+                // browser or its first-run UI. Opening the dashboard only hands
+                // the URL to that handler; it must not wait for the browser to exit.
+                drop(opener.arg(url).spawn()?);
+                println!("已请求系统浏览器打开本地号池控制台");
             }
-            println!("已打开本地号池控制台");
+            #[cfg(not(target_os = "windows"))]
+            {
+                if !opener.arg(url).status()?.success() {
+                    bail!("无法打开浏览器");
+                }
+                println!("已打开本地号池控制台");
+            }
         }
         _ => serve(cfg, config_path).await?,
     }
