@@ -31,7 +31,7 @@ struct Entry {
     model_states: HashMap<String, ModelState>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ModelState {
     in_flight: u32,
     cooldown_until_ms: u64,
@@ -271,6 +271,48 @@ impl Scheduler {
         state
             .accounts
             .retain(|_, entry| entry.present || total_in_flight(entry) > 0);
+        drop(state);
+        self.signal();
+    }
+
+    pub fn contains_model(&self, id: &str, upstream: &str, model: &str) -> bool {
+        self.lock().accounts.get(id).is_some_and(|entry| {
+            entry.present
+                && entry.account.upstream == upstream
+                && entry.account.models.iter().any(|item| item == model)
+        })
+    }
+
+    pub fn adopt_probe_health(&self, source: &Scheduler, pairs: &[(String, String, String)]) {
+        let source = source.lock();
+        let updates: Vec<(String, String, String, ModelState)> = pairs
+            .iter()
+            .filter_map(|(upstream, id, model)| {
+                source.accounts.get(id).and_then(|entry| {
+                    (entry.account.upstream == *upstream)
+                        .then(|| entry.model_states.get(model))
+                        .flatten()
+                        .map(|health| (id.clone(), upstream.clone(), model.clone(), health.clone()))
+                })
+            })
+            .collect();
+        drop(source);
+        let mut state = self.lock();
+        for (id, upstream, model, health) in updates {
+            let Some(entry) = state.accounts.get_mut(&id) else {
+                continue;
+            };
+            if !entry.present
+                || entry.account.upstream != upstream
+                || !entry.account.models.contains(&model)
+            {
+                continue;
+            }
+            let runtime = entry.model_states.entry(model).or_default();
+            let in_flight = runtime.in_flight;
+            *runtime = health;
+            runtime.in_flight = in_flight;
+        }
         drop(state);
         self.signal();
     }

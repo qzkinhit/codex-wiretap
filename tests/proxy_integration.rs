@@ -42,6 +42,7 @@ struct Seen {
 }
 
 enum Reply {
+    ForModel(&'static str, Box<Reply>),
     Sse(Vec<(Option<Arc<Notify>>, String)>),
     Json(StatusCode, Value, Option<&'static str>),
     Raw(StatusCode, &'static str, &'static str),
@@ -74,10 +75,27 @@ async fn mock_response(State(state): State<MockState>, request: Request) -> Resp
             .unwrap_or_default()
             .into(),
         headers: parts.headers,
-        body,
+        body: body.clone(),
     });
-    let reply = state.script.lock().unwrap().pop_front();
+    let requested_model = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|body| body["model"].as_str().map(str::to_owned));
+    let reply = {
+        let mut script = state.script.lock().unwrap();
+        let index = script
+            .iter()
+            .position(|reply| match reply {
+                Reply::ForModel(model, _) => requested_model.as_deref() == Some(*model),
+                _ => true,
+            })
+            .unwrap_or(0);
+        script.remove(index).map(|reply| match reply {
+            Reply::ForModel(_, reply) => *reply,
+            reply => reply,
+        })
+    };
     match reply {
+        Some(Reply::ForModel(_, _)) => unreachable!("model replies are unwrapped above"),
         Some(Reply::Sse(chunks)) => {
             let stream = async_stream::stream! {
                 for (gate, chunk) in chunks {
@@ -199,6 +217,7 @@ fn account(secret: &str, upstream: &str, models: &[&str]) -> Account {
 struct Harness {
     state: Arc<AppState>,
     base: String,
+    upstream: String,
     client: reqwest::Client,
     mock: MockState,
     jobs: Vec<JoinHandle<()>>,
@@ -259,6 +278,7 @@ impl Harness {
         Self {
             state,
             base: format!("http://{listen}"),
+            upstream,
             client: reqwest::Client::builder()
                 .no_proxy()
                 .timeout(Duration::from_secs(10))
@@ -298,27 +318,41 @@ impl Harness {
             .bearer_auth(&self.state.settings().local_token)
     }
 
-    async fn install_biwrite_fixture(&self) {
+    fn write_biwrite_fixture(&self, models: &[&str], prefix: &str) {
         let dir = self.state.settings().biwrite_dir;
         fs::create_dir_all(&dir).unwrap();
-        let fingerprint = &blake3::hash(TEST_KEY_A.as_bytes()).to_hex().to_string()[..12];
+        let fingerprint = blake3::hash(TEST_KEY_A.as_bytes()).to_hex().to_string()[..12].to_owned();
+        let mut providers = Vec::new();
+        let mut keys = serde_json::Map::new();
+        let mut kept = serde_json::Map::new();
+        for (index, model) in models.iter().enumerate() {
+            let id = if models.len() == 1 {
+                prefix.to_owned()
+            } else {
+                format!("{prefix}-{index}")
+            };
+            providers.push(json!({"id":id,"name":"自动测试","kind":"openai_compatible",
+                "wireApi":"responses","baseUrl":"https://api.example.com/v1","model":model,
+                "hasKey":true,"keyCount":1,"keyConcurrency":1}));
+            keys.insert(id.clone(), json!(TEST_KEY_A));
+            kept.insert(id, json!([fingerprint]));
+        }
         fs::write(
             dir.join("settings.json"),
-            json!({
-                "keysInFile": true,
-                "providers": [{"id":"p-auto-fixture","name":"自动测试","kind":"openai_compatible",
-                    "wireApi":"responses","baseUrl":"https://api.example.com/v1","model":ASTRA,
-                    "hasKey":true,"keyCount":1,"keyConcurrency":1}],
-                "keptKeys":{"p-auto-fixture":[fingerprint]}
-            })
-            .to_string(),
+            json!({"keysInFile":true,"providers":providers,"keptKeys":kept}).to_string(),
         )
         .unwrap();
-        fs::write(
-            dir.join("keys.json"),
-            json!({"keys":{"p-auto-fixture":TEST_KEY_A}}).to_string(),
-        )
-        .unwrap();
+        fs::write(dir.join("keys.json"), json!({"keys":keys}).to_string()).unwrap();
+        *self.state.source_upstream_override.write().unwrap() = Some(self.upstream.clone());
+    }
+
+    async fn install_biwrite_fixture(&self) {
+        self.write_biwrite_fixture(&[ASTRA], "p-auto-fixture");
+        self.state.sync_source().await.unwrap();
+    }
+
+    async fn install_biwrite_models_fixture(&self, models: &[&str]) {
+        self.write_biwrite_fixture(models, "p-validation");
         self.state.sync_source().await.unwrap();
     }
 
@@ -1167,8 +1201,7 @@ async fn manual_source_is_independent_of_biwrite_and_deletion_removes_candidate_
         assert!(!public_text.contains(TEST_MANUAL_KEY));
         assert!(!public_text.contains(TEST_KEY_A));
         assert!(!public_text.contains(&h.state.settings().local_token));
-        // Selection proves manual source supports automatic scheduling without
-        // ever sending fixture credentials to the configured example upstream URL.
+        // Selection proves manual source supports automatic scheduling.
         let selection = Selection { model: SOL.into(), ..Selection::default() };
         let lease = h.state.scheduler.try_acquire(&selection, &h.state.settings().policy).unwrap();
         assert_eq!(lease.account.id, id);
@@ -1974,8 +2007,542 @@ async fn json_and_sse_errors_record_bounded_messages_with_all_fixture_credential
 }
 
 #[tokio::test]
+async fn manual_sync_excludes_permanent_failure_until_successful_revalidation() {
+    let h = Harness::new(
+        vec![
+            Reply::Json(
+                StatusCode::UNAUTHORIZED,
+                json!({"error":{"code":"invalid_api_key","message":"fixture rejected"}}),
+                None,
+            ),
+            success("resp_revalidated", ASTRA),
+            Reply::Json(
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({"error":{"code":"rate_limit_exceeded","message":"fixture busy"}}),
+                None,
+            ),
+            success("resp_normal_retry", ASTRA),
+        ],
+        0,
+        &[ASTRA],
+    )
+    .await;
+    h.install_biwrite_models_fixture(&[ASTRA]).await;
+    h.state.config.write().unwrap().recording_enabled = false;
+    assert_eq!(h.calls(), 0, "automatic source sync must not probe");
+
+    let response = h.api_post("/api/sync", json!({})).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(h.calls(), 1, "a probe must not retry");
+    assert!(
+        h.state
+            .scheduler
+            .snapshot(&h.state.settings().policy)
+            .is_empty()
+    );
+    assert!(
+        h.state.records.records().is_empty(),
+        "permanent failure classification must not depend on monitoring records"
+    );
+    let public = h
+        .api_get("/api/state")
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(public["sync"]["running"], false);
+    assert_eq!(public["sync"]["completed"], 1);
+    assert_eq!(public["sync"]["total"], 1);
+    assert_eq!(public["sync"]["healthy"], 0);
+    assert_eq!(public["sync"]["removed"], 1);
+    assert_eq!(public["sync"]["temporary"], 0);
+    assert!(public["sync"]["last_completed_ms"].is_number());
+    assert_eq!(public["source"]["providers"][0]["imported_keys"], 0);
+    assert_eq!(public["source"]["providers"][0]["kept_keys"], 1);
+
+    let all = h
+        .api_post("/api/config", json!({"biwrite_import_all":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(all.status(), StatusCode::OK);
+    assert_eq!(
+        h.state.scheduler.snapshot(&h.state.settings().policy).len(),
+        1
+    );
+    assert_eq!(
+        h.calls(),
+        1,
+        "all-key mode must ignore exclusions without probing"
+    );
+    let kept = h
+        .api_post("/api/config", json!({"biwrite_import_all":false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(kept.status(), StatusCode::OK);
+    assert!(
+        h.state
+            .scheduler
+            .snapshot(&h.state.settings().policy)
+            .is_empty()
+    );
+
+    h.state.sync_source().await.unwrap();
+    assert_eq!(
+        h.calls(),
+        1,
+        "automatic sync must neither probe nor restore exclusions"
+    );
+    assert!(
+        h.state
+            .scheduler
+            .snapshot(&h.state.settings().policy)
+            .is_empty()
+    );
+    let response = h.api_post("/api/sync", json!({})).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        h.calls(),
+        2,
+        "manual sync must revalidate the full source snapshot"
+    );
+    assert_eq!(
+        h.state.scheduler.snapshot(&h.state.settings().policy).len(),
+        1
+    );
+    let sync = h.state.sync.read().unwrap().clone();
+    assert_eq!(
+        (sync.completed, sync.healthy, sync.removed, sync.temporary),
+        (1, 1, 0, 0)
+    );
+
+    h.state.config.write().unwrap().recording_enabled = true;
+    let response = h.post(Harness::request(ASTRA)).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        h.calls(),
+        4,
+        "ordinary requests retain their retry behavior"
+    );
+    assert_eq!(h.state.records.records()[0].attempts.len(), 2);
+}
+
+#[tokio::test]
+async fn manual_sync_retains_rate_limited_candidate_with_cooldown() {
+    let h = Harness::new(
+        vec![Reply::Json(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({"error":{"code":"rate_limit_exceeded","message":"fixture busy"}}),
+            None,
+        )],
+        0,
+        &[ASTRA],
+    )
+    .await;
+    h.install_biwrite_models_fixture(&[ASTRA]).await;
+    let response = h.api_post("/api/sync", json!({})).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(h.calls(), 1);
+    let accounts = h.state.scheduler.snapshot(&h.state.settings().policy);
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].models, [ASTRA]);
+    assert!(accounts[0].model_health[0].cooldown_until_ms.is_some());
+    let sync = h.state.sync.read().unwrap().clone();
+    assert_eq!((sync.removed, sync.temporary), (0, 1));
+    assert_eq!(h.state.source.read().unwrap().providers[0].imported_keys, 1);
+}
+
+#[tokio::test]
+async fn manual_sync_removes_models_independently() {
+    let h = Harness::new(
+        vec![
+            Reply::ForModel(
+                ASTRA,
+                Box::new(Reply::Json(
+                    StatusCode::FORBIDDEN,
+                    json!({"error":{"code":"permission_denied","message":"fixture denied"}}),
+                    None,
+                )),
+            ),
+            Reply::ForModel(SOL, Box::new(success("resp_remaining_model", SOL))),
+        ],
+        0,
+        &[ASTRA, SOL],
+    )
+    .await;
+    h.install_biwrite_models_fixture(&[ASTRA, SOL]).await;
+    let response = h.api_post("/api/sync", json!({})).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(h.calls(), 2);
+    let accounts = h.state.scheduler.snapshot(&h.state.settings().policy);
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].models, [SOL]);
+    let source = h.state.source.read().unwrap().clone();
+    for provider in &source.providers {
+        assert_eq!(provider.imported_keys, usize::from(provider.model == SOL));
+        assert_eq!(provider.kept_keys, 1);
+    }
+    let sync = h.state.sync.read().unwrap().clone();
+    assert_eq!(
+        (sync.completed, sync.total, sync.healthy, sync.removed),
+        (2, 2, 1, 1)
+    );
+}
+
+#[tokio::test]
+async fn manual_sync_treats_429_quota_as_permanent_without_changing_retry_classification() {
+    let h = Harness::new(
+        vec![Reply::Json(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({"error":{"code":"insufficient_quota","message":"fixture quota exhausted"}}),
+            None,
+        )],
+        0,
+        &[ASTRA],
+    )
+    .await;
+    h.install_biwrite_models_fixture(&[ASTRA]).await;
+    let response = h.api_post("/api/sync", json!({})).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(h.calls(), 1);
+    assert!(
+        h.state
+            .scheduler
+            .snapshot(&h.state.settings().policy)
+            .is_empty()
+    );
+    let sync = h.state.sync.read().unwrap().clone();
+    assert_eq!((sync.removed, sync.temporary), (1, 0));
+    let record = &h.state.records.records()[0];
+    assert_eq!(record.attempts[0].reason, "rate_limit_exceeded");
+}
+
+#[tokio::test]
+async fn exclusions_are_scoped_and_preserved_across_upstream_validations() {
+    let h = Harness::new(
+        vec![
+            Reply::Json(
+                StatusCode::UNAUTHORIZED,
+                json!({"error":{"code":"invalid_api_key","message":"fixture rejected"}}),
+                None,
+            ),
+            success("resp_second_upstream", ASTRA),
+        ],
+        0,
+        &[ASTRA],
+    )
+    .await;
+    h.install_biwrite_models_fixture(&[ASTRA]).await;
+    let response = h.api_post("/api/sync", json!({})).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        h.state
+            .scheduler
+            .snapshot(&h.state.settings().policy)
+            .is_empty()
+    );
+
+    let dir = h.state.settings().biwrite_dir;
+    let settings_path = dir.join("settings.json");
+    let original_settings = fs::read(&settings_path).unwrap();
+    let mut settings: Value = serde_json::from_slice(&original_settings).unwrap();
+    settings["providers"][0]["baseUrl"] = json!("https://api2.example.com/v1");
+    fs::write(&settings_path, settings.to_string()).unwrap();
+    *h.state.source_upstream_override.write().unwrap() =
+        Some(h.upstream.replacen("127.0.0.1", "localhost", 1));
+    let changed = h
+        .api_post(
+            "/api/config",
+            json!({"upstream_base_url":"https://api2.example.com/v1"}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(changed.status(), StatusCode::OK);
+    assert_eq!(
+        h.state.scheduler.snapshot(&h.state.settings().policy).len(),
+        1
+    );
+    assert_eq!(h.calls(), 1, "changing upstream must not trigger a probe");
+    let validated = h.api_post("/api/sync", json!({})).send().await.unwrap();
+    assert_eq!(validated.status(), StatusCode::OK);
+    assert_eq!(h.calls(), 2);
+
+    fs::write(&settings_path, original_settings).unwrap();
+    *h.state.source_upstream_override.write().unwrap() = Some(h.upstream.clone());
+    let restored = h
+        .api_post(
+            "/api/config",
+            json!({"upstream_base_url":"https://api.example.com/v1"}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restored.status(), StatusCode::OK);
+    assert!(
+        h.state
+            .scheduler
+            .snapshot(&h.state.settings().policy)
+            .is_empty(),
+        "validating B must not clear A's permanent exclusion"
+    );
+    assert_eq!(h.calls(), 2);
+}
+
+#[tokio::test]
+async fn model_override_availability_uses_the_filtered_prospective_snapshot() {
+    let h = Harness::new(
+        vec![Reply::Json(
+            StatusCode::UNAUTHORIZED,
+            json!({"error":{"code":"invalid_api_key","message":"fixture rejected"}}),
+            None,
+        )],
+        0,
+        &[ASTRA],
+    )
+    .await;
+    h.install_biwrite_models_fixture(&[ASTRA]).await;
+    let response = h.api_post("/api/sync", json!({})).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let changed = h
+        .api_post(
+            "/api/config",
+            json!({"upstream_base_url":"https://api.example.com/v1","model_override":ASTRA}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(changed.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        changed.json::<Value>().await.unwrap()["error"]["code"],
+        "model_unavailable"
+    );
+    assert_eq!(h.state.settings().model_override, None);
+    assert_eq!(h.calls(), 1);
+}
+
+#[tokio::test]
+async fn validation_preserves_formal_exclusions_and_duplicate_sync_returns_conflict() {
+    let gate = Arc::new(Notify::new());
+    let h = Harness::new(
+        vec![
+            Reply::Json(
+                StatusCode::UNAUTHORIZED,
+                json!({"error":{"code":"invalid_api_key","message":"fixture rejected"}}),
+                None,
+            ),
+            Reply::Sse(vec![
+                (None, created("resp_revalidation_pending", ASTRA)),
+                (
+                    Some(gate.clone()),
+                    completed("resp_revalidation_pending", ASTRA),
+                ),
+            ]),
+        ],
+        0,
+        &[ASTRA],
+    )
+    .await;
+    h.install_biwrite_models_fixture(&[ASTRA]).await;
+    let response = h.api_post("/api/sync", json!({})).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        h.state
+            .scheduler
+            .snapshot(&h.state.settings().policy)
+            .is_empty()
+    );
+
+    let first = h.api_post("/api/sync", json!({}));
+    let first = tokio::spawn(async move { first.send().await.unwrap() });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while h.calls() != 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("revalidation should reach the gated local upstream");
+    assert!(h.state.sync.read().unwrap().running);
+    assert!(
+        h.state
+            .scheduler
+            .snapshot(&h.state.settings().policy)
+            .is_empty()
+    );
+
+    let duplicate = h.api_post("/api/sync", json!({})).send().await.unwrap();
+    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        duplicate.json::<Value>().await.unwrap()["error"]["code"],
+        "sync_in_progress"
+    );
+    let ordinary = h.post(Harness::request(ASTRA)).send().await.unwrap();
+    assert_eq!(ordinary.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        h.calls(),
+        2,
+        "ordinary routing and duplicate sync must not probe"
+    );
+    assert!(
+        h.state
+            .scheduler
+            .snapshot(&h.state.settings().policy)
+            .is_empty()
+    );
+
+    gate.notify_one();
+    let first = tokio::time::timeout(Duration::from_secs(2), first)
+        .await
+        .expect("gated revalidation should finish")
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(h.calls(), 2);
+    assert_eq!(
+        h.state.scheduler.snapshot(&h.state.settings().policy).len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn validation_shares_formal_capacity_while_new_pair_still_probes() {
+    let gate = Arc::new(Notify::new());
+    let h = Harness::new(
+        vec![
+            Reply::Sse(vec![
+                (None, created("resp_formal_lease", ASTRA)),
+                (None, delta("formal output")),
+                (Some(gate.clone()), completed("resp_formal_lease", ASTRA)),
+            ]),
+            success("resp_new_model_validation", SOL),
+            success("resp_formal_model_validation", ASTRA),
+        ],
+        0,
+        &[ASTRA],
+    )
+    .await;
+    h.install_biwrite_models_fixture(&[ASTRA]).await;
+    let ordinary = h.post(Harness::request(ASTRA)).send().await.unwrap();
+    assert_eq!(ordinary.status(), StatusCode::OK);
+    assert_eq!(h.calls(), 1);
+    assert_eq!(h.in_flight(), 1);
+
+    h.write_biwrite_fixture(&[ASTRA, SOL], "p-validation");
+    let first = h.api_post("/api/sync", json!({}));
+    let first = tokio::spawn(async move { first.send().await.unwrap() });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while h.calls() != 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the new model should validate while the formal model lease is held");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        h.calls(),
+        2,
+        "formal pair validation must not exceed its occupied capacity"
+    );
+    assert_eq!(h.in_flight(), 1);
+    assert_eq!(h.state.sync.read().unwrap().completed, 1);
+    assert!(h.state.sync.read().unwrap().running);
+
+    gate.notify_one();
+    assert!(ordinary.text().await.unwrap().contains("resp_formal_lease"));
+    let first = tokio::time::timeout(Duration::from_secs(2), first)
+        .await
+        .expect("formal pair validation should continue after the lease drains")
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(h.calls(), 3);
+    let accounts = h.state.scheduler.snapshot(&h.state.settings().policy);
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].in_flight, 0);
+    let formal = accounts[0]
+        .model_health
+        .iter()
+        .find(|model| model.model == ASTRA)
+        .unwrap();
+    assert_eq!(
+        formal.successes, 2,
+        "formal cumulative health must be retained"
+    );
+    let new_model = accounts[0]
+        .model_health
+        .iter()
+        .find(|model| model.model == SOL)
+        .unwrap();
+    assert_eq!(new_model.successes, 1);
+}
+
+#[tokio::test]
+async fn paused_startup_initializes_read_only_and_periodic_pause_preserves_stale_pool() {
+    let h = Harness::new(vec![], 0, &[ASTRA]).await;
+    h.state.config.write().unwrap().sync_paused = true;
+    h.install_biwrite_models_fixture(&[ASTRA]).await;
+    assert!(
+        h.state
+            .scheduler
+            .snapshot(&h.state.settings().policy)
+            .is_empty()
+    );
+
+    h.state.sync_source_startup().await.unwrap();
+    assert_eq!(
+        h.state.scheduler.snapshot(&h.state.settings().policy).len(),
+        1
+    );
+    assert_eq!(h.calls(), 0, "startup must never probe");
+    assert!(!h.state.sync.read().unwrap().running);
+
+    let dir = h.state.settings().biwrite_dir;
+    let parked = h._dir.path().join("paused-startup-fixture");
+    fs::rename(&dir, &parked).unwrap();
+    h.state.source.write().unwrap().read_at_ms = 0;
+    h.state.sync_source().await.unwrap();
+    assert_eq!(
+        h.state.scheduler.snapshot(&h.state.settings().policy).len(),
+        1,
+        "an explicit pause must preserve the pool even after read_at expires"
+    );
+    assert_eq!(h.calls(), 0);
+}
+
+#[tokio::test]
+async fn stale_read_failure_clears_only_an_unpaused_pool() {
+    let h = Harness::new(vec![], 0, &[ASTRA]).await;
+    h.install_biwrite_models_fixture(&[ASTRA]).await;
+    assert_eq!(
+        h.state.scheduler.snapshot(&h.state.settings().policy).len(),
+        1
+    );
+    let dir = h.state.settings().biwrite_dir;
+    let parked = h._dir.path().join("read-failure-fixture");
+    fs::rename(&dir, &parked).unwrap();
+    h.state.source.write().unwrap().read_at_ms = 0;
+    assert!(h.state.sync_source().await.is_err());
+    assert!(
+        h.state
+            .scheduler
+            .snapshot(&h.state.settings().policy)
+            .is_empty()
+    );
+    assert_eq!(h.calls(), 0);
+}
+
+#[tokio::test]
 async fn paused_source_sync_preserves_active_pool_and_allows_explicit_sync_then_resume() {
-    let h = Harness::new(vec![success("resp_while_sync_paused", ASTRA)], 1, &[ASTRA]).await;
+    let h = Harness::new(
+        vec![
+            success("resp_while_sync_paused", ASTRA),
+            success("resp_manual_sync", ASTRA),
+        ],
+        1,
+        &[ASTRA],
+    )
+    .await;
     let before_id = h.state.scheduler.snapshot(&h.state.settings().policy)[0]
         .id
         .clone();
@@ -2027,8 +2594,7 @@ async fn paused_source_sync_preserves_active_pool_and_allows_explicit_sync_then_
     let snapshot = h.state.scheduler.snapshot(&h.state.settings().policy);
     assert_eq!(snapshot.len(), 1);
     assert_eq!(snapshot[0].id, expected_b);
-    // Source synchronization only reads fixture files. Never send an upstream
-    // request after the public example URL replaces the localhost mock address.
+    // The manual sync above verified the new candidate against the local mock.
     let selection = Selection {
         model: ASTRA.into(),
         ..Selection::default()
@@ -2070,7 +2636,7 @@ async fn paused_source_sync_preserves_active_pool_and_allows_explicit_sync_then_
             .unwrap()
             .sync_paused
     );
-    assert_eq!(h.calls(), 1);
+    assert_eq!(h.calls(), 2);
 }
 
 #[tokio::test]
@@ -2242,4 +2808,51 @@ async fn flat_response_error_recovers_only_before_output_and_records_redacted_me
         );
         assert_eq!(h.in_flight(), 0);
     }
+}
+
+#[tokio::test]
+async fn cancelling_a_manual_sync_clears_the_running_flag_and_allows_an_immediate_retry() {
+    let gate = Arc::new(Notify::new());
+    let h = Harness::new(
+        vec![
+            Reply::Sse(vec![
+                (Some(gate.clone()), created("resp_probe_gated", ASTRA)),
+                (None, completed("resp_probe_gated", ASTRA)),
+            ]),
+            success("resp_probe_retry", ASTRA),
+        ],
+        1,
+        &[ASTRA],
+    )
+    .await;
+    h.write_biwrite_fixture(&[ASTRA], "p-cancel-sync");
+    let cancelled =
+        tokio::time::timeout(Duration::from_millis(300), h.state.sync_source_now()).await;
+    assert!(cancelled.is_err());
+    let during: Value = h
+        .api_get("/api/state")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(during["sync"]["running"], json!(false));
+    gate.notify_waiters();
+    assert!(h.state.sync_source_now().await.is_ok());
+    let after: Value = h
+        .api_get("/api/state")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after["sync"]["running"], json!(false));
+    assert_eq!(after["sync"]["healthy"], json!(1));
+    assert!(after["sync"]["last_completed_ms"].as_u64().is_some());
+    assert_eq!(
+        h.state.scheduler.snapshot(&h.state.settings().policy).len(),
+        1
+    );
 }

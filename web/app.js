@@ -138,7 +138,43 @@ function filterModelHealth(account, model = "") {
 
 function syncActionLabel(config) {
   if (config?.source_mode === "manual") return "↻ 刷新手动池";
-  return config?.biwrite_import_all === true ? "↻ 同步全部 Key" : "↻ 同步保活候选";
+  return config?.biwrite_import_all === true ? "↻ 同步全部 Key" : "↻ 同步并验证保活";
+}
+
+function syncResultText(sync) {
+  if (!sync || sync.last_completed_ms == null) return "";
+  return `验证 ${Number(sync.total) || 0} 项：成功 ${Number(sync.healthy) || 0} 项，剔除 ${Number(sync.removed) || 0} 项，暂时失败或未完成 ${Number(sync.temporary) || 0} 项。`;
+}
+
+function syncProgressText(sync) {
+  if (!sync?.running) return "";
+  return `正在实时验证 ${Number(sync.completed) || 0} / ${Number(sync.total) || 0} 项，每项只尝试一次。`;
+}
+
+function syncProgressBrief(sync) {
+  if (!sync?.running) return "";
+  return `验证 ${Number(sync.completed) || 0} / ${Number(sync.total) || 0}`;
+}
+
+function verifiesCandidates(config) {
+  return config?.source_mode === "biwrite" && config?.biwrite_import_all !== true;
+}
+
+function syncBusyLabel(config) {
+  return verifiesCandidates(config) ? "正在验证…" : "正在读取…";
+}
+
+function sourceTimeState(state) {
+  const progress = syncProgressText(state?.sync);
+  if (progress) return { mode: "progress", text: progress };
+  const verifiedAt = Number(state?.sync?.last_completed_ms);
+  const readAt = Number(state?.source?.read_at_ms);
+  const verified = verifiesCandidates(state?.config) && Number.isFinite(verifiedAt) && verifiedAt > 0;
+  const read = Number.isFinite(readAt) && readAt > 0;
+  // A missing timestamp arrives as JSON null, which compares as zero.
+  if (verified && (!read || verifiedAt >= readAt)) return { mode: "verified", at: verifiedAt };
+  if (read) return verified ? { mode: "read", at: readAt, verifiedAt } : { mode: "read", at: readAt };
+  return { mode: "waiting" };
 }
 
 function syncConfigPatch(action, config) {
@@ -261,7 +297,7 @@ function routingConfigPayload(draft, latestConfig) {
   };
 }
 
-if (typeof module !== "undefined" && module.exports) module.exports = { compareReleaseVersions, safeReleaseUrl, updateActionState, conversationInfo, matchesConversationFilter, classifyRequestOutcome, manualAccountPayload, requestRouteMode, classifyServiceTier, recordServiceTier, matchesServiceTierFilter, sourceProviderRows, draftFromConfig, routingConfigPayload, accountModels, filterAccounts, filterModelHealth, syncConfigPatch, syncActionLabel, redactSensitiveText, normalizeProbeResult, gatewayActionRows, attemptErrorDetails, effectiveOutputWait };
+if (typeof module !== "undefined" && module.exports) module.exports = { compareReleaseVersions, safeReleaseUrl, updateActionState, conversationInfo, matchesConversationFilter, classifyRequestOutcome, manualAccountPayload, requestRouteMode, classifyServiceTier, recordServiceTier, matchesServiceTierFilter, sourceProviderRows, draftFromConfig, routingConfigPayload, accountModels, filterAccounts, filterModelHealth, syncConfigPatch, syncActionLabel, syncResultText, syncProgressText, syncProgressBrief, verifiesCandidates, syncBusyLabel, sourceTimeState, redactSensitiveText, normalizeProbeResult, gatewayActionRows, attemptErrorDetails, effectiveOutputWait };
 
 if (typeof document !== "undefined") (() => {
   const $ = (id) => document.getElementById(id);
@@ -351,7 +387,8 @@ if (typeof document !== "undefined") (() => {
 
   async function api(path, options = {}) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), options.timeout || 15000);
+    const timeoutMs = options.timeout === 0 ? null : options.timeout || 15000;
+    const timeout = timeoutMs === null ? null : setTimeout(() => controller.abort(), timeoutMs);
     const headers = { Accept: "application/json", Authorization: `Bearer ${sessionToken}` };
     if (options.body !== undefined) headers["Content-Type"] = "application/json";
     try {
@@ -450,23 +487,31 @@ if (typeof document !== "undefined") (() => {
     $("legacy-status").className = `badge badge-${legacyEnabled ? "green" : "neutral"}`;
     text("legacy-status", legacyEnabled ? "允许旧方式监控" : "旧方式监控已关闭");
     text("legacy-scope", legacyEnabled ? "仅能监控经过本地入口的请求，无法查看未经过代理的 HTTPS 流量。" : "旧方式监控已关闭，可在路由设置开启并保存。本地令牌号池模式不受影响。");
-    text("source-time", state.source?.read_at_ms ? `最近读取 ${timestamp(state.source.read_at_ms)}` : "等待首次读取");
+    const syncProgress = syncProgressText(state.sync);
+    const sourceTime = sourceTimeState(state);
+    text("source-time", sourceTime.mode === "progress" ? sourceTime.text
+      : sourceTime.mode === "verified" ? `最近验证 ${timestamp(sourceTime.at)}`
+      : sourceTime.mode === "read" ? `最近读取 ${timestamp(sourceTime.at)}${sourceTime.verifiedAt ? ` · 最近验证 ${timestamp(sourceTime.verifiedAt)}` : ""}`
+      : "等待首次读取");
     const manualMode = state.config?.source_mode === "manual";
     const importAll = state.config?.biwrite_import_all === true;
     const paused = state.config?.sync_paused === true;
-    if (!$("sync-button").disabled) text("sync-button", syncActionLabel(state.config));
+    const syncBusy = state.sync?.running === true || pendingActions.has("sync");
+    $("sync-button").disabled = syncBusy;
+    text("sync-button", syncProgressBrief(state.sync) || (syncBusy ? syncBusyLabel(state.config) : syncActionLabel(state.config)));
     text("pause-sync-button", paused ? "恢复同步" : "暂停同步");
-    $("pause-sync-button").disabled = manualMode || pendingActions.has("sync-config");
+    $("pause-sync-button").disabled = manualMode || syncBusy || pendingActions.has("sync-config");
     $("pause-sync-button").title = manualMode ? "当前使用手动来源，未自动读取 BiWrite" : "仅控制 BiWrite 的自动读取，当前号池仍可使用";
-    $("sync-scope-button").disabled = pendingActions.has("sync-config");
+    $("sync-scope-button").disabled = syncBusy || pendingActions.has("sync-config");
     text("sync-scope-button", !manualMode && importAll ? "仅同步保活候选" : "持续同步全部 Key");
     text("sync-mode-status", manualMode ? "手动来源" : `${paused ? "自动同步已暂停" : "自动同步中"} · ${importAll ? "全部 Key" : "保活候选"}`);
     $("sync-mode-status").className = `badge badge-${!manualMode && paused ? "amber" : "neutral"}`;
-    text("sync-mode-description", manualMode ? "可切换为 BiWrite 持续同步全部 Key，切换后立即生效。" : `${paused ? "暂停只停止自动读取，当前号池仍可使用；手动读取不会恢复自动同步。" : "每 1.5 秒读取来源，也可点击顶部同步按钮立即重新读取。"}${importAll ? "当前持续包含全部 Key，包括未保活、忽略和停止的 Key。" : "当前只包含保活候选，并排除忽略和停止的 Key。"}`);
-    text("source-heading", manualMode ? "手动维护号池" : importAll ? "BiWrite 全部 Key" : "BiWrite 保活候选");
-    text("source-description", manualMode ? "当前使用本地自定义池。可在路由设置中管理账号，模型健康与并发分别计算。" : "同步只重新读取 BiWrite 当前范围的账号、候选信息及 Key 昵称，不触发保活。候选与历史成功不保证当前可用，重新读取不会清空已有账号的失败记录。");
+    const lastVerification = verifiesCandidates(state.config) ? syncResultText(state.sync) : "";
+    text("sync-mode-description", `${manualMode ? "可切换为 BiWrite 持续同步全部 Key，切换后立即生效。" : `${paused ? "暂停只停止自动读取，当前号池仍可使用；手动同步不会恢复自动同步。" : "每 1.5 秒只读取来源，不发送验证请求。"}${importAll ? "当前持续包含全部 Key，包括未保活、忽略和停止的 Key。" : "点击顶部按钮会实时验证保活候选，明确失效的模型退出候选，暂时失败仅冷却。"}`}${lastVerification ? ` 上次${lastVerification}` : ""}`);
+    text("source-heading", manualMode ? "手动维护号池" : importAll ? "BiWrite 全部 Key" : "BiWrite 保活号池");
+    text("source-description", manualMode ? "当前使用本地自定义池。可在路由设置中管理账号，模型健康与并发分别计算。" : importAll ? "同步全部 Key 只读取配置，不执行实时验证。" : "手动同步会逐项验证当前 BiWrite 候选。后续自动读取不会重新加入已确认失效的模型，下次手动同步会重新验证完整来源。");
     text("accounts-empty-title", manualMode ? "当前手动池没有可用账号" : sourceProviderRows(state.source).length ? "当前没有可导入候选" : "还没有同步到号池");
-    text("accounts-empty-description", manualMode ? "可在路由设置的手动池管理中添加账号，或保存切换为自动读取 BiWrite。" : importAll ? "当前上游尚无可读取的 Key，请检查 BiWrite 配置和来源同步状态。" : "可在 BiWrite 运行保活，或选择持续同步全部 Key。来源同步中可查看尚无候选的模型。");
+    text("accounts-empty-description", manualMode ? "可在路由设置的手动池管理中添加账号，或保存切换为自动读取 BiWrite。" : importAll ? "当前上游尚无可读取的 Key，请检查 BiWrite 配置和来源同步状态。" : "可在 BiWrite 运行保活后点击「同步并验证保活」，或选择持续同步全部 Key。来源同步中可查看尚无候选的模型。");
     text("manual-effect-note", manualMode ? "当前已使用手动来源，添加、更新和删除会影响后续请求。相同 Key 再次提交会更新该账号。" : "当前使用自动来源，增删手动池不会改变当前路由。相同 Key 再次提交会更新该账号。");
     const warnings = [];
     if (state.source?.last_error) warnings.push(state.source.last_error);
@@ -1151,12 +1196,16 @@ if (typeof document !== "undefined") (() => {
   $("sync-scope-button").addEventListener("click", () => updateSyncConfig("scope"));
 
   $("sync-button").addEventListener("click", async () => {
-    const button = $("sync-button");
-    button.disabled = true;
-    text("sync-button", "正在读取…");
-    try { await serializeMutation(() => api("/api/sync", { method: "POST", body: {} })); await refreshState(); toast(state?.config?.source_mode === "manual" ? "已重新读取当前手动池。" : `已重新读取 BiWrite ${state?.config?.biwrite_import_all === true ? "全部 Key" : "保活候选"}，未触发保活，已有失败记录保留。${state?.config?.sync_paused ? "自动同步仍处于暂停状态。" : ""}`, "success"); }
-    catch (error) { toast(error.message, "error"); }
-    finally { button.disabled = false; text("sync-button", syncActionLabel(state?.config)); }
+    if (pendingActions.has("sync") || state?.sync?.running) return;
+    pendingActions.add("sync");
+    renderStats();
+    try {
+      await api("/api/sync", { method: "POST", body: {}, timeout: 0 });
+      await refreshState();
+      toast(state?.config?.source_mode === "manual" ? "已重新读取当前手动池。" : verifiesCandidates(state?.config) ? syncResultText(state?.sync) : "已重新读取 BiWrite 全部 Key，未执行实时验证。", "success");
+      if (state?.config?.sync_paused) toast("自动同步仍处于暂停状态。");
+    } catch (error) { toast(error.message, "error"); }
+    finally { pendingActions.delete("sync"); if (state) renderStats(); }
   });
 
   $("connect-button").addEventListener("click", async () => {

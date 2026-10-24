@@ -2,7 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { compareReleaseVersions, safeReleaseUrl, updateActionState, conversationInfo, matchesConversationFilter, classifyRequestOutcome, manualAccountPayload, requestRouteMode, classifyServiceTier, recordServiceTier, matchesServiceTierFilter, sourceProviderRows, draftFromConfig, routingConfigPayload, accountModels, filterAccounts, filterModelHealth, syncConfigPatch, syncActionLabel, normalizeProbeResult, gatewayActionRows, attemptErrorDetails, effectiveOutputWait } = require("./app.js");
+const { compareReleaseVersions, safeReleaseUrl, updateActionState, conversationInfo, matchesConversationFilter, classifyRequestOutcome, manualAccountPayload, requestRouteMode, classifyServiceTier, recordServiceTier, matchesServiceTierFilter, sourceProviderRows, draftFromConfig, routingConfigPayload, accountModels, filterAccounts, filterModelHealth, syncConfigPatch, syncActionLabel, syncResultText, syncProgressText, syncProgressBrief, verifiesCandidates, syncBusyLabel, sourceTimeState, normalizeProbeResult, gatewayActionRows, attemptErrorDetails, effectiveOutputWait } = require("./app.js");
 
 test("retry settings distinguish fifteen retries from sixteen total attempts and support both boundaries", () => {
   const defaults = draftFromConfig({});
@@ -86,6 +86,15 @@ test("sync controls preserve independent pause and scope settings", () => {
   assert.deepEqual(syncConfigPatch("scope", { source_mode: "biwrite", sync_paused: true, biwrite_import_all: false }), { source_mode: "biwrite", biwrite_import_all: true });
   assert.deepEqual(syncConfigPatch("scope", { source_mode: "biwrite", biwrite_import_all: true }), { source_mode: "biwrite", biwrite_import_all: false });
   assert.deepEqual(syncConfigPatch("scope", { source_mode: "manual", biwrite_import_all: true }), { source_mode: "biwrite", biwrite_import_all: true });
+});
+
+test("candidate sync exposes bounded progress and an exact result summary", () => {
+  assert.equal(syncActionLabel({ source_mode: "biwrite", biwrite_import_all: false }), "↻ 同步并验证保活");
+  assert.equal(syncActionLabel({ source_mode: "biwrite", biwrite_import_all: true }), "↻ 同步全部 Key");
+  assert.equal(syncProgressText({ running: true, completed: 3, total: 9 }), "正在实时验证 3 / 9 项，每项只尝试一次。");
+  assert.equal(syncProgressText({ running: false }), "");
+  assert.equal(syncResultText({ last_completed_ms: 1, total: 9, healthy: 2, removed: 6, temporary: 1 }), "验证 9 项：成功 2 项，剔除 6 项，暂时失败或未完成 1 项。");
+  assert.equal(syncResultText({}), "");
 });
 
 test("probe failures retain diagnostics and usage without becoming HTTP-only successes", () => {
@@ -369,10 +378,41 @@ test("update release links stay on this repository without credentials or token-
 
 
 test("sync button names the active source scope independently of pause state", () => {
-  assert.equal(syncActionLabel(), "↻ 同步保活候选");
+  assert.equal(syncActionLabel(), "↻ 同步并验证保活");
   for (const sync_paused of [false, true]) {
-    assert.equal(syncActionLabel({ source_mode: "biwrite", biwrite_import_all: false, sync_paused }), "↻ 同步保活候选");
+    assert.equal(syncActionLabel({ source_mode: "biwrite", biwrite_import_all: false, sync_paused }), "↻ 同步并验证保活");
     assert.equal(syncActionLabel({ source_mode: "biwrite", biwrite_import_all: true, sync_paused }), "↻ 同步全部 Key");
     assert.equal(syncActionLabel({ source_mode: "manual", biwrite_import_all: true, sync_paused }), "↻ 刷新手动池");
   }
+});
+
+test("source time never reports a verification that has not happened", () => {
+  const read = { source: { read_at_ms: 1000 }, config: { source_mode: "biwrite", biwrite_import_all: false } };
+  for (const sync of [undefined, {}, { running: false, last_completed_ms: null }, { running: false, last_completed_ms: 0 }]) {
+    assert.deepEqual(sourceTimeState({ ...read, sync }), { mode: "read", at: 1000 });
+  }
+  assert.deepEqual(sourceTimeState({ config: read.config, sync: { running: false, last_completed_ms: null } }), { mode: "waiting" });
+  assert.deepEqual(sourceTimeState({ ...read, sync: { running: false, last_completed_ms: 2000 } }), { mode: "verified", at: 2000 });
+  assert.deepEqual(sourceTimeState({ ...read, sync: { running: false, last_completed_ms: 999 } }), { mode: "read", at: 1000, verifiedAt: 999 });
+  assert.equal(sourceTimeState({ ...read, sync: { running: true, completed: 3, total: 9 } }).mode, "progress");
+  for (const config of [{ source_mode: "manual" }, { source_mode: "biwrite", biwrite_import_all: true }]) {
+    assert.deepEqual(sourceTimeState({ source: { read_at_ms: 1000 }, config, sync: { running: false, last_completed_ms: 2000 } }), { mode: "read", at: 1000 });
+  }
+});
+
+test("the top button keeps a short progress label while the source panel keeps the full sentence", () => {
+  const running = { running: true, completed: 8, total: 18 };
+  assert.equal(syncProgressBrief(running), "验证 8 / 18");
+  assert.match(syncProgressText(running), /正在实时验证 8 \/ 18 项/);
+  assert.ok(syncProgressBrief(running).length < syncProgressText(running).length);
+  for (const sync of [undefined, {}, { running: false, completed: 8, total: 18 }]) assert.equal(syncProgressBrief(sync), "");
+});
+
+test("only candidate verification announces verifying while other sources announce reading", () => {
+  assert.equal(verifiesCandidates({ source_mode: "biwrite", biwrite_import_all: false }), true);
+  assert.equal(syncBusyLabel({ source_mode: "biwrite", biwrite_import_all: false }), "正在验证…");
+  for (const config of [{ source_mode: "manual" }, { source_mode: "biwrite", biwrite_import_all: true }, undefined]) {
+    assert.equal(syncBusyLabel(config), "正在读取…");
+  }
+  assert.equal(verifiesCandidates({ source_mode: "manual", biwrite_import_all: false }), false);
 });

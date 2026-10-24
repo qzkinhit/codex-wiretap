@@ -20,7 +20,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-
+MINIMUM_PYTHON = (3, 9)
 DEFAULT_REPO = Path(__file__).resolve().parent.parent
 TARGET = "aarch64-apple-darwin"
 MANIFEST = "MANIFEST.json"
@@ -321,6 +321,12 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if sys.version_info < MINIMUM_PYTHON:
+        print(
+            "需要 Python 3.9 或更新版本；macOS 自带的旧 python3 没有 Path.is_relative_to。",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
     try:
         raise SystemExit(main())
     except (PackagingError, OSError, ValueError, KeyError, zipfile.BadZipFile) as error:
