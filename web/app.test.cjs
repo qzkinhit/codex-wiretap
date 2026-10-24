@@ -2,7 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { compareReleaseVersions, safeReleaseUrl, updateActionState, conversationInfo, matchesConversationFilter, classifyRequestOutcome, manualAccountPayload, requestRouteMode, classifyServiceTier, recordServiceTier, matchesServiceTierFilter, sourceProviderRows, draftFromConfig, routingConfigPayload, accountModels, filterAccounts, filterModelHealth, syncConfigPatch, normalizeProbeResult, gatewayActionRows, attemptErrorDetails, effectiveOutputWait } = require("./app.js");
+const { compareReleaseVersions, safeReleaseUrl, updateActionState, conversationInfo, matchesConversationFilter, classifyRequestOutcome, manualAccountPayload, requestRouteMode, classifyServiceTier, recordServiceTier, matchesServiceTierFilter, sourceProviderRows, draftFromConfig, routingConfigPayload, accountModels, filterAccounts, filterModelHealth, syncConfigPatch, syncActionLabel, normalizeProbeResult, gatewayActionRows, attemptErrorDetails, effectiveOutputWait } = require("./app.js");
 
 test("retry settings distinguish fifteen retries from sixteen total attempts and support both boundaries", () => {
   const defaults = draftFromConfig({});
@@ -365,4 +365,14 @@ test("update release links stay on this repository without credentials or token-
   const state = updateActionState({ current_version: "1.0.0", latest_version: "1.1.0", update_available: true, download_supported: false, release_url: root + "/tag/v1.1.0" });
   assert.equal(state.canDownload, false);
   assert.equal(state.releaseUrl, root + "/tag/v1.1.0");
+});
+
+
+test("sync button names the active source scope independently of pause state", () => {
+  assert.equal(syncActionLabel(), "↻ 同步保活候选");
+  for (const sync_paused of [false, true]) {
+    assert.equal(syncActionLabel({ source_mode: "biwrite", biwrite_import_all: false, sync_paused }), "↻ 同步保活候选");
+    assert.equal(syncActionLabel({ source_mode: "biwrite", biwrite_import_all: true, sync_paused }), "↻ 同步全部 Key");
+    assert.equal(syncActionLabel({ source_mode: "manual", biwrite_import_all: true, sync_paused }), "↻ 刷新手动池");
+  }
 });

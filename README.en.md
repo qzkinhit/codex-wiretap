@@ -55,7 +55,7 @@ On macOS, open `~/Applications/Pool Router.app`. On Windows, open **Pool Router*
 
 1. Use the **BiWrite** source in Routing Settings (`路由设置`). A single eligible upstream address is discovered automatically. If several exist, enter the Base URL you want and save.
 2. Find your model in Source Synchronization (`来源同步`) and check its candidate and imported counts. The imported count must be greater than zero for the corresponding account to appear.
-3. After running keep-alive in BiWrite, use Sync Once (`单次同步`) to reread immediately. If automatic synchronization is paused, use Resume Sync (`恢复同步`).
+3. After running keep-alive in BiWrite, click Sync Keep-alive Candidates (`同步保活候选`) to reread saved candidates. In all-key scope, the button reads Sync All Keys (`同步全部 Key`). This does not trigger keep-alive or clear existing accounts’ failure observations. If automatic synchronization is paused, use Resume Sync (`恢复同步`).
 
 Start with the default keep-alive candidate scope. **Continuously Sync All Keys (`持续同步全部 Key`) is optional.** It adds non-kept, ignored, and stopped keys at the selected upstream to both the dashboard and routing candidates; it does not verify their availability.
 
@@ -98,11 +98,17 @@ This checks official Releases; it does not install source changes directly from 
 
 ### Why are there no accounts, or no accounts for a particular model?
 
-Check that BiWrite uses local key files, that the provider uses Responses, and that its upstream matches the one selected in Pool Router. Then inspect the model's candidate and imported counts. Missing or empty `keptKeys` means the default scope does not import that model; historical `keyThrough` success timestamps cannot substitute for candidates. Run keep-alive for that model in BiWrite and click Sync Once. If candidates exist but none are imported, also check whether keys were ignored, stopped, or removed from the declared configuration.
+Check that BiWrite uses local key files, that the provider uses Responses, and that its upstream matches the one selected in Pool Router. Then inspect the model's candidate and imported counts. Missing or empty `keptKeys` means the default scope does not import that model; historical `keyThrough` success timestamps cannot substitute for candidates. Run keep-alive for that model in BiWrite and click Sync Keep-alive Candidates (`同步保活候选`). If candidates exist but none are imported, also check whether keys were ignored, stopped, or removed from the declared configuration.
 
 ### Why does the dashboard show every account rather than only keep-alive candidates?
 
 Check whether the scope says All Keys (`全部 Key`). If it does, click **Sync Only Keep-alive Candidates (`仅同步保活候选`)**. This changes both the dashboard and candidates for subsequent requests; existing in-flight requests continue. It does not turn candidate membership into a guarantee of current success. Proxy requests separately update success, failure, and cooldown observations.
+
+### Why do unavailable accounts remain after synchronization?
+
+Last Read (`最近读取`) only means that Pool Router reread BiWrite’s saved files; it does not mean a keep-alive run just finished. `keptKeys` includes keep-alive and re-entry candidates, and ordinary keep-alive failures may leave keys in that set. `keyThrough` records historical success and may be saved only at hourly intervals. BiWrite’s live keep-alive state, retry state, and failure counts remain in its application memory, with no external interface currently available to Pool Router. These saved files therefore cannot support a strict filter of accounts that are succeeding right now.
+
+Rereading does not automatically probe accounts or clear existing accounts’ proxy failure observations or cooldown state. To check the result for a particular account and model, use Verify (`验证`) when needed. It sends a real upstream request and uses quota; the result describes only that request and does not guarantee continued availability.
 
 ### How do I reopen the dashboard after closing the browser?
 
@@ -236,7 +242,7 @@ The pool view can be filtered by full model ID. Cards retain key labels and show
 
 `keptKeys` is a keep-alive and re-entry candidate set, not an exact assertion that an account is currently admitted. `keyThrough` records historical success and may be persisted only at hourly intervals. The proxy tracks its own observed success, failure, cooldown, and concurrency separately. During normal automatic synchronization, a failed read briefly retains the previous snapshot. Once the last successful read is more than 30 seconds old, new assignments stop until the files become readable again.
 
-The pause control sets `sync_paused = true` and stops only scheduled BiWrite reads. The current pool remains schedulable and does not expire merely because synchronization was deliberately paused. Every application startup reads the current source once to initialize the pool, including when a saved pause is active; subsequent periodic synchronization respects the pause setting. A single sync action reads the current scope once without resuming automatic reads. The resume control restarts scheduled reads. Pause and all-key scope are saved independently; both default to `false`.
+The pause control sets `sync_paused = true` and stops only scheduled BiWrite reads. The current pool remains schedulable and does not expire merely because synchronization was deliberately paused. Every application startup reads the current source once to initialize the pool, including when a saved pause is active; subsequent periodic synchronization respects the pause setting. The Sync Keep-alive Candidates or Sync All Keys button rereads the selected scope once. It does not trigger keep-alive, clear existing accounts’ failure observations, or resume automatic reads. The resume control restarts scheduled reads. Pause and all-key scope are saved independently; both default to `false`.
 
 The application has no built-in provider address. `upstream_base_url` defaults to `null`, which discovers the unique HTTPS Responses upstream in BiWrite when using the automatic source. If multiple addresses exist, you must specify the desired Base URL in the dashboard; the application does not choose one arbitrarily. An explicit address restricts imports to that upstream. When switching from the automatic source to manual mode without an explicit address, the most recently resolved upstream is saved to `upstream_base_url`. Manual mode then retains its upstream selection if BiWrite is closed or its directory moves. If no previously resolved address is available, an explicit address is required. Starting directly in manual mode requires an explicit `upstream_base_url`; manual mode does not follow changes in BiWrite and rejects forwarding when this address is absent. Only HTTPS public domain names on the default port are accepted, without user information, query parameters, fragments, or other paths. Root and `/v1` paths are normalized to `/v1`.
 
