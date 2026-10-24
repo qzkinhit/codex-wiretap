@@ -16,13 +16,23 @@ The screenshot uses simulated data and contains no real accounts, keys, or conve
 
 ### Prebuilt release
 
-Download a package matching your operating system and processor architecture from the [latest release](https://github.com/qzkinhit/codex-wiretap/releases/latest). After extracting a macOS installation package, run this from its root directory:
+On Apple Silicon Macs running macOS 11 or later, download **`PoolRouter-macOS-arm64.dmg`** from the [latest release](https://github.com/qzkinhit/codex-wiretap/releases/latest). Open the disk image and double-click **`安装.command`**. The DMG installer uses tools included with macOS and requires neither compilation nor a separate Python installation. Eject the image after installation and use `~/Applications/Pool Router.app` afterward.
+
+The installer uses the included `target/release/pool-router` binary, installs a user background service and `~/Applications/Pool Router.app`, and then opens the dashboard. Installation itself does not change Codex or CC Switch connection settings.
+
+The existing v0.1.0 `PoolRouter-macOS-arm64.zip` remains available. Its older installer still requires `python3` to generate macOS plist files. Extract the ZIP and double-click `安装.command`, or run this from its root directory:
 
 ```bash
 bash scripts/macos-install.sh --no-build
 ```
 
-This uses the included `target/release/pool-router` binary without compiling it locally. The installer requires `python3` to generate macOS plist files. It installs a user background service and `~/Applications/Pool Router.app`, then opens the dashboard. Installation itself does not change Codex or CC Switch connection settings.
+The DMG and ZIP contain the same executable and dependency licenses; the DMG includes updated installation scripts. The DMG is read-only and has not been notarized by Apple. If macOS blocks the first opening after download, verify the download source, find the corresponding message in System Settings under Privacy & Security, choose Open Anyway, and confirm. On older macOS versions, use Security & Privacy in System Preferences.
+
+Reproduce the DMG from an existing binary ZIP by running the following command in the current repository. Packaging requires Python 3; installing the DMG does not.
+
+```bash
+python3 scripts/macos-package-dmg.py /path/PoolRouter-macOS-arm64.zip /path/PoolRouter-macOS-arm64.dmg
+```
 
 ### Build from source
 

@@ -30,7 +30,7 @@ plist="$agent_dir/local.pool-router.plist"
 application="$HOME/Applications/Pool Router.app"
 domain="gui/$(id -u)"
 
-command -v python3 >/dev/null || { printf '%s\n' '缺少 python3，无法安全生成 macOS plist。' >&2; exit 1; }
+[[ -x /usr/bin/plutil ]] || { printf '%s\n' '缺少系统 plutil，无法安全生成 macOS plist。' >&2; exit 1; }
 if [[ ! -e "$plist" ]] && /bin/launchctl print "$domain/local.pool-router" >/dev/null 2>&1; then
   printf '%s\n' '存在未识别的同名运行服务，未安装或停止它。' >&2
   exit 1
@@ -53,50 +53,46 @@ mkdir -p "$install_dir/bin" "$install_dir/logs" "$agent_dir" "$application/Conte
 chmod 700 "$install_dir" "$install_dir/bin" "$install_dir/logs"
 # Atomic replacement leaves an already-running version intact until our own restart below.
 temporary_binary="$(mktemp "$install_dir/bin/.pool-router.XXXXXX")"
-trap 'rm -f "$temporary_binary"' EXIT
+temporary_plist=''
+temporary_info=''
+trap 'rm -f -- "$temporary_binary" "$temporary_plist" "$temporary_info"' EXIT
 install -m 700 "$crate_dir/target/release/pool-router" "$temporary_binary"
 mv -f "$temporary_binary" "$binary"
 "$binary" init --config "$config"
 install -m 700 "$script_dir/macos-uninstall.sh" "$install_dir/uninstall.sh"
 
-python3 - "$install_dir" "$plist" "$application" <<'PY'
-import os, plistlib, sys, tempfile
-from pathlib import Path
-root, agent, app = map(Path, sys.argv[1:])
-def write_plist(path, content):
-    descriptor, temporary = tempfile.mkstemp(prefix='.pool-router.', dir=path.parent)
-    try:
-        with os.fdopen(descriptor, 'wb') as stream:
-            os.fchmod(stream.fileno(), 0o600)
-            plistlib.dump(content, stream)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-write_plist(agent, {
-    'Label': 'local.pool-router',
-    'ProgramArguments': [str(root/'bin/pool-router'), 'serve', '--config', str(root/'config.json')],
-    'WorkingDirectory': str(root),
-    'RunAtLoad': True,
-    'KeepAlive': True,
-    'ThrottleInterval': 10,
-    'Umask': 0o077,
-    'StandardOutPath': str(root/'logs/service.log'),
-    'StandardErrorPath': str(root/'logs/service.log'),
-})
-write_plist(app/'Contents/Info.plist', {
-    'CFBundleIdentifier': 'local.pool-router.launcher',
-    'CFBundleName': 'Pool Router',
-    'CFBundleDisplayName': 'Pool Router',
-    'CFBundleExecutable': 'Pool Router',
-    'CFBundlePackageType': 'APPL',
-    'CFBundleShortVersionString': '0.1.0',
-    'LSUIElement': True,
-    'NSHighResolutionCapable': True,
-})
-PY
+# Generate each plist beside its destination, then replace it atomically.
+# Passing values as separate arguments lets plutil escape paths safely.
+temporary_plist="$(mktemp "$agent_dir/.pool-router.XXXXXX")"
+/usr/bin/plutil -create xml1 -- "$temporary_plist"
+/usr/bin/plutil -insert Label -string local.pool-router -- "$temporary_plist"
+/usr/bin/plutil -insert ProgramArguments -xml '<array/>' -- "$temporary_plist"
+/usr/bin/plutil -insert ProgramArguments.0 -string "$binary" -- "$temporary_plist"
+/usr/bin/plutil -insert ProgramArguments.1 -string serve -- "$temporary_plist"
+/usr/bin/plutil -insert ProgramArguments.2 -string --config -- "$temporary_plist"
+/usr/bin/plutil -insert ProgramArguments.3 -string "$config" -- "$temporary_plist"
+/usr/bin/plutil -insert WorkingDirectory -string "$install_dir" -- "$temporary_plist"
+/usr/bin/plutil -insert RunAtLoad -bool true -- "$temporary_plist"
+/usr/bin/plutil -insert KeepAlive -bool true -- "$temporary_plist"
+/usr/bin/plutil -insert ThrottleInterval -integer 10 -- "$temporary_plist"
+/usr/bin/plutil -insert Umask -integer 63 -- "$temporary_plist"
+/usr/bin/plutil -insert StandardOutPath -string "$install_dir/logs/service.log" -- "$temporary_plist"
+/usr/bin/plutil -insert StandardErrorPath -string "$install_dir/logs/service.log" -- "$temporary_plist"
+
+temporary_info="$(mktemp "$application/Contents/.pool-router.XXXXXX")"
+/usr/bin/plutil -create xml1 -- "$temporary_info"
+/usr/bin/plutil -insert CFBundleIdentifier -string local.pool-router.launcher -- "$temporary_info"
+/usr/bin/plutil -insert CFBundleName -string 'Pool Router' -- "$temporary_info"
+/usr/bin/plutil -insert CFBundleDisplayName -string 'Pool Router' -- "$temporary_info"
+/usr/bin/plutil -insert CFBundleExecutable -string 'Pool Router' -- "$temporary_info"
+/usr/bin/plutil -insert CFBundlePackageType -string APPL -- "$temporary_info"
+/usr/bin/plutil -insert CFBundleShortVersionString -string 0.1.0 -- "$temporary_info"
+/usr/bin/plutil -insert LSUIElement -bool true -- "$temporary_info"
+/usr/bin/plutil -insert NSHighResolutionCapable -bool true -- "$temporary_info"
+/usr/bin/plutil -lint -- "$temporary_plist" "$temporary_info" >/dev/null
+chmod 600 "$temporary_plist" "$temporary_info"
+mv -f "$temporary_plist" "$plist"
+mv -f "$temporary_info" "$application/Contents/Info.plist"
 
 cat > "$application/Contents/MacOS/Pool Router" <<'APP'
 #!/bin/bash

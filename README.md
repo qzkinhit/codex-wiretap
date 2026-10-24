@@ -16,13 +16,23 @@ Codex Wiretap 的 Rust 版本提供本地号池调度和请求监控。它默认
 
 ### 预编译版本
 
-从 [最新 Release](https://github.com/qzkinhit/codex-wiretap/releases/latest) 下载匹配系统和处理器架构的压缩包。macOS 安装包解压后，在包根目录执行：
+Apple Silicon Mac（macOS 11 或更新版本）可从 [最新 Release](https://github.com/qzkinhit/codex-wiretap/releases/latest) 下载 **`PoolRouter-macOS-arm64.dmg`**。打开磁盘映像后双击 **`安装.command`**。DMG 安装器采用 macOS 自带工具，无需编译或额外安装 Python。完成后可推出映像，以后打开 `~/Applications/Pool Router.app`。
+
+安装器使用包内 `target/release/pool-router`，安装当前用户的后台服务和 `~/Applications/Pool Router.app`，然后打开面板。安装本身不会修改 Codex 或 CC Switch 的接入配置。
+
+现有 v0.1.0 的 `PoolRouter-macOS-arm64.zip` 继续保留，其旧安装器仍需要 `python3` 来生成 macOS plist。解压后双击 `安装.command`，或在包根目录执行：
 
 ```bash
 bash scripts/macos-install.sh --no-build
 ```
 
-此命令使用包内 `target/release/pool-router`，不需要现场编译。安装脚本需要 `python3` 来生成 macOS plist，会安装当前用户的后台服务和 `~/Applications/Pool Router.app`，然后打开面板。安装本身不会修改 Codex 或 CC Switch 的接入配置。
+DMG 与 ZIP 包含相同的程序二进制和依赖许可证，DMG 更新了安装脚本。DMG 为只读镜像，尚未经过 Apple 公证。如果首次下载后被 macOS 阻止，请确认下载来源，在“系统设置”的“隐私与安全性”中找到对应提示，选择“仍要打开”并确认；旧版 macOS 的对应入口位于“系统偏好设置”的“安全性与隐私”。
+
+可在当前仓库中使用以下命令，从现有二进制 ZIP 复现 DMG。打包过程需要 Python 3，用户安装 DMG 时不需要。
+
+```bash
+python3 scripts/macos-package-dmg.py /path/PoolRouter-macOS-arm64.zip /path/PoolRouter-macOS-arm64.dmg
+```
 
 ### 从源码构建
 
