@@ -25,6 +25,19 @@ function classifyRequestOutcome(record) {
   return { type: "active", label: "处理中", style: "blue" };
 }
 
+function conversationInfo(record = {}) {
+  const id = typeof record?.conversation_id === "string" ? record.conversation_id : "";
+  const title = typeof record?.conversation_title === "string" ? record.conversation_title.trim() : "";
+  const href = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id) ? `codex://threads/${id}` : null;
+  return { id, title, label: title || id || "未提供", href };
+}
+
+function matchesConversationFilter(record, query = "") {
+  const term = String(query).trim().toLowerCase();
+  const conversation = conversationInfo(record);
+  return !term || [conversation.title, conversation.id].some((value) => value.toLowerCase().includes(term));
+}
+
 function manualAccountPayload(fields) {
   const key = String(fields.key || "").trim();
   const models = [...new Set(String(fields.models || "").split(/[,，\n]+/).map((model) => model.trim()).filter(Boolean))];
@@ -210,7 +223,7 @@ function routingConfigPayload(draft, latestConfig) {
   };
 }
 
-if (typeof module !== "undefined" && module.exports) module.exports = { classifyRequestOutcome, manualAccountPayload, requestRouteMode, classifyServiceTier, recordServiceTier, matchesServiceTierFilter, sourceProviderRows, draftFromConfig, routingConfigPayload, accountModels, filterAccounts, filterModelHealth, syncConfigPatch, redactSensitiveText, normalizeProbeResult, gatewayActionRows, attemptErrorDetails, effectiveOutputWait };
+if (typeof module !== "undefined" && module.exports) module.exports = { conversationInfo, matchesConversationFilter, classifyRequestOutcome, manualAccountPayload, requestRouteMode, classifyServiceTier, recordServiceTier, matchesServiceTierFilter, sourceProviderRows, draftFromConfig, routingConfigPayload, accountModels, filterAccounts, filterModelHealth, syncConfigPatch, redactSensitiveText, normalizeProbeResult, gatewayActionRows, attemptErrorDetails, effectiveOutputWait };
 
 if (typeof document !== "undefined") (() => {
   const $ = (id) => document.getElementById(id);
@@ -804,16 +817,24 @@ if (typeof document !== "undefined") (() => {
     $("probe-result-content").replaceChildren(...blocks);
   }
 
-  function conversationNode(id, compact = false) {
-    const value = String(id || "");
-    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) {
-      const link = node("a", "", compact ? `${value.slice(0, 8)}…${value.slice(-4)}` : value);
-      link.href = `codex://threads/${value}`;
-      link.title = "在 Codex 中打开此对话";
-      link.addEventListener("click", (event) => event.stopPropagation());
-      return link;
+  function conversationNode(record) {
+    const conversation = conversationInfo(record);
+    const element = node(conversation.href ? "a" : "span", "conversation-name", conversation.label);
+    element.title = safeText([conversation.label, conversation.title && conversation.id, conversation.href && "在 Codex 中打开此对话"].filter(Boolean).join("\n"));
+    if (conversation.href) {
+      element.href = conversation.href;
+      element.addEventListener("click", (event) => event.stopPropagation());
     }
-    return node("span", "", compact ? shortId(value) : value || "未提供");
+    return element;
+  }
+
+  function conversationCell(record) {
+    const cell = node("td", "conversation-cell");
+    const { id } = conversationInfo(record);
+    const summary = node("span", "cell-sub", `${clockTime(record.started_at_ms)}${id ? ` · ${shortId(id)}` : ""}`);
+    summary.title = safeText([timestamp(record.started_at_ms), id].filter(Boolean).join(" · "));
+    cell.append(conversationNode(record), summary);
+    return cell;
   }
 
   function stackedCell(main, sub) {
@@ -839,11 +860,11 @@ if (typeof document !== "undefined") (() => {
     recordSignature = signature;
     const models = [...new Set(records.flatMap((record) => [record.requested_model, record.effective_model, record.response_model]).filter((value) => typeof value === "string" && value))].sort();
     updateOptions($("filter-model"), models, "全部模型");
-    const filtered = records.filter((record) => (!selectedModel || [record.requested_model, record.effective_model, record.response_model].includes(selectedModel)) && (!conversation || String(record.conversation_id || "").toLowerCase().includes(conversation)) && (!selectedStatus || classifyRequestOutcome(record).type === selectedStatus) && matchesServiceTierFilter(record, selectedTier));
+    const filtered = records.filter((record) => (!selectedModel || [record.requested_model, record.effective_model, record.response_model].includes(selectedModel)) && matchesConversationFilter(record, conversation) && (!selectedStatus || classifyRequestOutcome(record).type === selectedStatus) && matchesServiceTierFilter(record, selectedTier));
     const rows = filtered.map((record) => {
       const row = node("tr");
       row.tabIndex = 0;
-      row.setAttribute("aria-label", `查看 ${clockTime(record.started_at_ms)} 的请求详情`);
+      row.setAttribute("aria-label", safeText(`查看 ${conversationInfo(record).label} 于 ${clockTime(record.started_at_ms)} 的请求详情`));
       row.addEventListener("click", () => openRecord(record));
       row.addEventListener("keydown", (event) => { if (event.target === row && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); openRecord(record); } });
       const status = classifyRequestOutcome(record);
@@ -856,7 +877,7 @@ if (typeof document !== "undefined") (() => {
       statusCell.append(badge(status.label, status.style));
       if (Array.isArray(record.attempts) && record.attempts.length > 1) statusCell.append(node("span", "cell-sub", `${record.attempts.length} 次尝试`));
       row.append(
-        stackedCell(clockTime(record.started_at_ms), conversationNode(record.conversation_id, true)),
+        conversationCell(record),
         stackedCell(record.effective_model || record.requested_model || "—", record.effective_effort || record.requested_effort || "强度未提供"),
         stackedCell(route.label, `${accountLabel(record.key_id)} · ${record.transport || "—"}`),
         tierCell,
@@ -870,7 +891,7 @@ if (typeof document !== "undefined") (() => {
     $("records-body").replaceChildren(...rows);
     $("records-empty").hidden = filtered.length > 0;
     $("records-empty").querySelector("h3").textContent = records.length ? "没有符合筛选条件的记录" : "尚无请求记录";
-    $("records-empty").querySelector("p").textContent = records.length ? "调整模型、对话 ID、状态或档位后重试。" : state?.config?.recording_enabled === false ? "记录已暂停，可在路由设置中启用请求监控。" : "请求经过 Pool Router 后，路由情况与诊断信息会显示在这里。";
+    $("records-empty").querySelector("p").textContent = records.length ? "调整模型、对话名称或 ID、状态或档位后重试。" : state?.config?.recording_enabled === false ? "记录已暂停，可在路由设置中启用请求监控。" : "请求经过 Pool Router 后，路由情况与诊断信息会显示在这里。";
     text("record-count", `${filtered.length} 条记录${filtered.length !== records.length ? ` / 共 ${records.length} 条` : ""}`);
     if (openedRecordId && $("record-dialog").open) {
       const updated = records.find((record) => String(record.id) === openedRecordId);
@@ -909,7 +930,8 @@ if (typeof document !== "undefined") (() => {
       detail("传输方式", record.transport || "未提供"),
       detail("转发方式", route.label),
       detail("账号处理", route.mode === "legacy" ? "按 CC Switch 传来的 Key 和模型转发，不自动换号。" : "使用当前来源的号池，按保存的路由策略分配请求。", true),
-      detail("对话 ID", conversationNode(record.conversation_id), true),
+      detail("对话名称", conversationNode(record), true),
+      detail("对话 ID", conversationNode({ conversation_id: record.conversation_id }), true),
       detail("Codex 请求模型", record.requested_model || "未提供"),
       detail("代理转发模型", record.effective_model || "未提供"),
       detail("返回模型（供应商声明）", record.response_model || "未提供"),

@@ -230,15 +230,71 @@ pub fn valid_key_id(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+fn environment_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn preferred_home(
+    home: Option<PathBuf>,
+    profile: Option<PathBuf>,
+    windows: bool,
+) -> Option<PathBuf> {
+    if windows { profile.or(home) } else { home }
+}
+
+/// Windows desktop processes normally provide USERPROFILE rather than HOME.
+pub fn user_home_dir() -> Option<PathBuf> {
+    preferred_home(
+        environment_path("HOME"),
+        environment_path("USERPROFILE"),
+        cfg!(target_os = "windows"),
+    )
+    .filter(|path| path.is_absolute())
+}
+
+fn codex_home_from(override_dir: Option<PathBuf>, user_dir: Option<PathBuf>) -> Option<PathBuf> {
+    override_dir.or_else(|| user_dir.map(|path| path.join(".codex")))
+}
+
+/// Both integration and the title index must use the same Codex data directory.
+pub fn codex_home_dir() -> Option<PathBuf> {
+    let path = codex_home_from(environment_path("CODEX_HOME"), user_home_dir())?;
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        std::env::current_dir().ok().map(|cwd| cwd.join(path))
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_config_path(local_data: Option<PathBuf>, user_dir: Option<PathBuf>) -> PathBuf {
+    local_data
+        .or_else(|| user_dir.map(|path| path.join("AppData/Local")))
+        .unwrap_or_default()
+        .join("Pool Router/config.json")
+}
+
 pub fn default_path() -> PathBuf {
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
     #[cfg(target_os = "macos")]
     {
-        home.join("Library/Application Support/Pool Router/config.json")
+        user_home_dir()
+            .unwrap_or_default()
+            .join("Library/Application Support/Pool Router/config.json")
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
-        home.join(".config/pool-router/config.json")
+        windows_config_path(
+            environment_path("LOCALAPPDATA").filter(|path| path.is_absolute()),
+            user_home_dir(),
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        user_home_dir()
+            .unwrap_or_default()
+            .join(".config/pool-router/config.json")
     }
 }
 
@@ -246,6 +302,7 @@ pub fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("缺少配置目录"))?;
+    #[cfg(unix)]
     let created_parent = !parent.exists();
     fs::create_dir_all(parent)?;
     #[cfg(unix)]
@@ -306,6 +363,53 @@ pub fn load_or_init(path: &Path) -> Result<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn platform_paths_prefer_windows_profile_and_keep_codex_override() {
+        let home = PathBuf::from("home-from-shell");
+        let profile = PathBuf::from("windows-profile");
+        assert_eq!(
+            preferred_home(Some(home.clone()), Some(profile.clone()), true),
+            Some(profile.clone())
+        );
+        assert_eq!(
+            preferred_home(None, Some(profile.clone()), true),
+            Some(profile.clone())
+        );
+        assert_eq!(
+            preferred_home(Some(home.clone()), None, true),
+            Some(home.clone())
+        );
+        assert_eq!(
+            preferred_home(Some(home.clone()), Some(profile.clone()), false),
+            Some(home.clone())
+        );
+        assert_eq!(preferred_home(None, Some(profile), false), None);
+        let custom = PathBuf::from("custom-codex");
+        assert_eq!(
+            codex_home_from(Some(custom.clone()), Some(home.clone())),
+            Some(custom)
+        );
+        assert_eq!(
+            codex_home_from(None, Some(home.clone())),
+            Some(home.join(".codex"))
+        );
+        assert_eq!(codex_home_from(None, None), None);
+    }
+
+    #[test]
+    fn windows_config_uses_local_app_data_with_profile_fallback() {
+        let local = PathBuf::from("local-app-data");
+        let profile = PathBuf::from("windows-profile");
+        assert_eq!(
+            windows_config_path(Some(local.clone()), Some(profile.clone())),
+            local.join("Pool Router/config.json")
+        );
+        assert_eq!(
+            windows_config_path(None, Some(profile.clone())),
+            profile.join("AppData/Local/Pool Router/config.json")
+        );
+    }
+
     #[test]
     fn manual_source_without_address_never_adopts_biwrite_endpoint() {
         let dir = tempfile::tempdir().unwrap();

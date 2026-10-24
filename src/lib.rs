@@ -1,5 +1,6 @@
 pub mod biwrite;
 pub mod config;
+pub mod conversations;
 pub mod image_compression;
 pub mod integration;
 pub mod manual;

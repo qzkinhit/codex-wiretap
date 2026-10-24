@@ -48,6 +48,9 @@ if [[ "$build" == 1 ]]; then
   (cd "$crate_dir" && cargo build --release)
 fi
 [[ -x "$crate_dir/target/release/pool-router" ]] || { printf '%s\n' '未找到 release 可执行文件，请先执行 cargo build --release。' >&2; exit 1; }
+version_output="$("$crate_dir/target/release/pool-router" --version)"
+[[ "$version_output" == 'Pool Router '* ]] || { printf '%s\n' '无法识别待安装程序的版本。' >&2; exit 1; }
+application_version="${version_output#Pool Router }"
 
 mkdir -p "$install_dir/bin" "$install_dir/logs" "$agent_dir" "$application/Contents/MacOS"
 chmod 700 "$install_dir" "$install_dir/bin" "$install_dir/logs"
@@ -86,7 +89,7 @@ temporary_info="$(mktemp "$application/Contents/.pool-router.XXXXXX")"
 /usr/bin/plutil -insert CFBundleDisplayName -string 'Pool Router' -- "$temporary_info"
 /usr/bin/plutil -insert CFBundleExecutable -string 'Pool Router' -- "$temporary_info"
 /usr/bin/plutil -insert CFBundlePackageType -string APPL -- "$temporary_info"
-/usr/bin/plutil -insert CFBundleShortVersionString -string 0.1.0 -- "$temporary_info"
+/usr/bin/plutil -insert CFBundleShortVersionString -string "$application_version" -- "$temporary_info"
 /usr/bin/plutil -insert LSUIElement -bool true -- "$temporary_info"
 /usr/bin/plutil -insert NSHighResolutionCapable -bool true -- "$temporary_info"
 /usr/bin/plutil -lint -- "$temporary_plist" "$temporary_info" >/dev/null

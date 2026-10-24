@@ -1,38 +1,137 @@
-# Codex Wiretap (Rust)
+# Pool Router
 
 [简体中文](README.md) | **English**
 
-The Rust edition of Codex Wiretap provides local account pool routing and request monitoring. By default, it reads upstream candidates and key names from BiWrite and connects Codex directly to `http://127.0.0.1:10813/v1`. It schedules requests by account and model, and displays request status and usage in a local dashboard. The default workflow requires BiWrite and this application; CC Switch is not a dependency.
+**Pool Router connects Codex to the account pool configured in BiWrite and shows the account, model, retries, and usage for each request locally.** The current release is **1.0.0**, the Rust edition of the `codex-wiretap` repository; its executable is `pool-router`. The desktop launcher opens a browser dashboard, while a local background process forwards requests.
 
-The desktop launcher is named **Pool Router**, and the executable is **`pool-router`**. On macOS, the launcher opens a browser dashboard while a local background service handles requests. An optional CC Switch monitoring path is also available for users who continue to manage their keys in CC Switch.
+| Your computer | Download and install |
+| --- | --- |
+| Apple Silicon Mac, macOS 11 or later | [Download PoolRouter-macOS-arm64.dmg](https://github.com/qzkinhit/codex-wiretap/releases/latest/download/PoolRouter-macOS-arm64.dmg) |
+| Windows 10 / 11, x64 | [Download PoolRouter-Windows-x64-Setup.exe](https://github.com/qzkinhit/codex-wiretap/releases/latest/download/PoolRouter-Windows-x64-Setup.exe) |
 
-[Download a prebuilt release](https://github.com/qzkinhit/codex-wiretap/releases/latest) · [Historical Python implementation](legacy/python/)
+[All releases and release notes](https://github.com/qzkinhit/codex-wiretap/releases) · [BiWrite repository and installation instructions](https://github.com/zzccppp/biwrite) · [Historical Python implementation](legacy/python/)
 
-![Example Codex Wiretap dashboard](docs/dashboard.png)
+The default workflow needs Codex, BiWrite, and an accessible Responses upstream service with your own keys.
+
+| Application | Responsibility |
+| --- | --- |
+| Codex | Sends your conversation and coding requests. |
+| [BiWrite](https://github.com/zzccppp/biwrite) | Stores upstream addresses, models, and keys; runs keep-alive and maintains candidates. |
+| Pool Router | Reads candidates, schedules requests by account and model, and displays routing and request records. |
+
+The default request path is **Codex → Pool Router → upstream service**. BiWrite supplies the account source; individual requests do not pass through it. CC Switch is not required for this workflow. Pool Router does not supply upstream accounts or keys.
+
+![Example Pool Router dashboard](docs/dashboard.png)
 
 The screenshot uses simulated data and contains no real accounts, keys, or conversations.
 
-## Installation and startup
+## First-time setup
 
-### Prebuilt release
+### 1. Download the package for your computer
 
-On Apple Silicon Macs running macOS 11 or later, download **`PoolRouter-macOS-arm64.dmg`** from the [latest release](https://github.com/qzkinhit/codex-wiretap/releases/latest). Open the disk image and double-click **`安装.command`**. The DMG installer uses tools included with macOS and requires neither compilation nor a separate Python installation. Eject the image after installation and use `~/Applications/Pool Router.app` afterward.
+Use the download table above. The Mac package is for Apple Silicon; the Windows package is for x64. Installing these prebuilt packages requires no Rust, Cargo, or Python.
 
-The installer uses the included `target/release/pool-router` binary, installs a user background service and `~/Applications/Pool Router.app`, and then opens the dashboard. Installation itself does not change Codex or CC Switch connection settings.
+**macOS:** Open the DMG, double-click **`安装.command`**, and wait for installation to finish. It installs a user background service and `~/Applications/Pool Router.app`, then opens the dashboard. Eject the DMG afterward and use the installed app from then on.
 
-The existing v0.1.0 `PoolRouter-macOS-arm64.zip` remains available. Its older installer still requires `python3` to generate macOS plist files. Extract the ZIP and double-click `安装.command`, or run this from its root directory:
+**Windows:** Run **`PoolRouter-Windows-x64-Setup.exe`**, complete the per-user installation wizard, and open **Pool Router** from the Start menu. The launcher starts the local process and opens the dashboard. Program files are installed under `%LOCALAPPDATA%\Programs\Pool Router`; configuration and records are stored under `%LOCALAPPDATA%\Pool Router`. The installer offers optional desktop and sign-in startup shortcuts.
+
+Installation itself does not change Codex or CC Switch connection settings. Prepare BiWrite before performing the direct connection step below.
+
+The current release has no publisher code signature, and the macOS DMG has not been notarized by Apple. If macOS blocks the first opening, verify that the download came from this repository, find the corresponding message in System Settings under Privacy & Security, choose Open Anyway, and confirm. Older macOS versions use Security & Privacy in System Preferences. Windows may show an unknown-publisher prompt; verify the download source.
+
+### 2. Prepare your upstream, models, and keys in BiWrite
+
+Install and open BiWrite using its [repository instructions](https://github.com/zzccppp/biwrite), then complete these steps.
+
+1. Configure an OpenAI-compatible **Responses** provider with your upstream Base URL, model ID, and key. Providers configured only for Chat Completions are not imported by this adapter.
+2. Enable **local key file storage**, corresponding to `keysInFile = true`, so that keys are saved in BiWrite's `keys.json`. Pool Router does not read the system keychain, and you do not need to copy keys into it again.
+3. Run keep-alive for the models you intend to use and wait for BiWrite to save their `keptKeys` candidates. A key admitted for one model is not automatically admitted for another.
+
+The default scope imports only keep-alive candidates and excludes keys ignored or stopped in BiWrite. Candidate membership permits later requests; it does not guarantee that a request will succeed now.
+
+### 3. Open Pool Router and check imported accounts
+
+On macOS, open `~/Applications/Pool Router.app`. On Windows, open **Pool Router** from the Start menu. Confirm that the dashboard reports the service as online, then check the following.
+
+1. Use the **BiWrite** source in Routing Settings (`路由设置`). A single eligible upstream address is discovered automatically. If several exist, enter the Base URL you want and save.
+2. Find your model in Source Synchronization (`来源同步`) and check its candidate and imported counts. The imported count must be greater than zero for the corresponding account to appear.
+3. After running keep-alive in BiWrite, use Sync Once (`单次同步`) to reread immediately. If automatic synchronization is paused, use Resume Sync (`恢复同步`).
+
+Start with the default keep-alive candidate scope. **Continuously Sync All Keys (`持续同步全部 Key`) is optional.** It adds non-kept, ignored, and stopped keys at the selected upstream to both the dashboard and routing candidates; it does not verify their availability.
+
+### 4. Connect Codex directly
+
+Click **Connect Codex Directly (`直接接入 Codex`)** at the top right. After success, the button changes to **Check Connection (`检查接入`)**. This step backs up the Codex configuration, selects the local `http://127.0.0.1:10813/v1` provider, and sets the required authentication and Responses options. You do not need to enter the local token manually.
+
+Reopen or reload already-open Codex conversations after the first connection so they use the new configuration. The Check Connection label means the configuration is recognized as directly connected; the next step confirms the actual request path.
+
+### 5. Send a request and verify it in the monitor
+
+Send a short Codex request, such as “Reply only OK.” This is a real upstream request and uses your account quota. Return to **Request Monitor (`请求监控`)**, find the latest record, and check its result and routing label.
+
+Records show the conversation name first and can be searched by **conversation name or ID**. Click the name to open that Codex conversation. Click elsewhere in the row to inspect the requested model, selected account, each attempt's status and error, and usage reported by the upstream. Records without a name fall back to the conversation ID.
+
+Names are read only from `title` or `name` in the local Codex database; conversation bodies are not read. The name cache expires after five seconds and is reread on a subsequent monitor refresh, so renames do not appear immediately. Names are added for display only and are not written to `records.jsonl`. Unavailable names fall back to IDs.
+
+### 6. Confirm which path you are using
+
+Use the record for the request you just sent.
+
+| What you see | What it means |
+| --- | --- |
+| Check Connection (`检查接入`) button | The current Codex configuration is recognized as directly connected; a new request still needs to confirm that an existing conversation uses it. |
+| Pool Routing (`号池调度`) on the new record | This request uses candidates from the current Pool Router source and its routing policy. |
+| Legacy Monitoring (`旧方式监控`) on the new record | This request carries an upstream key and uses the compatibility path without selecting an account from the current pool. |
+| Allow Legacy Monitoring (`允许旧方式监控`) enabled | Compatibility requests are allowed; this does not establish the route of your current requests. |
+
+For first-time setup, complete the direct workflow above. Read Optional CC Switch Monitoring below only if you intend to keep maintaining keys in CC Switch.
+
+## Frequently asked questions
+
+### Why are there no accounts, or no accounts for a particular model?
+
+Check that BiWrite uses local key files, that the provider uses Responses, and that its upstream matches the one selected in Pool Router. Then inspect the model's candidate and imported counts. Missing or empty `keptKeys` means the default scope does not import that model; historical `keyThrough` success timestamps cannot substitute for candidates. Run keep-alive for that model in BiWrite and click Sync Once. If candidates exist but none are imported, also check whether keys were ignored, stopped, or removed from the declared configuration.
+
+### Why does the dashboard show every account rather than only keep-alive candidates?
+
+Check whether the scope says All Keys (`全部 Key`). If it does, click **Sync Only Keep-alive Candidates (`仅同步保活候选`)**. This changes both the dashboard and candidates for subsequent requests; existing in-flight requests continue. It does not turn candidate membership into a guarantee of current success. Proxy requests separately update success, failure, and cooldown observations.
+
+### How do I reopen the dashboard after closing the browser?
+
+On macOS, open `~/Applications/Pool Router.app`; on Windows, open **Pool Router** from the Start menu. The browser is the control panel, and closing it does not stop background forwarding. Use the launcher instead of entering the local address manually so that the dashboard receives its required local authentication token.
+
+### How do I tell whether I am still using the old connection method?
+
+Send a new request and inspect its label in Request Monitor. Pool Routing (`号池调度`) identifies the current pool path; Legacy Monitoring (`旧方式监控`) identifies the compatibility path. The Check Connection button describes configuration state, while Allow Legacy Monitoring is a permission switch. Neither replaces evidence from the actual request record. To return to the default pool path, click Connect Codex Directly (or Check Connection if already configured), reopen the conversation as directed, and verify with another request.
+
+### Why is a name missing, or why are there no new monitor records?
+
+If only the name is missing, use the ID. The application looks up explicit conversation IDs in readable local Codex databases; conversations on other devices or missing local indexes may have no name. If the request has no record at all, check that the service is online, recording is enabled, and the sending Codex conversation has loaded the local connection configuration. Only requests passing through the local endpoint are monitored.
+
+## Installation and command-line reference
+
+### Older ZIP package and DMG reproduction
+
+The existing v0.1.0 `PoolRouter-macOS-arm64.zip` remains available. Its older installer still requires `python3` to generate macOS plist files. New users should use the DMG. To use the older ZIP, extract it and double-click `安装.command`, or run this from its root directory:
 
 ```bash
 bash scripts/macos-install.sh --no-build
 ```
 
-The DMG and ZIP contain the same executable and dependency licenses; the DMG includes updated installation scripts. The DMG is read-only and has not been notarized by Apple. If macOS blocks the first opening after download, verify the download source, find the corresponding message in System Settings under Privacy & Security, choose Open Anyway, and confirm. On older macOS versions, use Security & Privacy in System Preferences.
-
-Reproduce the DMG from an existing binary ZIP by running the following command in the current repository. Packaging requires Python 3; installing the DMG does not.
+The v0.1.0 DMG and corresponding ZIP contain the same executable and dependency licenses; the DMG updates the installation scripts. Use the current repository to package a DMG from an existing binary ZIP. **Packaging requires Python 3; installing the DMG does not.**
 
 ```bash
 python3 scripts/macos-package-dmg.py /path/PoolRouter-macOS-arm64.zip /path/PoolRouter-macOS-arm64.dmg
 ```
+
+### Windows installation paths
+
+| Item | Location |
+| --- | --- |
+| Program files and launcher | `%LOCALAPPDATA%\Programs\Pool Router` |
+| Configuration, manual accounts, and request records | `%LOCALAPPDATA%\Pool Router` |
+| Open the dashboard | Start menu → Pool Router |
+| Default BiWrite data directory | `%APPDATA%\app.biwrite.desktop` |
 
 ### Build from source
 
@@ -74,17 +173,9 @@ All commands accept `--config /absolute/path/config.json`. The `open` command re
 | Launcher | `~/Applications/Pool Router.app` |
 | Background service | `~/Library/LaunchAgents/local.pool-router.plist` |
 
-Other systems can use the command-line build and runtime. The background service installer included in this repository is specific to macOS.
+Linux and architectures without a prebuilt package can use the command-line build and runtime. The `macos-install.sh` script and LaunchAgent above apply only to macOS.
 
-## Default workflow: BiWrite and direct Codex connection
-
-1. Configure the required Responses providers in BiWrite. Enable local key storage so that keys are available in `keys.json`. The default scope imports keep-alive candidates only, so run keep-alive for the required models when using that scope.
-2. Start Pool Router. A single eligible upstream address in BiWrite is selected automatically; if several addresses exist, enter the desired Base URL in routing settings and save it. Choose continuous all-key synchronization to include keys outside the keep-alive set. Check the models and candidate counts in the source synchronization summary. Optional account/model probes send real upstream requests and may consume quota; importing alone does not verify availability.
-3. Use the dashboard's direct Codex connection action, or run:
-
-```bash
-"$HOME/Library/Application Support/Pool Router/bin/pool-router" connect
-```
+## Direct Codex connection details
 
 The connection action backs up `~/.codex/config.toml`, adds a separate `pool_router` provider, and selects it as Codex's active provider. It uses the local endpoint, the application's generated local token, and these protocol settings:
 
@@ -109,7 +200,7 @@ The `source_mode` configuration field determines where accounts come from. The r
 | `biwrite`, default | Reads BiWrite's local `settings.json` and `keys.json` every 1.5 seconds without copying keys manually. |
 | `manual` | Uses only the keys, models, labels, and concurrency limits entered in the dashboard. |
 
-By default, the automatic source imports only `keptKeys` candidates from Responses providers at the selected upstream, excluding ignored or stopped keys. The dashboard’s continuous all-key sync action immediately selects the BiWrite source and enables `biwrite_import_all`. Subsequent automatic reads keep including all keys at that upstream, including keys outside the keep-alive set and keys marked ignored or stopped. This does not create a manual pool. You can switch back to keep-alive candidates at any time. The public default is `false`; imported accounts remain unverified until an actual request provides evidence. On macOS, the default BiWrite directory is `~/Library/Application Support/app.biwrite.desktop`. The adapter requires `keysInFile` to be enabled. It does not read the system keychain or modify BiWrite files.
+By default, the automatic source imports only `keptKeys` candidates from Responses providers at the selected upstream, excluding ignored or stopped keys. The dashboard’s continuous all-key sync action immediately selects the BiWrite source and enables `biwrite_import_all`. Subsequent automatic reads keep including all keys at that upstream, including keys outside the keep-alive set and keys marked ignored or stopped. This does not create a manual pool. You can switch back to keep-alive candidates at any time. The public default is `false`; imported accounts remain unverified until an actual request provides evidence. The default BiWrite directory is `~/Library/Application Support/app.biwrite.desktop` on macOS and `%APPDATA%\app.biwrite.desktop` on Windows. The adapter requires `keysInFile` to be enabled. It does not read the system keychain or modify BiWrite files.
 
 The dashboard reads key labels from BiWrite’s `keyNames` for account cards and account references in request records. If no usable label exists, it displays an anonymous account identifier. Saved keys are never returned for display.
 
@@ -183,6 +274,8 @@ A shared upstream URL does not establish that accounts share server-side convers
 
 ## Monitoring and local data
 
+Using conversation UUIDs already present in request records, the monitor reads only `title` or `name` from local Codex databases and adds a nullable `conversation_title` to the API response. It uses `CODEX_HOME` when set, otherwise the current user’s `.codex` directory, including `USERPROFILE` on Windows. Both found and missing titles are cached for five seconds and refreshed on a later monitor query. Conversation bodies are not read, and names are not added to the request JSONL. Display and search retain the original ID when no name is available.
+
 Only requests **passing through the local endpoint** are monitored. This is not system-wide packet capture or HTTPS interception. The dashboard keeps the latest 1,000 allowlisted metadata records by default. Recording can be paused while forwarding continues.
 
 Records also include `gateway_actions`, the actual request body size sent in the last upstream attempt as `upstream_request_bytes`, and the wait for meaningful model output as `first_output_ms`. The dashboard distinguishes session resets and reuse, compaction repair, image compression, and timeout retries. It never substitutes SSE heartbeats, first-byte timing, or total request duration for meaningful output timing; missing values remain unknown.
@@ -191,13 +284,15 @@ Records include `route_mode`, an anonymous account identifier, recognizable conv
 
 The dashboard groups `fast` and `priority` together for service-tier viewing while retaining the original request and response values. These fields describe request parameters or server declarations; they do not prove the actual backend model, execution tier, or final billing.
 
-Ordinary gateway logs retain only allowlisted metadata and bounded, redacted per-attempt error messages in `AttemptRecord.error_message`. They do not store complete requests or successful response bodies. Error summaries explain individual failures; missing messages remain unknown, and complete upstream error responses are not stored. Summaries contain upstream diagnostic text and should still be reviewed before sharing. Limited text from fixed probes is used only in the current page’s probe details, separately from ordinary gateway logs. BiWrite keys are read into memory, manual keys use a private file, and a compatibility key is used only to forward its request. Private configuration contains the local access token, and recovery backups may contain credentials from previous configuration. These files use `0600` permissions and should not be included in source archives, screenshots, or diagnostic bundles.
+Ordinary gateway logs retain only allowlisted metadata and bounded, redacted per-attempt error messages in `AttemptRecord.error_message`. They do not store complete requests or successful response bodies. Error summaries explain individual failures; missing messages remain unknown, and complete upstream error responses are not stored. Summaries contain upstream diagnostic text and should still be reviewed before sharing. Limited text from fixed probes is used only in the current page’s probe details, separately from ordinary gateway logs. BiWrite keys are read into memory, manual keys use a private file, and a compatibility key is used only to forward its request. Private configuration contains the local access token, and recovery backups may contain credentials from previous configuration. These files should not be included in source archives, screenshots, or diagnostic bundles. They are created with `0600` permissions on macOS and Linux.
 
 The service binds only to loopback and checks Host and browser Origin. Management endpoints always require the local token. Compatibility upstream keys are accepted only by model-forwarding endpoints and cannot authorize administration.
 
 ## Maintenance, restoration, and removal
 
-Inspect sanitized status or reopen the dashboard:
+To update, rerun the installer for your operating system. On Windows, uninstall Pool Router from the system application list or the Start menu. The Windows uninstaller first restores connection settings managed by this application. Conflicts in managed fields abort uninstallation and preserve the configuration for resolution. User data is retained by default.
+
+The commands and LaunchAgent operations below apply to macOS. Inspect sanitized status or reopen the dashboard:
 
 ```bash
 "$HOME/Library/Application Support/Pool Router/bin/pool-router" status
@@ -232,7 +327,7 @@ Remove the background service and launcher:
 bash "$HOME/Library/Application Support/Pool Router/uninstall.sh"
 ```
 
-Uninstallation does not stop CC Switch or other wiretap services. Configuration, manual keys, logs, and archived recovery backups are retained by default. After verifying restoration and deciding the data is no longer needed, you can remove this application's data directory manually. Do not delete the executable while clients still depend on its local endpoint.
+The macOS uninstallation script does not stop CC Switch or other wiretap services. Configuration, manual keys, logs, and archived recovery backups are retained by default. After verifying restoration and deciding the data is no longer needed, you can remove this application's data directory manually. Do not delete the executable while clients still depend on its local endpoint.
 
 ## Historical version and development
 

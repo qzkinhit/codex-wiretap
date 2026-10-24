@@ -65,9 +65,13 @@ struct CurrentProvider {
 }
 
 fn home_dir() -> Result<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .context("无法确定用户目录")
+    crate::config::user_home_dir().context("无法确定用户目录")
+}
+
+fn codex_config_path() -> Result<PathBuf> {
+    crate::config::codex_home_dir()
+        .map(|path| path.join("config.toml"))
+        .context("无法确定 Codex 配置目录")
 }
 
 fn validate_target(raw: &str) -> Result<reqwest::Url> {
@@ -157,7 +161,7 @@ fn settings_document(settings: &str) -> Result<(Value, DocumentMut)> {
 }
 
 pub fn inspect_connection(base_url: &str) -> ConnectionInfo {
-    match home_dir().and_then(|home| inspect_at(base_url, &home)) {
+    match codex_config_path().and_then(|path| inspect_config(base_url, &path)) {
         Ok(info) => info,
         Err(_) => ConnectionInfo {
             base_url: base_url.to_owned(),
@@ -167,9 +171,14 @@ pub fn inspect_connection(base_url: &str) -> ConnectionInfo {
     }
 }
 
+#[cfg(test)]
 fn inspect_at(base_url: &str, home: &Path) -> Result<ConnectionInfo> {
+    inspect_config(base_url, &home.join(".codex/config.toml"))
+}
+
+fn inspect_config(base_url: &str, path: &Path) -> Result<ConnectionInfo> {
     validate_target(base_url)?;
-    let config = fs::read_to_string(home.join(".codex/config.toml"))?;
+    let config = fs::read_to_string(path)?;
     let (_, active) = active_endpoint(&document(&config)?)?;
     if normalized(&active) == normalized(base_url) {
         return Ok(ConnectionInfo { base_url:base_url.into(), configured:true, detail:"Codex 配置已直连 Pool Router，运行只需 BiWrite 与本软件。首次接入后，已打开会话是否采用新配置仍需请求验证，必要时重载一次。".into() });
@@ -183,16 +192,31 @@ fn inspect_at(base_url: &str, home: &Path) -> Result<ConnectionInfo> {
 
 /// Explicit mutation entry point, invoked only by the connect command/API.
 pub fn connect(base_url: &str, local_token: &str, state_dir: &Path) -> Result<String> {
-    connect_at(base_url, local_token, state_dir, &home_dir()?)
+    connect_config(base_url, local_token, state_dir, &codex_config_path()?)
 }
 
+#[cfg(test)]
 fn connect_at(base_url: &str, local_token: &str, state_dir: &Path, home: &Path) -> Result<String> {
+    connect_config(
+        base_url,
+        local_token,
+        state_dir,
+        &home.join(".codex/config.toml"),
+    )
+}
+
+fn connect_config(
+    base_url: &str,
+    local_token: &str,
+    state_dir: &Path,
+    path: &Path,
+) -> Result<String> {
     validate_target(base_url)?;
     ensure!(
         !local_token.is_empty() && !local_token.contains(['\n', '\r']),
         "本地访问令牌无效"
     );
-    let path = home.join(".codex/config.toml");
+    let path = path.to_path_buf();
     let original = fs::read_to_string(&path).context("无法读取 Codex 配置")?;
     let mut doc = document(&original)?;
     let prior_backup = if state_dir.join(JOURNAL).exists() {
@@ -986,6 +1010,8 @@ fn private_write_mode(path: &Path, data: &[u8], exclusive: bool) -> Result<()> {
         } else {
             fs::rename(&tmp, path)?;
         }
+        // Opening a directory as a File is supported on Unix, but fails on Windows.
+        #[cfg(unix)]
         fs::File::open(parent)?.sync_all()?;
         Ok(())
     })();
@@ -1021,6 +1047,24 @@ mod tests {
         }
         let state = home.join("state");
         (dir, state)
+    }
+
+    #[test]
+    fn explicit_codex_directory_roundtrip_leaves_default_config_unchanged() {
+        let (dir, state) = fixture(false);
+        let default_path = dir.path().join(".codex/config.toml");
+        let original = fs::read(&default_path).unwrap();
+        let selected_path = dir.path().join("custom Codex & data/config.toml");
+        fs::create_dir_all(selected_path.parent().unwrap()).unwrap();
+        fs::write(&selected_path, &original).unwrap();
+
+        connect_config(TARGET, "local-test-token", &state, &selected_path).unwrap();
+        assert!(inspect_config(TARGET, &selected_path).unwrap().configured);
+        assert!(!inspect_config(TARGET, &default_path).unwrap().configured);
+        assert_eq!(fs::read(&default_path).unwrap(), original);
+        restore(&state).unwrap();
+        assert_eq!(fs::read(&selected_path).unwrap(), original);
+        assert_eq!(fs::read(&default_path).unwrap(), original);
     }
 
     #[test]

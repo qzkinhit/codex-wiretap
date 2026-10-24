@@ -1,6 +1,7 @@
 use crate::{
     biwrite,
     config::{self, Config, SourceMode},
+    conversations::ConversationIndex,
     integration, manual,
     monitor::{
         self, AttemptRecord, GatewayAction, Observation, RecordStore, RequestRecord, SseObserver,
@@ -55,6 +56,8 @@ pub struct AppState {
     pub config_path: PathBuf,
     pub scheduler: Scheduler,
     pub records: RecordStore,
+    /// Local display metadata only. Titles never enter the persisted request log.
+    pub conversations: Arc<ConversationIndex>,
     pub source: RwLock<SourceState>,
     pub client: reqwest::Client,
     legacy_client: reqwest::Client,
@@ -98,6 +101,7 @@ impl AppState {
             config_path,
             scheduler: Scheduler::new(),
             records,
+            conversations: Arc::new(ConversationIndex::from_environment()),
             source: RwLock::new(SourceState::default()),
             client,
             legacy_client,
@@ -392,7 +396,33 @@ async fn api_state(State(state): State<Arc<AppState>>) -> Json<Value> {
     )
 }
 async fn api_records(State(s): State<Arc<AppState>>) -> Json<Value> {
-    Json(json!({"records":s.records.records()}))
+    let records = s.records.records();
+    let ids = records
+        .iter()
+        .filter_map(|record| record.conversation_id.clone())
+        .collect::<Vec<_>>();
+    let index = s.conversations.clone();
+    let titles = tokio::task::spawn_blocking(move || index.lookup(&ids))
+        .await
+        .unwrap_or_default();
+    #[derive(Serialize)]
+    struct DisplayRecord {
+        #[serde(flatten)]
+        record: RequestRecord,
+        conversation_title: Option<String>,
+    }
+    let records = records
+        .into_iter()
+        .map(|record| DisplayRecord {
+            conversation_title: record
+                .conversation_id
+                .as_ref()
+                .and_then(|id| titles.get(id))
+                .cloned(),
+            record,
+        })
+        .collect::<Vec<_>>();
+    Json(json!({"records":records}))
 }
 async fn api_clear(State(s): State<Arc<AppState>>) -> Response {
     match s.records.clear() {

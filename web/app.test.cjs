@@ -2,7 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { classifyRequestOutcome, manualAccountPayload, requestRouteMode, classifyServiceTier, recordServiceTier, matchesServiceTierFilter, sourceProviderRows, draftFromConfig, routingConfigPayload, accountModels, filterAccounts, filterModelHealth, syncConfigPatch, normalizeProbeResult, gatewayActionRows, attemptErrorDetails, effectiveOutputWait } = require("./app.js");
+const { conversationInfo, matchesConversationFilter, classifyRequestOutcome, manualAccountPayload, requestRouteMode, classifyServiceTier, recordServiceTier, matchesServiceTierFilter, sourceProviderRows, draftFromConfig, routingConfigPayload, accountModels, filterAccounts, filterModelHealth, syncConfigPatch, normalizeProbeResult, gatewayActionRows, attemptErrorDetails, effectiveOutputWait } = require("./app.js");
 
 test("retry settings distinguish fifteen retries from sixteen total attempts and support both boundaries", () => {
   const defaults = draftFromConfig({});
@@ -303,5 +303,38 @@ test("ultrafast, flex and scale retain independent groups", () => {
     assert.equal(tier.raw, value);
     assert.equal(tier.known, true);
     assert.equal(matchesServiceTierFilter({ outcome: "completed", requested_service_tier: value, response_service_tier: value }, "fast"), false);
+  }
+});
+
+
+test("conversation names take precedence while older records retain their exact IDs", () => {
+  const id = "01a16b50-e1f9-71d3-b9e2-24b065002660";
+  assert.equal(conversationInfo({ conversation_id: id, conversation_title: "  安装与发布 DMG  " }).label, "安装与发布 DMG");
+  for (const title of [undefined, null, "", " \n ", 42]) {
+    const info = conversationInfo({ conversation_id: id, conversation_title: title });
+    assert.equal(info.label, id);
+    assert.equal(info.href, `codex://threads/${id}`);
+  }
+  assert.equal(conversationInfo({ conversation_title: "仅有名称" }).label, "仅有名称");
+  assert.equal(conversationInfo({}).label, "未提供");
+  assert.equal(conversationInfo(null).href, null);
+});
+
+test("conversation filtering searches Chinese titles and IDs independently of case", () => {
+  const id = "01a16b50-e1f9-71d3-b9e2-24b065002660";
+  const record = { conversation_id: id, conversation_title: "修复 Codex DMG 安装" };
+  for (const query of ["修复", "  CODEX dmg ", "E1F9-71D3", "", "  "]) assert.equal(matchesConversationFilter(record, query), true, query);
+  assert.equal(matchesConversationFilter(record, "未出现的名称"), false);
+  assert.equal(matchesConversationFilter({ conversation_id: id }, "E1F9"), true);
+  assert.equal(matchesConversationFilter({ conversation_id: id }, "Codex"), false);
+  assert.equal(matchesConversationFilter({}, "未提供"), false);
+});
+
+test("conversation links only use complete UUIDs and never derive URLs from titles", () => {
+  const id = "01A16B50-E1F9-71D3-B9E2-24B065002660";
+  const title = '<img src=x onerror="alert(1)"> javascript:alert(1)';
+  assert.deepEqual(conversationInfo({ conversation_id: id, conversation_title: title }), { id, title, label: title, href: `codex://threads/${id}` });
+  for (const invalid of ["javascript:alert(1)", `codex://threads/${id}`, `${id}/other`, `${id}?action=delete`, `${id}#fragment`, ` ${id}`, `${id}\n`, '<img src=x onerror="alert(1)">', { toString: () => id }]) {
+    assert.equal(conversationInfo({ conversation_id: invalid, conversation_title: "正常名称" }).href, null);
   }
 });

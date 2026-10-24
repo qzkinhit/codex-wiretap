@@ -1,38 +1,137 @@
-# Codex Wiretap (Rust)
+# Pool Router
 
 **简体中文** | [English](README.en.md)
 
-Codex Wiretap 的 Rust 版本提供本地号池调度和请求监控。它默认只读同步 BiWrite 的上游候选与 Key 昵称，让 Codex 直接连接 `http://127.0.0.1:10813/v1`，按账号与模型选择可用容量，并在本地面板中查看请求状态和用量。日常默认流程只需要 BiWrite 与本软件，不依赖 CC Switch。
+**Pool Router 让 Codex 使用 BiWrite 中的账号池，并在本机查看每次请求的账号、模型、重试和用量。** 当前版本为 **1.0.0**，属于 `codex-wiretap` 仓库的 Rust 实现，程序名为 `pool-router`。安装后从桌面启动器打开浏览器控制台，本机后台程序负责实际转发。
 
-桌面启动器名称为 **Pool Router**，命令行程序为 **`pool-router`**。macOS 启动器打开浏览器面板，实际转发由本机后台服务完成。项目同时保留可选的 CC Switch 兼容监控路径，供仍在 CC Switch 中维护 Key 的用户使用。
+| 你的电脑 | 下载并安装 |
+| --- | --- |
+| Apple Silicon Mac，macOS 11 或更新版本 | [下载 PoolRouter-macOS-arm64.dmg](https://github.com/qzkinhit/codex-wiretap/releases/latest/download/PoolRouter-macOS-arm64.dmg) |
+| Windows 10 / 11，x64 | [下载 PoolRouter-Windows-x64-Setup.exe](https://github.com/qzkinhit/codex-wiretap/releases/latest/download/PoolRouter-Windows-x64-Setup.exe) |
 
-[下载预编译版本](https://github.com/qzkinhit/codex-wiretap/releases/latest) · [历史 Python 实现](legacy/python/)
+[全部版本与发行说明](https://github.com/qzkinhit/codex-wiretap/releases) · [BiWrite 公开仓库与安装说明](https://github.com/zzccppp/biwrite) · [历史 Python 实现](legacy/python/)
 
-![Codex Wiretap 本地控制台示例](docs/dashboard.png)
+默认流程需要 Codex、BiWrite，以及可访问的 Responses 上游服务和对应 Key。三者分工如下。
+
+| 软件 | 负责什么 |
+| --- | --- |
+| Codex | 发起你的对话和编程请求。 |
+| [BiWrite](https://github.com/zzccppp/biwrite) | 保存上游地址、模型和 Key，运行保活并维护候选集合。 |
+| Pool Router | 只读同步候选，按账号与模型分配请求，显示路由结果和监控记录。 |
+
+默认路径为 **Codex → Pool Router → 上游服务**。BiWrite 提供账号来源，不处在每次请求的转发链路中；默认流程不需要 CC Switch。Pool Router 不提供上游账号或 Key。
+
+![Pool Router 本地控制台示例](docs/dashboard.png)
 
 图中为模拟数据，不包含真实账号、密钥或对话。
 
-## 安装与启动
+## 第一次使用
 
-### 预编译版本
+### 1. 下载适合电脑的安装包
 
-Apple Silicon Mac（macOS 11 或更新版本）可从 [最新 Release](https://github.com/qzkinhit/codex-wiretap/releases/latest) 下载 **`PoolRouter-macOS-arm64.dmg`**。打开磁盘映像后双击 **`安装.command`**。DMG 安装器采用 macOS 自带工具，无需编译或额外安装 Python。完成后可推出映像，以后打开 `~/Applications/Pool Router.app`。
+从上表下载安装包。Mac 版本适用于 Apple Silicon；Windows 版本适用于 x64。安装这些预编译包无需 Rust、Cargo 或 Python。
 
-安装器使用包内 `target/release/pool-router`，安装当前用户的后台服务和 `~/Applications/Pool Router.app`，然后打开面板。安装本身不会修改 Codex 或 CC Switch 的接入配置。
+**macOS：** 打开 DMG，双击其中的 **`安装.command`**，等待安装完成。安装器会安装当前用户的后台服务和 `~/Applications/Pool Router.app`，并打开浏览器面板。完成后可以推出 DMG，以后直接打开该 App。
 
-现有 v0.1.0 的 `PoolRouter-macOS-arm64.zip` 继续保留，其旧安装器仍需要 `python3` 来生成 macOS plist。解压后双击 `安装.command`，或在包根目录执行：
+**Windows：** 双击 **`PoolRouter-Windows-x64-Setup.exe`**，按向导完成当前用户安装，然后从开始菜单打开 **Pool Router**。启动器会启动本地程序并打开浏览器面板。程序安装在 `%LOCALAPPDATA%\Programs\Pool Router`，配置和记录保存在 `%LOCALAPPDATA%\Pool Router`。安装时可选择创建桌面快捷方式和登录时启动快捷方式。
+
+安装本身不会修改 Codex 或 CC Switch 的接入配置。先完成下面的 BiWrite 准备，再执行直接接入。
+
+当前版本未使用发布者代码签名，macOS DMG 尚未经过 Apple 公证。若 macOS 阻止首次打开，请确认下载来自本仓库，在“系统设置”的“隐私与安全性”中找到对应提示，选择“仍要打开”并确认；旧版 macOS 的入口为“系统偏好设置”的“安全性与隐私”。Windows 可能显示未知发布者提示，请核对下载来源。
+
+### 2. 在 BiWrite 准备上游、模型和 Key
+
+按照 [BiWrite 仓库说明](https://github.com/zzccppp/biwrite) 安装并打开 BiWrite，然后完成以下操作。
+
+1. 配置 OpenAI 兼容的 **Responses** 供应商，填写你的上游 Base URL、模型 ID 和 Key。只配置 Chat Completions 的供应商不会被此适配器导入。
+2. 启用**本地密钥文件模式**，即 `keysInFile = true`，使 Key 保存在 BiWrite 的 `keys.json` 中。Pool Router 不读取系统钥匙串，不需要你再次复制 Key。
+3. 对实际要使用的模型运行保活，等待 BiWrite 保存对应的 `keptKeys` 候选。一个模型有候选，不代表同一 Key 在其他模型也已进入候选。
+
+默认只同步保活候选，并排除 BiWrite 中被忽略或停止的 Key。候选表示允许参与后续请求，不保证此刻请求一定成功。
+
+### 3. 打开 Pool Router，确认账号已导入
+
+Mac 打开 `~/Applications/Pool Router.app`；Windows 从开始菜单打开 **Pool Router**。看到浏览器面板后，确认服务处于在线状态，并按下面的顺序检查。
+
+1. 在“路由设置”中使用 **BiWrite** 来源。只有一个符合条件的上游地址时，程序会自动发现；有多个时，填写这次要使用的上游 Base URL 并保存。
+2. 在“来源同步”中找到你要用的模型，查看“保活候选数”和“已导入数”。已导入数需要大于 0，首页才会出现相应账号。
+3. 如果刚在 BiWrite 完成保活，可以点击“单次同步”。若自动同步已暂停，可点击“恢复同步”。
+
+先保留默认的“仅同步保活候选”范围。**“持续同步全部 Key”是可选操作**，会把该上游未保活、已忽略和已停止的 Key 也纳入首页和路由候选，并不代表这些 Key 已验证可用。
+
+### 4. 让 Codex 直接接入
+
+点击面板右上角的 **“直接接入 Codex”**。成功后，按钮会显示 **“检查接入”**。此步骤会先备份 Codex 配置，再将活动供应商指向本机 `http://127.0.0.1:10813/v1`，并配置所需认证和 Responses 协议参数；无需手工填写本地令牌。
+
+第一次接入后，重新打开或重载已打开的 Codex 会话，让它采用新配置。“检查接入”表示配置已识别为直接接入，仍需下一步确认实际请求经过该入口。
+
+### 5. 发出请求，在监控中确认结果
+
+在 Codex 中发送一条短请求，例如“只回复 OK”。这是实际上游请求，会使用你的账号额度。回到 Pool Router 的 **“请求监控”**，找到最新记录，确认结果和转发方式。
+
+列表优先显示对话名称，可以按**对话名称或 ID**搜索。点击名称可打开对应 Codex 对话；点击记录其他位置可查看请求模型、实际使用账号、每次尝试的状态和错误，以及上游报告的用量。缺少名称时显示对话 ID。
+
+对话名称只读自本机 Codex 数据库中的 `title` 或 `name`，不读取对话正文。名称缓存为 5 秒，到期后的监控刷新会重新读取，因此改名不会立即出现在面板。名称只用于显示，不写入 `records.jsonl`；无法读取时回退到 ID。
+
+### 6. 确认使用的是哪条路径
+
+以刚发出的请求记录为准。
+
+| 看到什么 | 说明 |
+| --- | --- |
+| 按钮显示“检查接入” | 当前 Codex 配置已被识别为直接接入；已有会话是否采用它仍要看新请求。 |
+| 新记录显示“号池调度” | 本次请求使用 Pool Router 当前来源中的候选账号和路由策略。 |
+| 新记录显示“旧方式监控” | 本次请求携带上游 Key，通过兼容路径转发，不从当前号池选账号。 |
+| “允许旧方式监控”已开启 | 只表示允许兼容请求，不代表当前请求就在使用旧方式。 |
+
+首次使用按上述默认直连流程即可。仍需要由 CC Switch 维护 Key 时，再阅读后面的“可选流程：兼容 CC Switch 监控”。
+
+## 常见问题
+
+### 为什么没有账号，或者某个模型没有账号？
+
+先确认 BiWrite 已启用本地密钥文件模式、供应商使用 Responses、上游地址与 Pool Router 选择的一致。再查看该模型的保活候选数和已导入数。`keptKeys` 缺失或为空时，默认不会导入该模型；历史成功时间 `keyThrough` 不能替代候选集合。在 BiWrite 对该模型运行保活后，点击“单次同步”。候选存在但导入为 0 时，还要检查 Key 是否被忽略、停止或已从当前配置移除。
+
+### 为什么首页显示全部账号，而不只是保活候选？
+
+查看同步范围是否为“全部 Key”。如果是，点击 **“仅同步保活候选”**。切换会同时更新首页和后续请求的路由候选，已有在途请求继续执行。它不会把保活候选变成实时成功保证；实际成功、失败和冷却由代理请求分别记录。
+
+### 关掉浏览器以后，怎么重新打开？
+
+Mac 打开 `~/Applications/Pool Router.app`，Windows 从开始菜单打开 **Pool Router**。浏览器只是控制面板，关闭页面不会停止后台转发。不要只手工输入本地地址，启动器会正确传递面板所需的本地认证令牌。
+
+### 怎么判断还在使用旧接入方式？
+
+发送一条新请求，在“请求监控”查看标签。“号池调度”表示当前号池路径，“旧方式监控”表示兼容路径。右上角“检查接入”反映配置状态，“允许旧方式监控”反映权限开关，两者都不能替代这条实际请求记录。想回到默认号池路径时，点击“直接接入 Codex”（已接入时显示“检查接入”），按提示重新打开会话，再用新请求确认。
+
+### 名称没显示，或者监控完全没有新记录？
+
+仅名称缺失时，仍可通过 ID 查找。程序只查询本机可读 Codex 数据库中的明确对话 ID；其他设备的对话或缺失的本地索引可能没有名称。如果新请求完全没有记录，先确认服务在线、记录已启用，以及发出请求的 Codex 会话已加载本地接入配置。此程序只监控经过本地入口的请求。
+
+## 安装与命令行参考
+
+### 旧版 ZIP 与 DMG 复现
+
+现有 v0.1.0 的 `PoolRouter-macOS-arm64.zip` 继续保留，其旧安装器仍需要 `python3` 来生成 macOS plist。新用户优先使用 DMG。使用旧 ZIP 时，解压后双击 `安装.command`，或在包根目录执行：
 
 ```bash
 bash scripts/macos-install.sh --no-build
 ```
 
-DMG 与 ZIP 包含相同的程序二进制和依赖许可证，DMG 更新了安装脚本。DMG 为只读镜像，尚未经过 Apple 公证。如果首次下载后被 macOS 阻止，请确认下载来源，在“系统设置”的“隐私与安全性”中找到对应提示，选择“仍要打开”并确认；旧版 macOS 的对应入口位于“系统偏好设置”的“安全性与隐私”。
-
-可在当前仓库中使用以下命令，从现有二进制 ZIP 复现 DMG。打包过程需要 Python 3，用户安装 DMG 时不需要。
+v0.1.0 DMG 与对应 ZIP 包含相同的程序二进制和依赖许可证，DMG 更新了安装脚本。可在当前仓库中从已有二进制 ZIP 打包 DMG；**打包需要 Python 3，安装 DMG 不需要**。
 
 ```bash
 python3 scripts/macos-package-dmg.py /path/PoolRouter-macOS-arm64.zip /path/PoolRouter-macOS-arm64.dmg
 ```
+
+### Windows 安装位置
+
+| 内容 | 位置 |
+| --- | --- |
+| 程序与启动器 | `%LOCALAPPDATA%\Programs\Pool Router` |
+| 配置、手动号池和请求记录 | `%LOCALAPPDATA%\Pool Router` |
+| 打开控制台 | 开始菜单 → Pool Router |
+| 默认 BiWrite 数据目录 | `%APPDATA%\app.biwrite.desktop` |
 
 ### 从源码构建
 
@@ -74,17 +173,9 @@ cargo build --release --locked
 | 启动器 | `~/Applications/Pool Router.app` |
 | 后台服务 | `~/Library/LaunchAgents/local.pool-router.plist` |
 
-其他系统可使用命令行构建与运行方式；当前仓库提供的后台服务安装脚本仅适用于 macOS。
+Linux 或未提供预编译包的架构可使用命令行构建与运行方式。以上 `macos-install.sh` 和 LaunchAgent 仅适用于 macOS。
 
-## 默认流程：BiWrite 与 Codex 直连
-
-1. 在 BiWrite 中配置所需上游的 Responses 供应商。启用本地密钥文件模式，使密钥存于 `keys.json`。默认只同步保活候选，使用此范围时先对所需模型运行保活。
-2. 启动 Pool Router。若 BiWrite 中只有一个符合条件的上游地址，会自动读取；存在多个地址时，在路由设置填写所需上游的 Base URL 后保存。需要包含未保活 Key 时，选择“持续同步全部 Key”。确认“来源同步”中的模型与候选数量，可按需运行账号与模型验证。验证是真实上游请求，可能消耗额度；导入本身不验证可用性。
-3. 在面板执行 Codex 直连接入，或运行：
-
-```bash
-"$HOME/Library/Application Support/Pool Router/bin/pool-router" connect
-```
+## Codex 直接接入的配置细节
 
 接入会备份 `~/.codex/config.toml`，新增独立的 `pool_router` 供应商，并切换 Codex 的活动供应商。它使用本地入口、本软件生成的本地令牌，以及以下协议设置：
 
@@ -109,7 +200,7 @@ supports_websockets = false
 | `biwrite`，默认 | 每 1.5 秒只读同步 BiWrite 的本地 `settings.json` 和 `keys.json`，无需复制 Key。 |
 | `manual` | 只使用用户在面板中添加的 Key、模型、昵称和并发配置。 |
 
-自动来源默认只导入所选上游 Responses 供应商的 `keptKeys` 候选，并排除对应供应商下被忽略或停止的密钥。面板中的“持续同步全部 Key”会立即切换到 BiWrite 来源并启用 `biwrite_import_all`，之后自动同步持续包含该上游全部 Key，包括未保活、忽略和停止的 Key。该操作不创建手动池；可随时切回“仅同步保活候选”。公开默认值为 `false`，新增账号未经实际请求验证时显示“待验证”。macOS 默认 BiWrite 目录为 `~/Library/Application Support/app.biwrite.desktop`。该适配器要求 `keysInFile` 开启，不读取系统钥匙串，也不修改 BiWrite 文件。
+自动来源默认只导入所选上游 Responses 供应商的 `keptKeys` 候选，并排除对应供应商下被忽略或停止的密钥。面板中的“持续同步全部 Key”会立即切换到 BiWrite 来源并启用 `biwrite_import_all`，之后自动同步持续包含该上游全部 Key，包括未保活、忽略和停止的 Key。该操作不创建手动池；可随时切回“仅同步保活候选”。公开默认值为 `false`，新增账号未经实际请求验证时显示“待验证”。macOS 默认 BiWrite 目录为 `~/Library/Application Support/app.biwrite.desktop`，Windows 为 `%APPDATA%\app.biwrite.desktop`。该适配器要求 `keysInFile` 开启，不读取系统钥匙串，也不修改 BiWrite 文件。
 
 面板从 BiWrite 的 `keyNames` 读取 Key 昵称，并用于账号卡片和请求记录中的账号显示。缺少可用昵称时显示匿名账号标识，不回显密钥。
 
@@ -183,6 +274,8 @@ supports_websockets = false
 
 ## 监控记录与数据边界
 
+监控接口按记录中已有的对话 UUID，只读查询本机 Codex 数据库的 `title` 或 `name`，将结果作为可空的 `conversation_title` 返回。它优先使用 `CODEX_HOME`；未设置时使用当前用户的 `.codex` 目录，Windows 支持 `USERPROFILE`。标题正、负查询结果均缓存 5 秒，到期后随监控查询更新；不读取对话正文，不向请求 JSONL 追加名称。无名称时界面和搜索继续支持原始 ID。
+
 只监控**经过本地入口**的请求，不读取其他进程的 HTTPS 流量，也不执行系统级抓包或中间人解密。默认保存最近 1000 条白名单元数据，可暂停记录而继续转发。
 
 记录另含 `gateway_actions` 网关处理动作、最后一次实际发往上游的请求体积 `upstream_request_bytes`，以及有效模型输出等待时间 `first_output_ms`。面板将会话重置与复用、压缩上下文修复、图片压缩及超时重试分别展示。有效输出耗时不使用 SSE 心跳、首包时间或累计请求耗时代替，缺失时保持未知。
@@ -191,13 +284,15 @@ supports_websockets = false
 
 面板将 `fast` 与 `priority` 放在同一服务档位组中方便查看，同时保留请求和响应的原始值。这些字段只说明请求参数或服务器声明，不能证明实际后端模型、服务档位执行情况或最终计费。
 
-日常网关日志仅保存白名单元数据，以及每次尝试中经过长度限制和脱敏的错误消息 `AttemptRecord.error_message`，不保存完整请求或成功回复正文。错误摘要用于解释具体失败，缺失时保持未知，不保存整段上游错误响应。摘要来自上游诊断文本，分享前仍应检查其中的内容。固定验证请求的有限返回文本仅用于当前页面的验证详情，与日常网关日志分开处理。BiWrite 密钥只读入内存；手动密钥存于私有文件；兼容请求的 Key 只用于该请求转发。私有配置保存本地访问令牌，接入恢复备份也可能包含原配置中的凭证。这些文件使用 `0600` 权限，不应随源码、截图或诊断包分享。
+日常网关日志仅保存白名单元数据，以及每次尝试中经过长度限制和脱敏的错误消息 `AttemptRecord.error_message`，不保存完整请求或成功回复正文。错误摘要用于解释具体失败，缺失时保持未知，不保存整段上游错误响应。摘要来自上游诊断文本，分享前仍应检查其中的内容。固定验证请求的有限返回文本仅用于当前页面的验证详情，与日常网关日志分开处理。BiWrite 密钥只读入内存；手动密钥存于私有文件；兼容请求的 Key 只用于该请求转发。私有配置保存本地访问令牌，接入恢复备份也可能包含原配置中的凭证。这些文件不应随源码、截图或诊断包分享；在 macOS 和 Linux 上创建时使用 `0600` 权限。
 
 服务仅监听回环地址，并检查 Host 和浏览器 Origin。管理接口始终要求本地令牌。兼容的真实 Key 只被模型转发接口接受，不能作为管理令牌使用。
 
 ## 维护、恢复与卸载
 
-查看脱敏状态或重新打开面板：
+更新到新版本时重新运行对应系统的安装包。Windows 可从系统设置的应用列表或开始菜单卸载 Pool Router。Windows 卸载器会先恢复本软件管理的接入配置；出现受管字段冲突时中止卸载，保留配置供处理。用户数据默认保留。
+
+以下命令和 LaunchAgent 操作适用于 macOS。查看脱敏状态或重新打开面板：
 
 ```bash
 "$HOME/Library/Application Support/Pool Router/bin/pool-router" status
@@ -232,7 +327,7 @@ launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/local.pool-router
 bash "$HOME/Library/Application Support/Pool Router/uninstall.sh"
 ```
 
-卸载不停止 CC Switch 或其他 wiretap 服务。配置、手动密钥、日志和归档恢复备份默认保留；确认恢复完成且不再需要数据后，可手动删除本软件的数据目录。不要在仍有客户端指向本地入口时直接删除程序。
+macOS 卸载脚本不停止 CC Switch 或其他 wiretap 服务。配置、手动密钥、日志和归档恢复备份默认保留；确认恢复完成且不再需要数据后，可手动删除本软件的数据目录。不要在仍有客户端指向本地入口时直接删除程序。
 
 ## 历史版本与开发
 
