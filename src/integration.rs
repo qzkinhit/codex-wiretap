@@ -19,7 +19,7 @@ const DIRECT_STRING_FIELDS: [&str; 4] =
 const DIRECT_BOOL_FIELDS: [&str; 2] = ["supports_websockets", "requires_openai_auth"];
 /// Written by connect and removed by restore, but deliberately left out of the
 /// consistency check so the user can tune the retry budget by hand.
-const DIRECT_TUNABLE_FIELDS: [&str; 1] = ["stream_max_retries"];
+const DIRECT_TUNABLE_FIELDS: [&str; 2] = ["stream_max_retries", "stream_idle_timeout_ms"];
 
 #[derive(Clone, Serialize)]
 pub struct ConnectionInfo {
@@ -317,6 +317,7 @@ pub fn connect(
     local_token: &str,
     state_dir: &Path,
     stream_retries: u32,
+    stream_idle_timeout_ms: u32,
 ) -> Result<String> {
     connect_config(
         base_url,
@@ -324,6 +325,7 @@ pub fn connect(
         state_dir,
         &codex_config_path()?,
         stream_retries,
+        stream_idle_timeout_ms,
     )
 }
 
@@ -335,6 +337,7 @@ fn connect_at(base_url: &str, local_token: &str, state_dir: &Path, home: &Path) 
         state_dir,
         &home.join(".codex/config.toml"),
         15,
+        600_000,
     )
 }
 
@@ -344,6 +347,7 @@ fn connect_config(
     state_dir: &Path,
     path: &Path,
     stream_retries: u32,
+    stream_idle_timeout_ms: u32,
 ) -> Result<String> {
     validate_target(base_url)?;
     ensure!(
@@ -452,6 +456,12 @@ fn connect_config(
     // Codex retries a broken stream on its own. Matching the pool's retry budget
     // keeps the two layers consistent instead of leaving Codex on its default.
     table["stream_max_retries"] = value(i64::from(stream_retries));
+    // Codex gives up on a quiet stream after its own default, which is shorter
+    // than a high reasoning effort takes to produce its first token. Measured
+    // on this upstream, requests were cut at exactly 300s with nothing served.
+    // Matching the pool's own queue budget lets the retries here run their
+    // course instead of the client abandoning them first.
+    table["stream_idle_timeout_ms"] = value(i64::from(stream_idle_timeout_ms));
     providers.insert(PROVIDER, Item::Table(table));
     doc["model_provider"] = value(PROVIDER);
     write_agent_defaults(&mut doc);
@@ -1228,7 +1238,15 @@ mod tests {
         fs::create_dir_all(selected_path.parent().unwrap()).unwrap();
         fs::write(&selected_path, &original).unwrap();
 
-        connect_config(TARGET, "local-test-token", &state, &selected_path, 15).unwrap();
+        connect_config(
+            TARGET,
+            "local-test-token",
+            &state,
+            &selected_path,
+            15,
+            600_000,
+        )
+        .unwrap();
         assert!(inspect_config(TARGET, &selected_path).unwrap().configured);
         assert!(!inspect_config(TARGET, &default_path).unwrap().configured);
         assert_eq!(fs::read(&default_path).unwrap(), original);
@@ -1588,7 +1606,8 @@ mod tests {
         let path = dir.path().join(".codex/config.toml");
         let mut doc = document(&fs::read_to_string(&path).unwrap()).unwrap();
         doc["user_added"] = value(true);
-        doc["model_providers"][PROVIDER]["stream_idle_timeout_ms"] = value(123_456);
+        // A field this software never writes, so restore must leave it alone.
+        doc["model_providers"][PROVIDER]["websocket_connect_timeout_ms"] = value(123_456);
         fs::write(&path, doc.to_string()).unwrap();
         let before = fs::read(&path).unwrap();
         connect_at(TARGET, "local-token", &state, dir.path()).unwrap();
@@ -1599,7 +1618,7 @@ mod tests {
         assert_eq!(doc["model_provider"].as_str(), Some("custom"));
         assert_eq!(doc["user_added"].as_bool(), Some(true));
         assert_eq!(
-            doc["model_providers"][PROVIDER]["stream_idle_timeout_ms"].as_integer(),
+            doc["model_providers"][PROVIDER]["websocket_connect_timeout_ms"].as_integer(),
             Some(123_456)
         );
         assert!(doc["model_providers"][PROVIDER].get("base_url").is_none());

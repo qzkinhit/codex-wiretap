@@ -72,6 +72,7 @@ async fn run() -> Result<()> {
                         .parent()
                         .ok_or_else(|| anyhow::anyhow!("配置目录无效"))?,
                     u32::try_from(cfg.max_attempts.saturating_sub(1).max(1)).unwrap_or(15),
+                    u32::try_from(cfg.queue_timeout_ms).unwrap_or(600_000),
                 )?
             );
         }

@@ -2,6 +2,7 @@ use crate::{biwrite, types::RoutingPolicy};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::{
     fs,
     io::Write,
@@ -35,6 +36,24 @@ pub struct Config {
     pub poll_interval_ms: u64,
     pub policy: RoutingPolicy,
     pub model_override: Option<String>,
+    /// Requested model -> ordered substitutes, used when the pool carries no
+    /// account for the requested one. The first substitute the pool can serve
+    /// wins, so a dead primary does not take the request down with it.
+    pub model_aliases: BTreeMap<String, Vec<String>>,
+    pub model_aliases_enabled: bool,
+    /// Move to another account when the upstream's first streamed event names a
+    /// shallower model or reasoning tier than the request asked for. Zero
+    /// disables it. Bounded separately from the retry budget because a pool
+    /// where every account downgrades must still answer.
+    pub downgrade_retries: u32,
+    /// After this many consecutive failed requests in one conversation, put a
+    /// prompt on the clipboard that lets the user pick the work back up.
+    /// Zero disables it.
+    pub continuation_after_failures: u32,
+    /// "new_window" asks the agent to carry on in a fresh conversation and
+    /// names the thread to read; "current_window" only says to continue,
+    /// because the thread is already open.
+    pub continuation_mode: String,
     pub reasoning_override: Option<String>,
     /// Total upstream attempts, including the first request. The UI exposes retries.
     pub max_attempts: usize,
@@ -72,6 +91,16 @@ impl Default for Config {
             poll_interval_ms: 1500,
             policy: RoutingPolicy::default(),
             model_override: None,
+            // The upstream this software is tested against answers 404 for
+            // gpt-6-luna, which Codex requests once per new conversation.
+            model_aliases: BTreeMap::from([(
+                "gpt-6-luna".to_owned(),
+                vec!["gpt-6.1-sol".to_owned(), "gpt-6-astra".to_owned()],
+            )]),
+            model_aliases_enabled: false,
+            downgrade_retries: 2,
+            continuation_after_failures: 0,
+            continuation_mode: "new_window".to_owned(),
             reasoning_override: None,
             max_attempts: 16,
             queue_timeout_ms: 600_000,
@@ -114,6 +143,39 @@ impl Config {
             || !(10..=10_000).contains(&self.record_limit)
         {
             bail!("时间、重试次数、记录数量或请求大小超出允许范围");
+        }
+        if self.continuation_after_failures > 100 {
+            bail!("持续模式的失败次数超出允许范围");
+        }
+        if !matches!(
+            self.continuation_mode.as_str(),
+            "new_window" | "current_window"
+        ) {
+            bail!("持续模式的目标窗口无效");
+        }
+        if self.downgrade_retries > 8 {
+            bail!("降级重试次数超出允许范围");
+        }
+        if self.model_aliases.len() > 32 {
+            bail!("模型别名条目过多");
+        }
+        let valid = |name: &str| {
+            !name.is_empty()
+                && name.len() <= 100
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._:/-".contains(c))
+        };
+        for (from, targets) in &self.model_aliases {
+            if !valid(from) || targets.is_empty() || targets.len() > 8 {
+                bail!("模型别名的来源或候选数量无效");
+            }
+            if targets
+                .iter()
+                .any(|target| !valid(target) || target == from)
+            {
+                bail!("模型别名的候选无效或指向自身");
+            }
         }
         if !(1..=64).contains(&self.policy.max_concurrency_per_key)
             || self
@@ -177,7 +239,7 @@ impl Config {
         }
     }
     pub fn public(&self) -> Value {
-        serde_json::json!({"source_mode":self.source_mode,"upstream_base_url":self.upstream_base_url,"legacy_monitor_enabled":self.legacy_monitor_enabled,"policy":self.policy,"model_override":self.model_override,
+        serde_json::json!({"source_mode":self.source_mode,"upstream_base_url":self.upstream_base_url,"legacy_monitor_enabled":self.legacy_monitor_enabled,"policy":self.policy,"model_override":self.model_override,"model_aliases":self.model_aliases,"model_aliases_enabled":self.model_aliases_enabled,"downgrade_retries":self.downgrade_retries,"continuation_after_failures":self.continuation_after_failures,"continuation_mode":self.continuation_mode,
             "biwrite_import_all":self.biwrite_import_all,"sync_paused":self.sync_paused,
             "session_recovery_enabled":self.session_recovery_enabled,"compaction_repair_enabled":self.compaction_repair_enabled,
             "compress_images":self.compress_images,"first_output_timeout_ms":self.first_output_timeout_ms,

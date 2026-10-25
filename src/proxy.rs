@@ -93,6 +93,13 @@ pub struct Counters {
     waiting_streams: AtomicU64,
 }
 
+#[derive(Default)]
+pub struct ContinuationState {
+    pub streak: HashMap<String, u32>,
+    /// What to paste, and which conversation it came from.
+    pub prompt: Option<(String, String)>,
+}
+
 pub struct AppState {
     pub config: RwLock<Config>,
     pub config_path: PathBuf,
@@ -104,6 +111,9 @@ pub struct AppState {
     pub usage: usage::Ledger,
     /// Local display metadata only. Titles never enter the persisted request log.
     pub conversations: Arc<ConversationIndex>,
+    /// Consecutive failures per conversation, and the prompt offered once a
+    /// conversation has failed enough times for the client to have given up.
+    pub continuation: RwLock<ContinuationState>,
     pub updates: UpdateService,
     pub source: RwLock<SourceState>,
     pub sync: RwLock<SyncState>,
@@ -167,6 +177,7 @@ impl AppState {
             records,
             usage,
             conversations: Arc::new(ConversationIndex::from_environment()),
+            continuation: RwLock::new(ContinuationState::default()),
             updates,
             source: RwLock::new(SourceState::default()),
             sync: RwLock::new(SyncState::default()),
@@ -651,7 +662,7 @@ async fn api_state(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(
         json!({"version":env!("CARGO_PKG_VERSION"),"uptime_seconds":state.started.elapsed().as_secs(),
         "source":state.source.read().unwrap_or_else(|e|e.into_inner()).clone(),"sync":state.sync.read().unwrap_or_else(|e|e.into_inner()).clone(),"accounts":accounts,"models":models,"config":cfg.public(),
-        "connection":connection,"stats":{"requests":state.counters.requests.load(Ordering::Relaxed),"successes":state.counters.successes.load(Ordering::Relaxed),"failures":state.counters.failures.load(Ordering::Relaxed),"unassigned":state.counters.unassigned.load(Ordering::Relaxed),"active":state.counters.active.load(Ordering::Relaxed),"waiting_streams":state.counters.waiting_streams.load(Ordering::Relaxed)}}),
+        "connection":connection,"continuation":state.continuation.read().unwrap_or_else(|e|e.into_inner()).prompt.as_ref().map(|(id,text)|json!({"conversation_id":id,"prompt":text})),"stats":{"requests":state.counters.requests.load(Ordering::Relaxed),"successes":state.counters.successes.load(Ordering::Relaxed),"failures":state.counters.failures.load(Ordering::Relaxed),"unassigned":state.counters.unassigned.load(Ordering::Relaxed),"active":state.counters.active.load(Ordering::Relaxed),"waiting_streams":state.counters.waiting_streams.load(Ordering::Relaxed)}}),
     )
 }
 /// Read-only view of the two files that decide behaviour, with every
@@ -1089,6 +1100,7 @@ async fn api_connect(State(s): State<Arc<AppState>>) -> Response {
             &cfg.local_token,
             &dir,
             u32::try_from(cfg.max_attempts.saturating_sub(1).max(1)).unwrap_or(15),
+            u32::try_from(cfg.queue_timeout_ms).unwrap_or(600_000),
         )
     })
     .await
@@ -1722,12 +1734,149 @@ impl Drop for RequestGuard {
         } else {
             self.state.counters.failures.fetch_add(1, Ordering::Relaxed);
         }
+        // A conversation that keeps failing has usually exhausted the client's
+        // own retries too, leaving the user with a dead turn and no thread id
+        // at hand. Count the streak here so every way a request can end feeds
+        // it, and offer the prompt that resumes the work.
+        let settings = self.state.settings();
+        if settings.continuation_after_failures > 0
+            && let Some(conversation) = self.record.conversation_id.clone()
+        {
+            let completed = self.record.outcome == "completed";
+            let mut state = self
+                .state
+                .continuation
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            if completed {
+                state.streak.remove(&conversation);
+                if state
+                    .prompt
+                    .as_ref()
+                    .is_some_and(|(id, _)| id == &conversation)
+                {
+                    state.prompt = None;
+                }
+            } else {
+                let streak = state.streak.entry(conversation.clone()).or_default();
+                *streak = streak.saturating_add(1);
+                if *streak >= settings.continuation_after_failures
+                    && let Some(text) =
+                        continuation_prompt(&settings.continuation_mode, Some(&conversation))
+                {
+                    state.prompt = Some((conversation, text));
+                }
+                // Bound the map so a long session cannot grow it without end.
+                if state.streak.len() > 512 {
+                    state.streak.clear();
+                }
+            }
+        }
         // Accounting is independent of the monitor: turning request logging off
         // hides the details, not the daily totals.
         self.state.usage.record(&self.record);
         if self.recording {
             let _ = self.state.records.record(self.record.clone());
         }
+    }
+}
+
+/// Higher reasoning effort takes measurably longer to produce its first
+/// meaningful token, so one fixed deadline either kills healthy slow requests
+/// or lets dead ones linger. Measured on a live pool over 583 completed
+/// requests: the 99th percentile of time to first output was 90s at low, 195s
+/// at high and 270s at xhigh. The base covers low, and the higher tiers scale
+/// from it. A stream that sends nothing at all is still cut by the idle
+/// timeout, which is independent of this.
+fn first_output_budget(base_ms: u64, effort: Option<&str>) -> u64 {
+    let scaled = match effort.unwrap_or("").to_ascii_lowercase().as_str() {
+        "minimal" | "low" => base_ms,
+        "high" => base_ms.saturating_mul(2),
+        "xhigh" | "max" | "ultra" => base_ms.saturating_mul(5) / 2,
+        // Unspecified or medium sits between low and high.
+        _ => base_ms.saturating_mul(3) / 2,
+    };
+    scaled.min(600_000)
+}
+
+/// A failure that every account in the pool will hit the same way, because it
+/// is the model or the relay that is unavailable rather than one key. Walking
+/// the pool for these only spends the retry budget, so the whole model waits.
+/// Matching is on the upstream's own wording; anything unrecognized keeps the
+/// existing per-account behaviour.
+fn pool_wide_failure(status: Option<u16>, message: Option<&str>) -> bool {
+    let Some(status) = status else { return false };
+    if !(500..=599).contains(&status) {
+        return false;
+    }
+    // A bare 5xx is ambiguous: it can be one account's own transient failure,
+    // which the next account may well survive. Only the upstream's own wording
+    // for "the model or my own upstream is unavailable" is treated as shared,
+    // so an unrecognized error keeps the ordinary per-account retry path.
+    let message = message.unwrap_or("").to_ascii_lowercase();
+    const SHARED_OUTAGE: [&str; 7] = [
+        "负载已经达到上限",
+        "负载已达上限",
+        "当前模型负载",
+        "请求上游地址失败",
+        "overloaded",
+        "at capacity",
+        "bad response status code 50",
+    ];
+    SHARED_OUTAGE.iter().any(|needle| message.contains(needle))
+}
+
+/// Reasoning tiers in increasing order of depth, so a response can be compared
+/// with what was asked for. Unknown names rank as unknown and never trigger a
+/// downgrade verdict.
+fn effort_rank(effort: &str) -> Option<u8> {
+    match effort.to_ascii_lowercase().as_str() {
+        "minimal" | "none" => Some(0),
+        "low" => Some(1),
+        "medium" => Some(2),
+        "high" => Some(3),
+        "xhigh" | "max" | "ultra" => Some(4),
+        _ => None,
+    }
+}
+
+/// Whether the upstream answered with a shallower model or reasoning tier than
+/// the request asked for. The first streamed event already carries the model
+/// and effort the upstream committed to, so this is decided before any content
+/// reaches the client and the attempt can still move to another account.
+fn served_below_request(
+    requested_model: &str,
+    requested_effort: Option<&str>,
+    served_model: Option<&str>,
+    served_effort: Option<&str>,
+) -> bool {
+    if let Some(served) = served_model
+        && !served.is_empty()
+        && !served.eq_ignore_ascii_case(requested_model)
+    {
+        return true;
+    }
+    let (Some(asked), Some(served)) = (
+        requested_effort.and_then(effort_rank),
+        served_effort.and_then(effort_rank),
+    ) else {
+        return false;
+    };
+    served < asked
+}
+
+/// The prompt that picks a conversation back up after the client has given up.
+/// In a fresh conversation the agent has no context, so the thread is named and
+/// the target window is stated; without that it reads the link and assumes it
+/// should carry on in the old thread. In the thread itself the link would be
+/// redundant, so only the instruction remains.
+fn continuation_prompt(mode: &str, conversation_id: Option<&str>) -> Option<String> {
+    match mode {
+        "current_window" => Some("继续".to_owned()),
+        "new_window" => conversation_id
+            .filter(|id| !id.is_empty())
+            .map(|id| format!("codex://threads/{id} 继续这个，在新窗口做")),
+        _ => None,
     }
 }
 
@@ -2149,7 +2298,7 @@ async fn run_proxy_inner(
     } else {
         &state.scheduler
     };
-    let effective_model = if probe {
+    let mut effective_model = if probe {
         requested_model.clone()
     } else {
         initial
@@ -2165,6 +2314,34 @@ async fn run_proxy_inner(
             .clone()
             .or_else(|| requested_effort.clone())
     };
+    // A client may ask for a model this upstream does not carry at all. Rather
+    // than fail the request, fall through the configured substitutes and take
+    // the first one the pool can serve right now, so a dead primary does not
+    // decide the outcome. Probes keep the model they were asked to check.
+    let aliased_from = if probe || !initial.model_aliases_enabled {
+        None
+    } else {
+        initial
+            .model_aliases
+            .get(&effective_model)
+            .filter(|_| {
+                !state
+                    .scheduler
+                    .can_serve_model(&effective_model, &initial.policy)
+            })
+            .and_then(|targets| {
+                targets
+                    .iter()
+                    .find(|target| state.scheduler.can_serve_model(target, &initial.policy))
+                    .cloned()
+            })
+    };
+    if let Some(target) = &aliased_from {
+        effective_model = target.clone();
+    }
+    // Captured before the value is moved; the retry loop sizes each attempt's
+    // first-output budget from it.
+    let effort_for_budget = effective_effort.clone();
     let previous = body["previous_response_id"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -2251,6 +2428,9 @@ async fn run_proxy_inner(
     };
     let mut guard = RequestGuard::new(state.clone(), record, initial.recording_enabled);
     guard.scheduler = scheduler.clone();
+    if aliased_from.is_some() {
+        guard.action("model_alias", 0, 1);
+    }
     if let Some(summary) = image_summary
         && summary.count > 0
     {
@@ -2273,6 +2453,9 @@ async fn run_proxy_inner(
     let max_attempts = if probe { 1 } else { initial.max_attempts };
     let mut attempt_count = 0usize;
     let mut recovery_state = RequestRecovery::default();
+    let mut downgrade_retries_left = initial.downgrade_retries;
+    let mut judged_attempts = 0usize;
+    let mut pool_wide_failures = 0usize;
     let mut retry_same_key: Option<String> = None;
     'attempts: loop {
         let cfg = state.settings();
@@ -2288,6 +2471,51 @@ async fn run_proxy_inner(
                 .insert("retry-after", HeaderValue::from_static("2"));
             return r;
         }
+        // The previous attempt's verdict decides whether another account is even
+        // worth trying. This sits ahead of acquisition so every failure branch
+        // feeds it without each having to remember to.
+        // Only ever judge a given attempt once. Paths that loop without adding
+        // an attempt record would otherwise re-judge the same failure and back
+        // off again on every pass, spending the whole deadline on waiting.
+        if guard.record.attempts.len() > judged_attempts
+            && let Some(last) = guard.record.attempts.last()
+            && pool_wide_failure(last.status, last.error_message.as_deref())
+        {
+            // Retrying past a few rounds cannot help while the model itself is
+            // unavailable, and the caller gives up long before this request's
+            // own deadline. Say so quickly instead of holding the connection.
+            const GIVE_UP_AFTER: usize = 3;
+            pool_wide_failures += 1;
+            if pool_wide_failures >= GIVE_UP_AFTER {
+                let detail = guard
+                    .record
+                    .attempts
+                    .last()
+                    .and_then(|attempt| attempt.error_message.clone())
+                    .unwrap_or_else(|| "上游未给出原因".to_owned());
+                guard.record.status = Some(503);
+                guard.finish("model_unavailable");
+                let mut response = guard.error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "model_unavailable",
+                    &format!(
+                        "{effective_model} 在上游侧整体不可用，号池里每个账号都得到同样结果，已停止重试。上游原因：{detail}"
+                    ),
+                );
+                response
+                    .headers_mut()
+                    .insert("retry-after", HeaderValue::from_static("30"));
+                return response;
+            }
+            let delay = scheduler.cool_model(&effective_model);
+            guard.action("model_backoff", attempt_count, 1);
+            let wait = Duration::from_millis(delay)
+                .min(deadline.saturating_duration_since(Instant::now()));
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
+        }
+        judged_attempts = guard.record.attempts.len();
         let mut attempt_selection = selection.clone();
         if let Some(key) = &retry_same_key {
             attempt_selection.explicit_key = Some(key.clone());
@@ -2351,9 +2579,13 @@ async fn run_proxy_inner(
             }
         };
         attempt_count += 1;
+        let mut downgraded_on_this_attempt = false;
         let attempt_started = Instant::now();
-        let first_output_deadline =
-            attempt_started + Duration::from_millis(cfg.first_output_timeout_ms);
+        let first_output_deadline = attempt_started
+            + Duration::from_millis(first_output_budget(
+                cfg.first_output_timeout_ms,
+                effort_for_budget.as_deref(),
+            ));
         let key = lease.account.id.clone();
         guard.record.key_id = Some(key.clone());
         let scope = session_scope(
@@ -2812,6 +3044,23 @@ async fn run_proxy_inner(
                             .first_output_ms
                             .get_or_insert(guard.started.elapsed().as_millis() as u64);
                     }
+                    // The upstream has named the model and tier it will use and
+                    // nothing has reached the client yet, so a downgrade can
+                    // still be answered by moving to another account.
+                    // Still inside the prelude, which is forwarded only after
+                    // this loop ends, so nothing has reached the client yet even
+                    // once content has arrived from the upstream.
+                    if downgrade_retries_left > 0
+                        && served_below_request(
+                            &effective_model,
+                            effort_for_budget.as_deref(),
+                            o.model.as_deref(),
+                            o.effort.as_deref(),
+                        )
+                    {
+                        downgraded_on_this_attempt = true;
+                        break;
+                    }
                     if o.meaningful_output || o.terminal || prelude_size >= 256 * 1024 {
                         break;
                     }
@@ -2874,6 +3123,24 @@ async fn run_proxy_inner(
             }
         }
         let observation = observer.observation().clone();
+        // Nothing has been forwarded yet, so the shallow answer can be dropped
+        // and another account asked. The account is excluded for this request
+        // only; its record is what steers later selection.
+        if downgraded_on_this_attempt {
+            downgrade_retries_left = downgrade_retries_left.saturating_sub(1);
+            scheduler.note_depth(&key, &effective_model, true);
+            guard.record.attempts.push(AttemptRecord {
+                error_message: None,
+                key_id: key.clone(),
+                status: Some(status.as_u16()),
+                reason: "served_below_request".into(),
+                duration_ms: attempt_started.elapsed().as_millis() as u64,
+            });
+            guard.action("downgrade_retry", attempt_count, 1);
+            guard.record.effort_mismatch = observation.effort.clone();
+            selection.exclude.insert(key.clone());
+            continue 'attempts;
+        }
         if observation.terminal {
             ended = true;
         }
@@ -2971,7 +3238,12 @@ async fn run_proxy_inner(
             let completed=final_observation.completed && final_observation.error_code.is_none() && !transport_failed;
             let reason=if completed{"completed"}else if output_timed_out{"first_output_timeout"}else{final_observation.error_code.as_deref().unwrap_or("incomplete_stream")};
             record_guard.set_probe_upstream(Some(status.as_u16()),if completed{None}else{Some(final_observation.error_code.clone().unwrap_or_else(||reason.to_owned()))});
-            if completed {response_scheduler.mark_success(&key,&effective_model);}else{response_scheduler.mark_failure(&key,&effective_model,Some(health_status(status.as_u16(),final_observation)),retry_delay,reason,&policy);}
+            if completed {
+                // A completed answer that kept the requested tier is the
+                // evidence that makes this account preferred later.
+                response_scheduler.note_depth(&key,&effective_model,false);
+                response_scheduler.mark_success(&key,&effective_model);
+            }else{response_scheduler.mark_failure(&key,&effective_model,Some(health_status(status.as_u16(),final_observation)),retry_delay,reason,&policy);}
             let error_message=observed_error_message(&state,final_observation,&[cfg.local_token.as_str(),_lease.account.secret.as_ref()]);
             record_guard.record.attempts.push(AttemptRecord{error_message,key_id:key,status:Some(status.as_u16()),reason:reason.into(),duration_ms:attempt_started.elapsed().as_millis() as u64});
             record_guard.finish(if completed{"completed"}else{"upstream_failed"});
@@ -3212,5 +3484,168 @@ mod probe_tests {
         assert_eq!(filtered.providers[0].imported_keys, 0);
         assert_eq!(filtered.providers[1].imported_keys, 1);
         assert!(filtered.providers.iter().all(|p| p.kept_keys == 2));
+    }
+}
+
+#[cfg(test)]
+mod adaptive_tests {
+    use super::{
+        continuation_prompt, effort_rank, first_output_budget, pool_wide_failure,
+        served_below_request,
+    };
+
+    #[test]
+    fn the_first_output_budget_follows_the_measured_cost_of_each_effort() {
+        // Measured 99th percentiles on a live pool: 90s at low, 195s at high,
+        // 270s at xhigh. Each tier's budget has to clear its own percentile.
+        let base = 120_000;
+        assert_eq!(first_output_budget(base, Some("low")), 120_000);
+        assert_eq!(first_output_budget(base, Some("minimal")), 120_000);
+        assert_eq!(first_output_budget(base, None), 180_000);
+        assert_eq!(first_output_budget(base, Some("medium")), 180_000);
+        assert!(first_output_budget(base, Some("high")) >= 195_000);
+        assert!(first_output_budget(base, Some("xhigh")) >= 270_000);
+        // Codex sends xhigh; the upstream reports it back as max, and a user
+        // may write ultra in the client configuration.
+        assert_eq!(
+            first_output_budget(base, Some("XHigh")),
+            first_output_budget(base, Some("max"))
+        );
+        assert_eq!(
+            first_output_budget(base, Some("ultra")),
+            first_output_budget(base, Some("xhigh"))
+        );
+        // An operator who shortens the base still gets the same ordering.
+        assert!(
+            first_output_budget(20_000, Some("low")) < first_output_budget(20_000, Some("high"))
+        );
+        assert!(first_output_budget(10_000_000, Some("xhigh")) <= 600_000);
+    }
+
+    #[test]
+    fn the_resume_prompt_states_where_to_carry_on() {
+        // A fresh conversation has no context, so it needs the thread and an
+        // explicit target; without the target the agent assumes the old window.
+        let new_window =
+            continuation_prompt("new_window", Some("01a172ca-b722-7940-bd8b")).unwrap();
+        assert!(new_window.starts_with("codex://threads/01a172ca-b722-7940-bd8b"));
+        assert!(new_window.contains("在新窗口做"));
+
+        // Inside the thread the link would say nothing the agent does not have.
+        let current = continuation_prompt("current_window", Some("01a172ca")).unwrap();
+        assert_eq!(current, "继续");
+        assert_eq!(
+            continuation_prompt("current_window", None).as_deref(),
+            Some("继续")
+        );
+
+        // Without a conversation there is no thread to name, so no prompt.
+        assert_eq!(continuation_prompt("new_window", None), None);
+        assert_eq!(continuation_prompt("new_window", Some("")), None);
+        assert_eq!(continuation_prompt("unknown_mode", Some("01a1")), None);
+    }
+
+    #[test]
+    fn a_shallower_model_or_tier_than_was_asked_for_counts_as_a_downgrade() {
+        // Codex asks for xhigh; the upstream reports the same tier as max.
+        assert!(!served_below_request(
+            "gpt-6.1-sol",
+            Some("xhigh"),
+            Some("gpt-6.1-sol"),
+            Some("max")
+        ));
+        assert_eq!(effort_rank("xhigh"), effort_rank("max"));
+        // The reported tier is below what was asked for.
+        assert!(served_below_request(
+            "gpt-6.1-sol",
+            Some("xhigh"),
+            Some("gpt-6.1-sol"),
+            Some("low")
+        ));
+        assert!(served_below_request(
+            "gpt-6.1-sol",
+            Some("high"),
+            Some("gpt-6.1-sol"),
+            Some("medium")
+        ));
+        // A different model entirely, which is the case the upstream is
+        // reported to serve quietly.
+        assert!(served_below_request(
+            "gpt-6.1-sol",
+            Some("xhigh"),
+            Some("gpt-5.5"),
+            Some("max")
+        ));
+        // Above what was asked for is not a downgrade.
+        assert!(!served_below_request(
+            "gpt-6.1-sol",
+            Some("low"),
+            Some("gpt-6.1-sol"),
+            Some("high")
+        ));
+        // Nothing reported yet, or a name this build does not know, must never
+        // throw away a working answer.
+        assert!(!served_below_request(
+            "gpt-6.1-sol",
+            Some("xhigh"),
+            None,
+            None
+        ));
+        assert!(!served_below_request(
+            "gpt-6.1-sol",
+            Some("xhigh"),
+            Some("gpt-6.1-sol"),
+            Some("experimental-tier")
+        ));
+        assert!(!served_below_request(
+            "gpt-6.1-sol",
+            None,
+            Some("gpt-6.1-sol"),
+            Some("low")
+        ));
+        // Case differences in the model name are not a downgrade.
+        assert!(!served_below_request(
+            "GPT-6.1-Sol",
+            Some("high"),
+            Some("gpt-6.1-sol"),
+            Some("high")
+        ));
+    }
+
+    #[test]
+    fn only_failures_every_account_would_share_hold_back_the_whole_model() {
+        // The relay could not reach its own upstream, so no key of ours helps.
+        assert!(pool_wide_failure(
+            Some(503),
+            Some("bad response status code 503")
+        ));
+        assert!(pool_wide_failure(
+            Some(502),
+            Some("bad response status code 502")
+        ));
+        // A bare 5xx stays ambiguous: it can be one account's own transient
+        // failure, so it keeps the per-account retry path and the documented
+        // retry budget still applies to it.
+        assert!(!pool_wide_failure(Some(502), None));
+        assert!(!pool_wide_failure(Some(503), None));
+        assert!(!pool_wide_failure(Some(504), None));
+        // The model itself is at capacity, reported as a 500 with its own text.
+        assert!(pool_wide_failure(
+            Some(500),
+            Some("当前模型 gpt-6.1-sol 负载已经达到上限，请稍后重试")
+        ));
+        assert!(pool_wide_failure(Some(500), Some("请求上游地址失败")));
+        assert!(pool_wide_failure(
+            Some(500),
+            Some("The model is Overloaded")
+        ));
+
+        // One account's own problem must still move to the next account.
+        assert!(!pool_wide_failure(Some(401), Some("invalid api key")));
+        assert!(!pool_wide_failure(Some(403), Some("无权限")));
+        assert!(!pool_wide_failure(Some(429), Some("rate limit")));
+        assert!(!pool_wide_failure(Some(500), Some("internal error")));
+        assert!(!pool_wide_failure(Some(500), None));
+        assert!(!pool_wide_failure(None, Some("负载已经达到上限")));
     }
 }

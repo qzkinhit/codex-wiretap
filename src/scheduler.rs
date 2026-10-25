@@ -23,6 +23,16 @@ struct State {
     conversations: HashMap<(String, String), Binding>,
     responses: HashMap<String, Binding>,
     round_robin: usize,
+    /// Upstreams that limit a model rather than an account reject every key the
+    /// same way, so trying the next account only burns the retry budget. The
+    /// model waits as a whole instead.
+    model_backoff: HashMap<String, ModelBackoff>,
+}
+
+#[derive(Default)]
+struct ModelBackoff {
+    until_ms: u64,
+    consecutive: u32,
 }
 
 struct Entry {
@@ -35,6 +45,12 @@ struct Entry {
 struct ModelState {
     in_flight: u32,
     cooldown_until_ms: u64,
+    /// Substantive answers served, and how many of those carried no reasoning
+    /// at all although the response declared a reasoning tier. An upstream that
+    /// quietly serves a cheaper model shows up here; one account's rate is only
+    /// meaningful against the others, so selection compares rather than judges.
+    substantive: u32,
+    shallow: u32,
     last_ok_ms: Option<u64>,
     last_error: Option<String>,
     successes: u64,
@@ -283,6 +299,49 @@ impl Scheduler {
         })
     }
 
+    /// Record how much reasoning a completed response actually carried, for
+    /// responses substantial enough that the absence of any reasoning is
+    /// informative. Short answers legitimately skip reasoning and are not
+    /// counted either way.
+    pub fn note_depth(&self, id: &str, model: &str, shallow: bool) {
+        if let Some(entry) = self
+            .lock()
+            .accounts
+            .get_mut(id)
+            .and_then(|entry| entry.model_states.get_mut(model))
+        {
+            entry.substantive = entry.substantive.saturating_add(1);
+            if shallow {
+                entry.shallow = entry.shallow.saturating_add(1);
+            }
+        }
+    }
+
+    /// Whether any enabled account currently carries this model and is not
+    /// held back by a model-wide rate limit. Used to pick an alias target that
+    /// the pool can actually serve, so this deliberately ignores momentary
+    /// concurrency, which clears on its own.
+    pub fn can_serve_model(&self, model: &str, policy: &RoutingPolicy) -> bool {
+        let now = now_ms();
+        let state = self.lock();
+        if state
+            .model_backoff
+            .get(model)
+            .is_some_and(|backoff| backoff.until_ms > now)
+        {
+            return false;
+        }
+        state.accounts.values().any(|entry| {
+            entry.present
+                && enabled(entry, policy)
+                && entry.account.models.iter().any(|item| item == model)
+                && entry
+                    .model_states
+                    .get(model)
+                    .is_some_and(|runtime| runtime.cooldown_until_ms <= now)
+        })
+    }
+
     pub fn adopt_probe_health(&self, source: &Scheduler, pairs: &[(String, String, String)]) {
         let source = source.lock();
         let updates: Vec<(String, String, String, ModelState)> = pairs
@@ -361,6 +420,17 @@ impl Scheduler {
             return Err(SelectError::NoEligible);
         }
 
+        // A model the upstream is rate limiting as a whole waits instead of
+        // walking the pool. Busy makes the caller wait without spending an
+        // attempt, which is what the retry budget should be saved for.
+        if state
+            .model_backoff
+            .get(&selection.model)
+            .is_some_and(|backoff| backoff.until_ms > now)
+        {
+            return Err(SelectError::Busy);
+        }
+
         let chosen = if let Some(id) = &hard_key {
             let entry = state
                 .accounts
@@ -394,6 +464,28 @@ impl Scheduler {
                 return Err(SelectError::Busy);
             }
             available.sort();
+            // Accounts with a track record of answering below the requested
+            // tier go last. A minimum sample keeps one unlucky response from
+            // moving an account, and the split never empties the candidate
+            // list: if every account is marked, the original order stands.
+            const MIN_SAMPLE: u32 = 8;
+            const SHALLOW_SHARE: u32 = 2;
+            let shallow_marked = |id: &String| {
+                state.accounts[id]
+                    .model_states
+                    .get(&selection.model)
+                    .is_some_and(|runtime| {
+                        runtime.substantive >= MIN_SAMPLE
+                            && runtime.shallow.saturating_mul(SHALLOW_SHARE) >= runtime.substantive
+                    })
+            };
+            let (full_depth, shallow): (Vec<String>, Vec<String>) = available
+                .iter()
+                .cloned()
+                .partition(|id| !shallow_marked(id));
+            if !full_depth.is_empty() && !shallow.is_empty() {
+                available = full_depth;
+            }
             match policy.strategy {
                 Strategy::Random => available[random_index(available.len())].clone(),
                 Strategy::RoundRobin => {
@@ -500,8 +592,10 @@ impl Scheduler {
     }
 
     pub fn mark_success(&self, id: &str, model: &str) {
-        if let Some(entry) = self
-            .lock()
+        let mut state = self.lock();
+        // The model answered, so a model-wide hold no longer applies.
+        state.model_backoff.remove(model);
+        if let Some(entry) = state
             .accounts
             .get_mut(id)
             .and_then(|entry| entry.model_states.get_mut(model))
@@ -517,7 +611,35 @@ impl Scheduler {
                 entry.cooldown_until_ms = 0;
             }
         }
+        drop(state);
         self.signal();
+    }
+
+    /// Hold back every account for one model after the upstream reported that
+    /// the model itself is at capacity. Returns the delay actually applied.
+    pub fn cool_model(&self, model: &str) -> u64 {
+        const BASE_MS: u64 = 2_000;
+        const MAX_MS: u64 = 30_000;
+        let mut state = self.lock();
+        let backoff = state.model_backoff.entry(model.to_owned()).or_default();
+        backoff.consecutive = backoff.consecutive.saturating_add(1);
+        let delay = BASE_MS
+            .saturating_mul(1u64 << backoff.consecutive.saturating_sub(1).min(5))
+            .min(MAX_MS);
+        backoff.until_ms = backoff.until_ms.max(now_ms().saturating_add(delay));
+        drop(state);
+        self.signal();
+        delay
+    }
+
+    /// Milliseconds a model-wide hold still has to run, for the dashboard.
+    pub fn model_backoff_remaining(&self, model: &str) -> u64 {
+        let now = now_ms();
+        self.lock()
+            .model_backoff
+            .get(model)
+            .map(|backoff| backoff.until_ms.saturating_sub(now))
+            .unwrap_or(0)
     }
 
     pub fn mark_failure(

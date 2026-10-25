@@ -68,6 +68,9 @@ pub struct RequestRecord {
     pub total_tokens: Option<u64>,
     /// Already counted inside output_tokens. Never add it again when pricing.
     pub reasoning_tokens: Option<u64>,
+    /// The tier the upstream named when it answered with less depth than
+    /// the request asked for, kept so the panel can show what was served.
+    pub effort_mismatch: Option<String>,
     pub request_bytes: u64,
     pub upstream_request_bytes: Option<u64>,
     pub response_bytes: u64,
@@ -668,6 +671,7 @@ fn sanitize(mut row: RequestRecord) -> RequestRecord {
     row.requested_effort = clean_option(row.requested_effort);
     row.effective_effort = clean_option(row.effective_effort);
     row.response_effort = clean_option(row.response_effort);
+    row.effort_mismatch = clean_option(row.effort_mismatch);
     row.requested_service_tier = clean_option(row.requested_service_tier);
     row.response_service_tier = clean_option(row.response_service_tier);
     row.key_id = clean_option(row.key_id);
@@ -684,6 +688,9 @@ fn sanitize(mut row: RequestRecord) -> RequestRecord {
                 | "header_timeout_retry"
                 | "hedged_attempt"
                 | "hedged_win"
+                | "model_backoff"
+                | "model_alias"
+                | "downgrade_retry"
         )
     });
     row.gateway_actions.truncate(32);

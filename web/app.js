@@ -374,7 +374,7 @@ function normalizeProbeResult(result, model, elapsedMs = 0, secrets = []) {
 }
 
 function gatewayActionRows(record) {
-  const names = { session_reset: "重置会话", session_reused: "复用恢复后的会话", compaction_repair: "修复压缩上下文", image_compression: "压缩图片", first_output_timeout: "等待首段输出超时", header_timeout_retry: "响应头超时后重试", hedged_attempt: "同时试另一个号", hedged_win: "另一个号先返回" };
+  const names = { session_reset: "重置会话", session_reused: "复用恢复后的会话", compaction_repair: "修复压缩上下文", image_compression: "压缩图片", first_output_timeout: "等待首段输出超时", header_timeout_retry: "响应头超时后重试", hedged_attempt: "同时试另一个号", hedged_win: "另一个号先返回", model_backoff: "整个模型在限流，已等待后重试", model_alias: "号池没有所请求的模型，已换成可用模型", downgrade_retry: "上游给的档位低于所请求的，已换号重试" };
   return (Array.isArray(record.gateway_actions) ? record.gateway_actions : []).map((action) => ({
     label: Object.hasOwn(names, action.action) ? names[action.action] : "其他网关处理",
     attempt: Number.isInteger(action.attempt) && action.attempt >= 0 ? action.attempt : null,
@@ -429,6 +429,10 @@ function draftFromConfig(config) {
     session_recovery_enabled: config?.session_recovery_enabled !== false,
     compaction_repair_enabled: config?.compaction_repair_enabled !== false,
     compress_images: config?.compress_images === true,
+    model_aliases_enabled: config?.model_aliases_enabled === true,
+    downgrade_retries: config?.downgrade_retries ?? 2,
+    continuation_after_failures: config?.continuation_after_failures ?? 0,
+    continuation_mode: config?.continuation_mode || "new_window",
     first_output_timeout: (config?.first_output_timeout_ms ?? 120000) / 1000,
     hedge_after: (config?.hedge_after_ms ?? 20000) / 1000,
   };
@@ -448,6 +452,10 @@ function routingConfigPayload(draft, latestConfig) {
     session_recovery_enabled: draft.session_recovery_enabled,
     compaction_repair_enabled: draft.compaction_repair_enabled,
     compress_images: draft.compress_images,
+    model_aliases_enabled: draft.model_aliases_enabled,
+    downgrade_retries: draft.downgrade_retries,
+    continuation_after_failures: draft.continuation_after_failures,
+    continuation_mode: draft.continuation_mode,
     first_output_timeout_ms: Math.round(draft.first_output_timeout * 1000),
     hedge_after_ms: Math.round(draft.hedge_after * 1000),
   };
@@ -646,6 +654,9 @@ if (typeof document !== "undefined") (() => {
     $("copy-url").disabled = !state.connection?.base_url;
     text("connect-button", state.connection?.configured ? "检查接入" : "直接接入 Codex");
     $("disconnect-button").hidden = !state.connection?.configured;
+    const resume = state.continuation?.prompt || "";
+    $("continuation-banner").hidden = !resume;
+    text("continuation-prompt", resume);
     $("disconnect-button").title = "把 Codex 配置还原到接入之前，之后可在 CC Switch 或 Codex 里自行选择供应商";
     $("connect-button").title = state.connection?.configured ? "检查 Codex → Pool Router → 上游服务 的直接接入配置" : "直接配置 Codex 使用 Pool Router";
     showAlert("connection-note", !state.connection?.configured ? "点击「直接接入 Codex」完成本地配置，后续由 Pool Router 自动分配号池。" : "");
@@ -843,6 +854,10 @@ if (typeof document !== "undefined") (() => {
       session_recovery_enabled: $("session-recovery-enabled").checked,
       compaction_repair_enabled: $("compaction-repair-enabled").checked,
       compress_images: $("compress-images").checked,
+      model_aliases_enabled: $("model-aliases-enabled").checked,
+      downgrade_retries: Number($("downgrade-retries").value),
+      continuation_after_failures: Number($("continuation-after").value),
+      continuation_mode: $("continuation-mode").value,
       first_output_timeout: Number($("first-output-timeout").value),
       hedge_after: Number($("hedge-after").value),
     };
@@ -891,6 +906,10 @@ if (typeof document !== "undefined") (() => {
     $("session-recovery-enabled").checked = draft.session_recovery_enabled;
     $("compaction-repair-enabled").checked = draft.compaction_repair_enabled;
     $("compress-images").checked = draft.compress_images;
+    $("model-aliases-enabled").checked = draft.model_aliases_enabled;
+    $("downgrade-retries").value = draft.downgrade_retries;
+    $("continuation-after").value = draft.continuation_after_failures;
+    $("continuation-mode").value = draft.continuation_mode;
     $("first-output-timeout").value = draft.first_output_timeout;
     $("hedge-after").value = draft.hedge_after;
     $("pinned-field").hidden = draft.strategy !== "pinned";
@@ -1619,6 +1638,13 @@ if (typeof document !== "undefined") (() => {
       await refreshState();
     } catch (error) { toast(error.message, "error"); }
     finally { button.disabled = false; text("connect-button", state?.connection?.configured ? "检查接入" : "直接接入 Codex"); }
+  });
+
+  $("copy-continuation").addEventListener("click", async () => {
+    const value = $("continuation-prompt").textContent || "";
+    if (!value) return;
+    try { await navigator.clipboard.writeText(value); toast("已复制，粘贴到 Codex 即可。", "success"); }
+    catch { toast("浏览器拒绝了复制，请手动选中上面的文字。", "error"); }
   });
 
   $("disconnect-button").addEventListener("click", async () => {

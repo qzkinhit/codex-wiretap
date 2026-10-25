@@ -3197,3 +3197,404 @@ async fn a_continuation_is_never_raced_because_its_session_lives_on_one_account(
         "a continuation must not be raced: {actions:?}"
     );
 }
+
+#[tokio::test]
+async fn a_relay_that_cannot_reach_its_own_upstream_does_not_burn_the_retry_budget() {
+    // Every account sees the same 503, so walking the pool cannot help. The
+    // request must back off instead of spending every attempt at once.
+    let replies: Vec<Reply> = (0..12)
+        .map(|_| {
+            Reply::Json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error":{"message":"bad response status code 503","type":"upstream_error"}}),
+                None,
+            )
+        })
+        .collect();
+    let h = Harness::new(replies, 3, &[ASTRA]).await;
+    {
+        let mut config = h.state.config.write().unwrap();
+        config.max_attempts = 12;
+        // Long enough that the give-up rule, not the deadline, ends the request.
+        config.queue_timeout_ms = 30_000;
+        config.hedge_after_ms = 0;
+    }
+
+    let started = std::time::Instant::now();
+    let response = h.post(Harness::request(ASTRA)).send().await.unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let calls = h.calls();
+    assert!(
+        calls <= 3,
+        "the whole retry budget was spent on a pool-wide outage: {calls} upstream calls in {elapsed:?}"
+    );
+    // The caller must hear about it quickly rather than hold the connection
+    // open for a deadline it will never wait out.
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the client was held for {elapsed:?}"
+    );
+    let body = response.json::<Value>().await.unwrap();
+    assert_eq!(body["error"]["code"], "model_unavailable");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|text| text.contains("503")),
+        "the upstream's own reason was dropped: {body}"
+    );
+    let records = h.state.records.records();
+    let actions: Vec<String> = records
+        .iter()
+        .flat_map(|record| record.gateway_actions.iter())
+        .map(|action| action.action.clone())
+        .collect();
+    assert!(
+        actions.iter().any(|action| action == "model_backoff"),
+        "the outage was not recognized as pool-wide: {actions:?}"
+    );
+    // Each failed attempt may back off once. Loop passes that add no attempt
+    // record must not re-judge the same failure, which would spend the whole
+    // deadline waiting and send nothing.
+    let backoffs = actions
+        .iter()
+        .filter(|action| *action == "model_backoff")
+        .count();
+    assert!(
+        backoffs <= calls,
+        "backed off {backoffs} times for {calls} attempts"
+    );
+}
+
+#[tokio::test]
+async fn a_model_the_pool_does_not_carry_falls_through_to_one_it_can_serve() {
+    // The pool holds astra only. A request for a model this upstream answers
+    // 404 for must land on astra rather than failing, and the substitution has
+    // to be visible in the record.
+    let h = Harness::new(vec![success("resp_aliased", ASTRA)], 1, &[ASTRA]).await;
+    {
+        let mut config = h.state.config.write().unwrap();
+        config.model_aliases_enabled = true;
+        config.model_aliases = std::collections::BTreeMap::from([(
+            "gpt-6-luna".to_owned(),
+            vec![SOL.to_owned(), ASTRA.to_owned()],
+        )]);
+    }
+
+    let response = h.post(Harness::request("gpt-6-luna")).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.text().await.unwrap().contains("resp_aliased"));
+
+    // SOL comes first in the list but the pool cannot serve it, so ASTRA wins.
+    let seen = h.mock.seen.lock().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&seen[0].body).unwrap()["model"],
+        ASTRA
+    );
+    drop(seen);
+    let records = h.state.records.records();
+    let actions: Vec<String> = records
+        .iter()
+        .flat_map(|record| record.gateway_actions.iter())
+        .map(|action| action.action.clone())
+        .collect();
+    assert!(
+        actions.iter().any(|action| action == "model_alias"),
+        "the substitution was not recorded: {actions:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_alias_never_displaces_a_model_the_pool_already_serves() {
+    let h = Harness::new(vec![success("resp_direct", ASTRA)], 1, &[ASTRA]).await;
+    {
+        let mut config = h.state.config.write().unwrap();
+        config.model_aliases_enabled = true;
+        // Even with a rule for it, a model the pool carries is left alone.
+        config.model_aliases =
+            std::collections::BTreeMap::from([(ASTRA.to_owned(), vec![SOL.to_owned()])]);
+    }
+
+    let response = h.post(Harness::request(ASTRA)).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let seen = h.mock.seen.lock().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&seen[0].body).unwrap()["model"],
+        ASTRA
+    );
+}
+
+#[tokio::test]
+async fn aliases_switched_off_let_the_request_fail_as_before() {
+    let h = Harness::new(vec![success("resp_unused", ASTRA)], 1, &[ASTRA]).await;
+    {
+        let mut config = h.state.config.write().unwrap();
+        config.model_aliases_enabled = false;
+        config.model_aliases =
+            std::collections::BTreeMap::from([("gpt-6-luna".to_owned(), vec![ASTRA.to_owned()])]);
+    }
+
+    let response = h.post(Harness::request("gpt-6-luna")).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(h.calls(), 0, "no upstream request should have been made");
+}
+
+fn created_with_effort(id: &str, model: &str, effort: &str) -> String {
+    frame(json!({"type":"response.created","response":{
+        "id":id,"model":model,"status":"in_progress","reasoning":{"effort":effort}}}))
+}
+
+/// A downgraded response reports the cheaper tier throughout, not only in its
+/// first event.
+fn completed_with_effort(id: &str, model: &str, effort: &str) -> String {
+    frame(json!({"type":"response.completed","response":{
+        "id":id,"model":model,"status":"completed","reasoning":{"effort":effort},
+        "usage":{"input_tokens":100,"output_tokens":12,
+                 "input_tokens_details":{"cached_tokens":80},
+                 "output_tokens_details":{"reasoning_tokens":0}}}}))
+}
+
+#[tokio::test]
+async fn a_response_announced_below_the_requested_tier_is_dropped_before_the_client_sees_it() {
+    // The request asks for high. The first account announces low in its very
+    // first event, which arrives before any content, so the attempt can still
+    // move to another account without the client observing anything.
+    let h = Harness::new(
+        vec![
+            Reply::Sse(vec![
+                (None, created_with_effort("resp_shallow", ASTRA, "low")),
+                (None, delta("shallow-answer")),
+                (None, completed_with_effort("resp_shallow", ASTRA, "low")),
+            ]),
+            Reply::Sse(vec![
+                (None, created_with_effort("resp_full", ASTRA, "high")),
+                (None, delta("full-answer")),
+                (None, completed("resp_full", ASTRA)),
+            ]),
+        ],
+        2,
+        &[ASTRA],
+    )
+    .await;
+
+    let response = h.post(Harness::request(ASTRA)).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.unwrap();
+    assert!(
+        body.contains("full-answer"),
+        "client did not get the full answer: {body}"
+    );
+    assert!(
+        !body.contains("shallow-answer") && !body.contains("resp_shallow"),
+        "the downgraded attempt leaked to the client: {body}"
+    );
+    assert_eq!(h.calls(), 2, "both accounts were asked");
+
+    let records = h.state.records.records();
+    let actions: Vec<String> = records
+        .iter()
+        .flat_map(|record| record.gateway_actions.iter())
+        .map(|action| action.action.clone())
+        .collect();
+    assert!(
+        actions.iter().any(|action| action == "downgrade_retry"),
+        "the downgrade was not recorded: {actions:?}"
+    );
+    assert_eq!(records[0].effort_mismatch.as_deref(), Some("low"));
+}
+
+#[tokio::test]
+async fn switching_downgrade_retries_off_forwards_whatever_the_upstream_announced() {
+    let h = Harness::new(
+        vec![Reply::Sse(vec![
+            (None, created_with_effort("resp_shallow", ASTRA, "low")),
+            (None, delta("shallow-answer")),
+            (None, completed_with_effort("resp_shallow", ASTRA, "low")),
+        ])],
+        2,
+        &[ASTRA],
+    )
+    .await;
+    h.state.config.write().unwrap().downgrade_retries = 0;
+
+    let response = h.post(Harness::request(ASTRA)).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.text().await.unwrap().contains("shallow-answer"));
+    assert_eq!(h.calls(), 1, "no second account should have been asked");
+}
+
+#[tokio::test]
+async fn a_pool_that_only_downgrades_still_answers_instead_of_retrying_forever() {
+    // Every account announces low. The bounded retry count has to give up and
+    // serve something rather than spend the whole budget.
+    let replies: Vec<Reply> = (0..6)
+        .map(|i| {
+            Reply::Sse(vec![
+                (
+                    None,
+                    created_with_effort(&format!("resp_{i}"), ASTRA, "low"),
+                ),
+                (None, delta("shallow-answer")),
+                (
+                    None,
+                    completed_with_effort(&format!("resp_{i}"), ASTRA, "low"),
+                ),
+            ])
+        })
+        .collect();
+    let h = Harness::new(replies, 6, &[ASTRA]).await;
+    h.state.config.write().unwrap().downgrade_retries = 2;
+
+    let response = h.post(Harness::request(ASTRA)).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.text().await.unwrap().contains("shallow-answer"));
+    assert_eq!(
+        h.calls(),
+        3,
+        "two retries then serve, rather than exhausting the pool"
+    );
+}
+
+#[tokio::test]
+async fn a_conversation_that_keeps_failing_offers_the_prompt_that_resumes_it() {
+    // Three failures in one conversation, then a success. The prompt must
+    // appear only once the streak reaches the configured count, and a later
+    // success must withdraw it, because the work is no longer stuck.
+    let h = Harness::new(
+        vec![
+            Reply::Json(
+                StatusCode::BAD_GATEWAY,
+                json!({"error":{"message":"x"}}),
+                None,
+            ),
+            Reply::Json(
+                StatusCode::BAD_GATEWAY,
+                json!({"error":{"message":"x"}}),
+                None,
+            ),
+            Reply::Json(
+                StatusCode::BAD_GATEWAY,
+                json!({"error":{"message":"x"}}),
+                None,
+            ),
+            success("resp_recovered", ASTRA),
+        ],
+        1,
+        &[ASTRA],
+    )
+    .await;
+    {
+        let mut config = h.state.config.write().unwrap();
+        config.continuation_after_failures = 2;
+        config.continuation_mode = "new_window".into();
+        // One account, so without this the failures put it in cooldown and the
+        // recovery request never reaches the upstream.
+        config.policy.cooldown_base_ms = 100;
+        config.policy.cooldown_max_ms = 100;
+        config.max_attempts = 1;
+        config.queue_timeout_ms = 5_000;
+        config.hedge_after_ms = 0;
+    }
+    let conversation = "01a172ca-b722-7940-bd8b-2dbde7355763";
+    let send = || {
+        h.client
+            .post(format!("{}/v1/responses", h.base))
+            .bearer_auth(&h.state.settings().local_token)
+            .header("session-id", conversation)
+            .header("accept", "text/event-stream")
+            .json(&Harness::request(ASTRA))
+            .send()
+    };
+
+    let prompt_now = || {
+        h.state
+            .continuation
+            .read()
+            .unwrap()
+            .prompt
+            .as_ref()
+            .map(|(_, text)| text.clone())
+    };
+    // The guard that counts the streak is dropped by the streaming task, which
+    // can finish just after the client has the last byte.
+    let settle = async || {
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            tokio::task::yield_now().await;
+        }
+    };
+
+    let _ = send().await.unwrap().bytes().await;
+    settle().await;
+    assert_eq!(
+        prompt_now(),
+        None,
+        "one failure is not a stuck conversation"
+    );
+
+    let _ = send().await.unwrap().bytes().await;
+    settle().await;
+    let offered = prompt_now().expect("the streak reached the configured count");
+    assert!(
+        offered.contains(conversation) && offered.contains("在新窗口做"),
+        "the prompt does not name the thread and the window: {offered}"
+    );
+
+    let _ = send().await.unwrap().bytes().await;
+    let _ = send().await.unwrap().bytes().await;
+    settle().await;
+    assert_eq!(
+        prompt_now(),
+        None,
+        "a conversation that answered again is no longer stuck"
+    );
+}
+
+#[tokio::test]
+async fn continuation_stays_silent_until_it_is_switched_on() {
+    let h = Harness::new(
+        vec![
+            Reply::Json(
+                StatusCode::BAD_GATEWAY,
+                json!({"error":{"message":"x"}}),
+                None,
+            ),
+            Reply::Json(
+                StatusCode::BAD_GATEWAY,
+                json!({"error":{"message":"x"}}),
+                None,
+            ),
+            Reply::Json(
+                StatusCode::BAD_GATEWAY,
+                json!({"error":{"message":"x"}}),
+                None,
+            ),
+        ],
+        1,
+        &[ASTRA],
+    )
+    .await;
+    {
+        let mut config = h.state.config.write().unwrap();
+        assert_eq!(config.continuation_after_failures, 0, "off by default");
+        config.max_attempts = 1;
+        config.queue_timeout_ms = 5_000;
+        config.hedge_after_ms = 0;
+    }
+    for _ in 0..3 {
+        let _ = h
+            .client
+            .post(format!("{}/v1/responses", h.base))
+            .bearer_auth(&h.state.settings().local_token)
+            .header("session-id", "01a172ca-b722-7940-bd8b-2dbde7355763")
+            .header("accept", "text/event-stream")
+            .json(&Harness::request(ASTRA))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await;
+    }
+    assert!(h.state.continuation.read().unwrap().prompt.is_none());
+}
