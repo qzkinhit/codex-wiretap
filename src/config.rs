@@ -50,10 +50,10 @@ pub struct Config {
     /// prompt on the clipboard that lets the user pick the work back up.
     /// Zero disables it.
     pub continuation_after_failures: u32,
-    /// "new_window" asks the agent to carry on in a fresh conversation and
-    /// names the thread to read; "current_window" only says to continue,
-    /// because the thread is already open.
-    pub continuation_mode: String,
+    /// Upper bound on automatic resumes for one conversation, so an upstream
+    /// that stays broken cannot keep spending quota unattended. A success in
+    /// that conversation starts the count again.
+    pub auto_resume_max: u32,
     pub reasoning_override: Option<String>,
     /// Total upstream attempts, including the first request. The UI exposes retries.
     pub max_attempts: usize,
@@ -100,7 +100,7 @@ impl Default for Config {
             model_aliases_enabled: false,
             downgrade_retries: 2,
             continuation_after_failures: 0,
-            continuation_mode: "new_window".to_owned(),
+            auto_resume_max: 5,
             reasoning_override: None,
             max_attempts: 16,
             queue_timeout_ms: 600_000,
@@ -147,11 +147,8 @@ impl Config {
         if self.continuation_after_failures > 100 {
             bail!("持续模式的失败次数超出允许范围");
         }
-        if !matches!(
-            self.continuation_mode.as_str(),
-            "new_window" | "current_window"
-        ) {
-            bail!("持续模式的目标窗口无效");
+        if !(1..=20).contains(&self.auto_resume_max) {
+            bail!("自动续跑次数上限超出允许范围");
         }
         if self.downgrade_retries > 8 {
             bail!("降级重试次数超出允许范围");
@@ -239,7 +236,7 @@ impl Config {
         }
     }
     pub fn public(&self) -> Value {
-        serde_json::json!({"source_mode":self.source_mode,"upstream_base_url":self.upstream_base_url,"legacy_monitor_enabled":self.legacy_monitor_enabled,"policy":self.policy,"model_override":self.model_override,"model_aliases":self.model_aliases,"model_aliases_enabled":self.model_aliases_enabled,"downgrade_retries":self.downgrade_retries,"continuation_after_failures":self.continuation_after_failures,"continuation_mode":self.continuation_mode,
+        serde_json::json!({"source_mode":self.source_mode,"upstream_base_url":self.upstream_base_url,"legacy_monitor_enabled":self.legacy_monitor_enabled,"policy":self.policy,"model_override":self.model_override,"model_aliases":self.model_aliases,"model_aliases_enabled":self.model_aliases_enabled,"downgrade_retries":self.downgrade_retries,"continuation_after_failures":self.continuation_after_failures,"auto_resume_max":self.auto_resume_max,
             "biwrite_import_all":self.biwrite_import_all,"sync_paused":self.sync_paused,
             "session_recovery_enabled":self.session_recovery_enabled,"compaction_repair_enabled":self.compaction_repair_enabled,
             "compress_images":self.compress_images,"first_output_timeout_ms":self.first_output_timeout_ms,
@@ -413,8 +410,20 @@ pub fn load(path: &Path) -> Result<Config> {
     if bytes.len() > 1024 * 1024 {
         bail!("Pool Router 配置文件过大");
     }
-    let config: Config =
+    // Unknown fields are rejected so a mistyped setting cannot be silently
+    // ignored. A field this software used to write is a different case: it is
+    // already sitting in installed configurations, and refusing it would stop
+    // the service from starting after an update. Those are dropped by name.
+    const RETIRED_FIELDS: [&str; 1] = ["continuation_mode"];
+    let mut value: Value =
         serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("Pool Router 配置格式无效"))?;
+    if let Some(object) = value.as_object_mut() {
+        for field in RETIRED_FIELDS {
+            object.remove(field);
+        }
+    }
+    let config: Config =
+        serde_json::from_value(value).map_err(|_| anyhow::anyhow!("Pool Router 配置格式无效"))?;
     config.validate()?;
     Ok(config)
 }
@@ -431,6 +440,29 @@ pub fn load_or_init(path: &Path) -> Result<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_update_that_drops_a_setting_still_starts_but_a_typo_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        // Written by an earlier version of this software and left behind by
+        // the update. Refusing it would stop the service from starting.
+        let mut stored = serde_json::to_value(Config::default()).unwrap();
+        stored["continuation_mode"] = serde_json::json!("new_window");
+        stored["continuation_after_failures"] = serde_json::json!(7);
+        fs::write(&path, stored.to_string()).unwrap();
+        let loaded = load(&path).expect("a retired field must not block startup");
+        assert_eq!(loaded.continuation_after_failures, 7);
+
+        // A field nobody ever wrote is a mistyped setting, and silently
+        // ignoring it would leave the user believing it took effect.
+        let mut typo = serde_json::to_value(Config::default()).unwrap();
+        typo["continuaton_after_failures"] = serde_json::json!(7);
+        fs::write(&path, typo.to_string()).unwrap();
+        assert!(load(&path).is_err());
+    }
+
     #[test]
     fn platform_paths_prefer_windows_profile_and_keep_codex_override() {
         let home = PathBuf::from("home-from-shell");

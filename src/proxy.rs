@@ -96,8 +96,11 @@ pub struct Counters {
 #[derive(Default)]
 pub struct ContinuationState {
     pub streak: HashMap<String, u32>,
-    /// What to paste, and which conversation it came from.
-    pub prompt: Option<(String, String)>,
+    /// Resumes already sent per conversation, bounded so a broken upstream
+    /// cannot keep spending quota while nobody is watching.
+    pub resumes: HashMap<String, u32>,
+    /// The last conversation resumed and how many times, for the dashboard.
+    pub last: Option<(String, u32)>,
 }
 
 pub struct AppState {
@@ -662,7 +665,7 @@ async fn api_state(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(
         json!({"version":env!("CARGO_PKG_VERSION"),"uptime_seconds":state.started.elapsed().as_secs(),
         "source":state.source.read().unwrap_or_else(|e|e.into_inner()).clone(),"sync":state.sync.read().unwrap_or_else(|e|e.into_inner()).clone(),"accounts":accounts,"models":models,"config":cfg.public(),
-        "connection":connection,"continuation":state.continuation.read().unwrap_or_else(|e|e.into_inner()).prompt.as_ref().map(|(id,text)|json!({"conversation_id":id,"prompt":text})),"stats":{"requests":state.counters.requests.load(Ordering::Relaxed),"successes":state.counters.successes.load(Ordering::Relaxed),"failures":state.counters.failures.load(Ordering::Relaxed),"unassigned":state.counters.unassigned.load(Ordering::Relaxed),"active":state.counters.active.load(Ordering::Relaxed),"waiting_streams":state.counters.waiting_streams.load(Ordering::Relaxed)}}),
+        "connection":connection,"continuation":state.continuation.read().unwrap_or_else(|e|e.into_inner()).last.as_ref().map(|(id,n)|json!({"conversation_id":id,"resumes":n})),"stats":{"requests":state.counters.requests.load(Ordering::Relaxed),"successes":state.counters.successes.load(Ordering::Relaxed),"failures":state.counters.failures.load(Ordering::Relaxed),"unassigned":state.counters.unassigned.load(Ordering::Relaxed),"active":state.counters.active.load(Ordering::Relaxed),"waiting_streams":state.counters.waiting_streams.load(Ordering::Relaxed)}}),
     )
 }
 /// Read-only view of the two files that decide behaviour, with every
@@ -1750,21 +1753,30 @@ impl Drop for RequestGuard {
                 .unwrap_or_else(|e| e.into_inner());
             if completed {
                 state.streak.remove(&conversation);
-                if state
-                    .prompt
-                    .as_ref()
-                    .is_some_and(|(id, _)| id == &conversation)
-                {
-                    state.prompt = None;
-                }
+                state.resumes.remove(&conversation);
             } else {
-                let streak = state.streak.entry(conversation.clone()).or_default();
-                *streak = streak.saturating_add(1);
-                if *streak >= settings.continuation_after_failures
-                    && let Some(text) =
-                        continuation_prompt(&settings.continuation_mode, Some(&conversation))
-                {
-                    state.prompt = Some((conversation, text));
+                let streak = state
+                    .streak
+                    .entry(conversation.clone())
+                    .and_modify(|n| *n = n.saturating_add(1))
+                    .or_insert(1);
+                let reached = *streak >= settings.continuation_after_failures;
+                let resumed = state.resumes.get(&conversation).copied().unwrap_or(0);
+                if reached && resumed < settings.auto_resume_max {
+                    let attempt = resumed + 1;
+                    state.resumes.insert(conversation.clone(), attempt);
+                    // Resetting the streak stops one stalled conversation from
+                    // queueing a message on every later failure.
+                    state.streak.insert(conversation.clone(), 0);
+                    state.last = Some((conversation.clone(), attempt));
+                    let id = conversation.clone();
+                    drop(state);
+                    // Codex talks to its own daemon, which can take a moment.
+                    std::thread::spawn(move || {
+                        let sent = resume_conversation(&id);
+                        let _ = (attempt, sent);
+                    });
+                    return;
                 }
                 // Bound the map so a long session cannot grow it without end.
                 if state.streak.len() > 512 {
@@ -1865,18 +1877,37 @@ fn served_below_request(
     served < asked
 }
 
-/// The prompt that picks a conversation back up after the client has given up.
-/// In a fresh conversation the agent has no context, so the thread is named and
-/// the target window is stated; without that it reads the link and assumes it
-/// should carry on in the old thread. In the thread itself the link would be
-/// redundant, so only the instruction remains.
-fn continuation_prompt(mode: &str, conversation_id: Option<&str>) -> Option<String> {
-    match mode {
-        "current_window" => Some("继续".to_owned()),
-        "new_window" => conversation_id
-            .filter(|id| !id.is_empty())
-            .map(|id| format!("codex://threads/{id} 继续这个，在新窗口做")),
-        _ => None,
+/// The Codex command line that the desktop application actually runs. It is
+/// installed under the user's home rather than on PATH, and the copy on PATH
+/// may be a broken wrapper, so the bundled one is preferred.
+fn codex_command() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let bundled =
+        home.join(".codex/plugins/.plugin-appserver/codex-cli/CodexCLI.app/Contents/MacOS/codex");
+    bundled.is_file().then_some(bundled)
+}
+
+/// Ask Codex to carry on with a conversation that has stopped making progress.
+/// The message is queued onto the existing thread, so the agent keeps the
+/// context it already has instead of starting over. Returns whether Codex
+/// accepted it.
+fn resume_conversation(conversation_id: &str) -> bool {
+    let Some(command) = codex_command() else {
+        return false;
+    };
+    let output = std::process::Command::new(command)
+        .arg("queue")
+        .arg("--thread")
+        .arg(conversation_id)
+        .arg("--message")
+        .arg("继续")
+        .stdin(std::process::Stdio::null())
+        .output();
+    // The command exits zero even when the thread is unknown, so the message
+    // on standard error is what says whether anything was queued.
+    match output {
+        Ok(out) => out.status.success() && !String::from_utf8_lossy(&out.stderr).contains("Error:"),
+        Err(_) => false,
     }
 }
 
@@ -3490,7 +3521,7 @@ mod probe_tests {
 #[cfg(test)]
 mod adaptive_tests {
     use super::{
-        continuation_prompt, effort_rank, first_output_budget, pool_wide_failure,
+        codex_command, effort_rank, first_output_budget, pool_wide_failure, resume_conversation,
         served_below_request,
     };
 
@@ -3522,27 +3553,29 @@ mod adaptive_tests {
         assert!(first_output_budget(10_000_000, Some("xhigh")) <= 600_000);
     }
 
+    /// Only runs when a thread id is supplied, because it queues a real
+    /// message into that conversation and makes the agent work.
     #[test]
-    fn the_resume_prompt_states_where_to_carry_on() {
-        // A fresh conversation has no context, so it needs the thread and an
-        // explicit target; without the target the agent assumes the old window.
-        let new_window =
-            continuation_prompt("new_window", Some("01a172ca-b722-7940-bd8b")).unwrap();
-        assert!(new_window.starts_with("codex://threads/01a172ca-b722-7940-bd8b"));
-        assert!(new_window.contains("在新窗口做"));
-
-        // Inside the thread the link would say nothing the agent does not have.
-        let current = continuation_prompt("current_window", Some("01a172ca")).unwrap();
-        assert_eq!(current, "继续");
-        assert_eq!(
-            continuation_prompt("current_window", None).as_deref(),
-            Some("继续")
+    fn resuming_reaches_a_real_conversation() {
+        let Ok(thread) = std::env::var("POOL_ROUTER_TEST_THREAD") else {
+            return;
+        };
+        assert!(
+            resume_conversation(&thread),
+            "Codex did not accept the resume for {thread}"
         );
+    }
 
-        // Without a conversation there is no thread to name, so no prompt.
-        assert_eq!(continuation_prompt("new_window", None), None);
-        assert_eq!(continuation_prompt("new_window", Some("")), None);
-        assert_eq!(continuation_prompt("unknown_mode", Some("01a1")), None);
+    #[test]
+    fn resuming_reports_failure_for_a_thread_codex_does_not_have() {
+        // The real check is that a resume is only reported as sent when Codex
+        // actually took it. `codex queue` exits zero even for an unknown
+        // thread, so a naive success check would report every resume as sent
+        // and the cap would be spent on conversations that were never resumed.
+        if codex_command().is_none() {
+            return; // Codex is not installed here; nothing to talk to.
+        }
+        assert!(!resume_conversation("00000000-0000-4000-8000-000000000000"));
     }
 
     #[test]

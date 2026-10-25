@@ -432,7 +432,7 @@ function draftFromConfig(config) {
     model_aliases_enabled: config?.model_aliases_enabled === true,
     downgrade_retries: config?.downgrade_retries ?? 2,
     continuation_after_failures: config?.continuation_after_failures ?? 0,
-    continuation_mode: config?.continuation_mode || "new_window",
+    auto_resume_max: config?.auto_resume_max ?? 5,
     first_output_timeout: (config?.first_output_timeout_ms ?? 120000) / 1000,
     hedge_after: (config?.hedge_after_ms ?? 20000) / 1000,
   };
@@ -455,7 +455,7 @@ function routingConfigPayload(draft, latestConfig) {
     model_aliases_enabled: draft.model_aliases_enabled,
     downgrade_retries: draft.downgrade_retries,
     continuation_after_failures: draft.continuation_after_failures,
-    continuation_mode: draft.continuation_mode,
+    auto_resume_max: draft.auto_resume_max,
     first_output_timeout_ms: Math.round(draft.first_output_timeout * 1000),
     hedge_after_ms: Math.round(draft.hedge_after * 1000),
   };
@@ -654,9 +654,6 @@ if (typeof document !== "undefined") (() => {
     $("copy-url").disabled = !state.connection?.base_url;
     text("connect-button", state.connection?.configured ? "检查接入" : "直接接入 Codex");
     $("disconnect-button").hidden = !state.connection?.configured;
-    const resume = state.continuation?.prompt || "";
-    $("continuation-banner").hidden = !resume;
-    text("continuation-prompt", resume);
     $("disconnect-button").title = "把 Codex 配置还原到接入之前，之后可在 CC Switch 或 Codex 里自行选择供应商";
     $("connect-button").title = state.connection?.configured ? "检查 Codex → Pool Router → 上游服务 的直接接入配置" : "直接配置 Codex 使用 Pool Router";
     showAlert("connection-note", !state.connection?.configured ? "点击「直接接入 Codex」完成本地配置，后续由 Pool Router 自动分配号池。" : "");
@@ -857,7 +854,7 @@ if (typeof document !== "undefined") (() => {
       model_aliases_enabled: $("model-aliases-enabled").checked,
       downgrade_retries: Number($("downgrade-retries").value),
       continuation_after_failures: Number($("continuation-after").value),
-      continuation_mode: $("continuation-mode").value,
+      auto_resume_max: Number($("resume-max").value),
       first_output_timeout: Number($("first-output-timeout").value),
       hedge_after: Number($("hedge-after").value),
     };
@@ -909,7 +906,7 @@ if (typeof document !== "undefined") (() => {
     $("model-aliases-enabled").checked = draft.model_aliases_enabled;
     $("downgrade-retries").value = draft.downgrade_retries;
     $("continuation-after").value = draft.continuation_after_failures;
-    $("continuation-mode").value = draft.continuation_mode;
+    $("resume-max").value = draft.auto_resume_max;
     $("first-output-timeout").value = draft.first_output_timeout;
     $("hedge-after").value = draft.hedge_after;
     $("pinned-field").hidden = draft.strategy !== "pinned";
@@ -1638,13 +1635,6 @@ if (typeof document !== "undefined") (() => {
       await refreshState();
     } catch (error) { toast(error.message, "error"); }
     finally { button.disabled = false; text("connect-button", state?.connection?.configured ? "检查接入" : "直接接入 Codex"); }
-  });
-
-  $("copy-continuation").addEventListener("click", async () => {
-    const value = $("continuation-prompt").textContent || "";
-    if (!value) return;
-    try { await navigator.clipboard.writeText(value); toast("已复制，粘贴到 Codex 即可。", "success"); }
-    catch { toast("浏览器拒绝了复制，请手动选中上面的文字。", "error"); }
   });
 
   $("disconnect-button").addEventListener("click", async () => {

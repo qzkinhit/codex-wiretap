@@ -3457,7 +3457,7 @@ async fn a_pool_that_only_downgrades_still_answers_instead_of_retrying_forever()
 }
 
 #[tokio::test]
-async fn a_conversation_that_keeps_failing_offers_the_prompt_that_resumes_it() {
+async fn a_conversation_that_keeps_failing_is_resumed_without_anyone_watching() {
     // Three failures in one conversation, then a success. The prompt must
     // appear only once the streak reaches the configured count, and a later
     // success must withdraw it, because the work is no longer stuck.
@@ -3487,7 +3487,7 @@ async fn a_conversation_that_keeps_failing_offers_the_prompt_that_resumes_it() {
     {
         let mut config = h.state.config.write().unwrap();
         config.continuation_after_failures = 2;
-        config.continuation_mode = "new_window".into();
+        config.auto_resume_max = 5;
         // One account, so without this the failures put it in cooldown and the
         // recovery request never reaches the upstream.
         config.policy.cooldown_base_ms = 100;
@@ -3507,14 +3507,17 @@ async fn a_conversation_that_keeps_failing_offers_the_prompt_that_resumes_it() {
             .send()
     };
 
-    let prompt_now = || {
+    // What matters is whether a resume was attempted for this conversation,
+    // not any text: the message goes to Codex, not to the user.
+    let resumes_now = || {
         h.state
             .continuation
             .read()
             .unwrap()
-            .prompt
-            .as_ref()
-            .map(|(_, text)| text.clone())
+            .resumes
+            .get(conversation)
+            .copied()
+            .unwrap_or(0)
     };
     // The guard that counts the streak is dropped by the streaming task, which
     // can finish just after the client has the last byte.
@@ -3527,26 +3530,22 @@ async fn a_conversation_that_keeps_failing_offers_the_prompt_that_resumes_it() {
 
     let _ = send().await.unwrap().bytes().await;
     settle().await;
-    assert_eq!(
-        prompt_now(),
-        None,
-        "one failure is not a stuck conversation"
-    );
+    assert_eq!(resumes_now(), 0, "one failure is not a stuck conversation");
 
     let _ = send().await.unwrap().bytes().await;
     settle().await;
-    let offered = prompt_now().expect("the streak reached the configured count");
-    assert!(
-        offered.contains(conversation) && offered.contains("在新窗口做"),
-        "the prompt does not name the thread and the window: {offered}"
+    assert_eq!(
+        resumes_now(),
+        1,
+        "the streak reached the configured count but nothing was resumed"
     );
 
     let _ = send().await.unwrap().bytes().await;
     let _ = send().await.unwrap().bytes().await;
     settle().await;
     assert_eq!(
-        prompt_now(),
-        None,
+        resumes_now(),
+        0,
         "a conversation that answered again is no longer stuck"
     );
 }
@@ -3596,5 +3595,5 @@ async fn continuation_stays_silent_until_it_is_switched_on() {
             .bytes()
             .await;
     }
-    assert!(h.state.continuation.read().unwrap().prompt.is_none());
+    assert!(h.state.continuation.read().unwrap().resumes.is_empty());
 }

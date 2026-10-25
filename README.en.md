@@ -4,7 +4,7 @@
 
 <img src="assets/logo-wordmark.png" width="420" alt="Pool Router">
 
-**Pool Router is a local router and request monitor for Codex. It spreads requests across your own keys by account and model, shows which account served each request along with retries, tokens, and cost, and moves to another account when one stalls.** The current release is **1.1.3**, the Rust edition of the `codex-wiretap` repository; its executable is `pool-router`. The desktop launcher opens a browser dashboard, while a local background process forwards requests.
+**Pool Router is a local router and request monitor for Codex. It spreads requests across your own keys by account and model, shows which account served each request along with retries, tokens, and cost, and moves to another account when one stalls.** The current release is **1.1.4**, the Rust edition of the `codex-wiretap` repository; its executable is `pool-router`. The desktop launcher opens a browser dashboard, while a local background process forwards requests.
 
 | Your computer | Download and install |
 | --- | --- |
@@ -154,7 +154,7 @@ python3 scripts/macos-package-dmg.py dist/macos/PoolRouter-macOS-arm64.zip dist/
 On Windows, use PowerShell with Rust and the installer build tools available:
 
 ```powershell
-./scripts/windows/build.ps1 -ReleaseTag v1.1.3
+./scripts/windows/build.ps1 -ReleaseTag v1.1.4
 ```
 
 Alternatively, run the **Build Windows installer** GitHub Actions workflow and supply `release_tag`. After creating the release tag, leave `source_ref` empty to build that tag. To build before tagging, explicitly supply the intended commit or branch, such as `main`. The resulting package must correspond to the final release tag; an unchecked branch build is not evidence of a published release.
@@ -311,7 +311,9 @@ The pool path checks both HTTP status and Responses/SSE events. A failure event 
 
 The pool defaults to at most **15 retries**, or **16 attempts including the first request**. The backend setting `max_attempts = 16` includes the first request; the dashboard displays and edits the retry count. Requests created by session recovery or compaction repair count against the same limit. Queueing and the pre-output phase share a 600-second deadline. The upstream response-header timeout is 120 seconds, the first meaningful output deadline is 120 seconds from the start of each attempt, and the stream idle timeout is 180 seconds. The time deadline can therefore expire before all retries are used. Legacy monitoring submits each upstream request once.
 
-**Failures before offering a resume prompt** corresponds to `continuation_after_failures`, which defaults to 0 and is off, and **where to carry on** corresponds to `continuation_mode`, which defaults to `new_window`. When one conversation has failed that many times in a row, the dashboard offers a prompt to paste back into Codex so the unfinished work can be picked up; a later success in that conversation withdraws it. The new-window form is `codex://threads/<thread id> 继续这个，在新窗口做`, naming both the thread to read and the window to work in, because without the second part the agent treats it as continuing the old thread. The current-window form is just `继续`, since the thread is already open and the link would add nothing. The prompt is shown in the dashboard and copied by its own button; this software does not write to the system clipboard on your behalf.
+**Failures before an automatic resume** corresponds to `continuation_after_failures`, which defaults to 0 and is off, and **how many automatic resumes** corresponds to `auto_resume_max`, which defaults to 5. When one conversation has failed that many times in a row, this software uses the Codex command line to queue a short instruction to continue onto that same conversation, so unfinished work carries on with nobody at the keyboard. Codex's own stream reconnect count is of the same order, so reaching this number usually means that conversation cannot recover on its own.
+
+Three limits keep a long upstream outage from spending quota unattended: the number of automatic resumes per conversation is capped; a resume clears that conversation's failure streak, so it does not queue another message on every later failure; and a success in that conversation starts the count again. The command exits zero even for a thread Codex does not have, so whether the message was queued is read from its error output, and a resume Codex did not accept does not count against the cap.
 
 **Retries when the tier is below the request** under Forwarding enhancements corresponds to `downgrade_retries`, defaults to 2, and 0 disables it. The upstream's first streamed event already names the model and reasoning tier it will use. That event and the prelude after it are buffered here and forwarded only once buffering ends, so a tier below the requested one can be discarded whole and another account asked without the client ever seeing the discarded attempt. Only tier names this build recognizes take part in the comparison, an unknown name is never judged a downgrade, and a tier above the requested one does not count. The count is bounded and separate from the ordinary retry budget, so a pool where every account answers with a lower tier still returns a result.
 
