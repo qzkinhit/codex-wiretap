@@ -12,3 +12,4 @@ pub mod scheduler;
 pub mod types;
 pub mod updates;
 pub mod upstream;
+pub mod usage;

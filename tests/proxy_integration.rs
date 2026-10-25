@@ -2887,3 +2887,137 @@ async fn a_manual_sync_answers_with_the_result_of_that_very_round() {
         .unwrap();
     assert_eq!(state["sync"], body["sync"]);
 }
+
+#[tokio::test]
+async fn a_served_request_lands_in_the_daily_ledger_with_its_cost() {
+    let h = Harness::new(vec![success("resp_billed", ASTRA)], 1, &[ASTRA]).await;
+    let response = h.post(Harness::request(ASTRA)).send().await.unwrap();
+    response.bytes().await.unwrap();
+
+    let value: Value = h
+        .api_get("/api/usage")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // The fixture completion frame reports 100 input of which 80 were cached,
+    // 12 output and 4 reasoning tokens.
+    assert_eq!(value["today"]["requests"], json!(1));
+    assert_eq!(value["today"]["uncounted_requests"], json!(0));
+    assert_eq!(value["today"]["tokens"]["input"], json!(100));
+    assert_eq!(value["today"]["tokens"]["cached"], json!(80));
+    assert_eq!(value["today"]["tokens"]["ordinary"], json!(20));
+    assert_eq!(value["today"]["tokens"]["output"], json!(12));
+    assert_eq!(value["today"]["tokens"]["reasoning"], json!(4));
+    assert!(value["today"]["cost_usd"].as_f64().expect("cost") > 0.0);
+    let models = value["by_model"].as_array().expect("rows");
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0]["name"], json!(ASTRA));
+    assert_eq!(models[0]["requests"], json!(1));
+    let efforts = value["by_effort"].as_array().expect("rows");
+    assert_eq!(efforts[0]["name"], json!("high"));
+    assert_eq!(value["by_key"].as_array().expect("rows").len(), 1);
+}
+
+#[tokio::test]
+async fn a_request_that_never_reported_usage_is_listed_as_uncounted() {
+    let h = Harness::new(
+        vec![Reply::Json(
+            StatusCode::BAD_REQUEST,
+            json!({"error":{"code":"bad_request","message":"fixture rejected"}}),
+            None,
+        )],
+        1,
+        &[ASTRA],
+    )
+    .await;
+    use_short_cooldown(&h);
+    let response = h.post(Harness::request(ASTRA)).send().await.unwrap();
+    response.bytes().await.unwrap();
+
+    let value: Value = h
+        .api_get("/api/usage")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(value["today"]["requests"], json!(0));
+    assert!(
+        value["today"]["uncounted_requests"]
+            .as_u64()
+            .expect("count")
+            >= 1
+    );
+    assert_eq!(value["today"]["tokens"]["input"], json!(0));
+    assert_eq!(value["today"]["cost_usd"], json!(0.0));
+}
+
+#[tokio::test]
+async fn a_heartbeat_never_splits_an_upstream_event_across_the_wire() {
+    // The upstream stops mid line and resumes only after a heartbeat is due.
+    // Inserting the comment there would corrupt the event and the client would
+    // report a decoding error instead of the result.
+    let resume = Arc::new(Notify::new());
+    let event = completed("resp_split", ASTRA);
+    let cut = event.len() / 2;
+    let (head, tail) = event.split_at(cut);
+    assert!(!head.ends_with('\n'), "the fixture must stop mid line");
+    let h = Harness::new(
+        vec![Reply::Sse(vec![
+            (None, created("resp_split", ASTRA)),
+            (None, delta("partial")),
+            (None, head.to_owned()),
+            (Some(resume.clone()), tail.to_owned()),
+        ])],
+        1,
+        &[ASTRA],
+    )
+    .await;
+    {
+        // The pause must come from the fixture, not from an idle deadline.
+        let mut config = h.state.config.write().unwrap();
+        config.queue_timeout_ms = 30_000;
+        config.upstream_header_timeout_ms = 30_000;
+        config.stream_idle_timeout_ms = 30_000;
+        config.first_output_timeout_ms = 30_000;
+    }
+    let release = tokio::spawn(async move {
+        // Longer than the five second heartbeat interval.
+        tokio::time::sleep(Duration::from_secs(7)).await;
+        resume.notify_one();
+    });
+    let response = h
+        .post(Harness::request(ASTRA))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.unwrap();
+    release.await.unwrap();
+
+    assert!(body.contains("resp_split"), "{body}");
+    // Every comment must occupy a whole line of its own.
+    for (index, line) in body.lines().enumerate() {
+        if line.contains(": pool-router waiting") {
+            assert!(
+                line.trim_start().starts_with(':'),
+                "line {index} carries a comment inside other content: {line}"
+            );
+        }
+    }
+    // The split event must arrive intact, not interrupted by a comment.
+    assert!(
+        !body.contains("pool-router waiting\n\n\"status\""),
+        "a comment landed inside the completion event: {body}"
+    );
+    for line in body.lines().filter(|line| line.starts_with("data:")) {
+        let payload = line.trim_start_matches("data:").trim();
+        serde_json::from_str::<Value>(payload)
+            .unwrap_or_else(|e| panic!("client could not decode {payload}: {e}"));
+    }
+}

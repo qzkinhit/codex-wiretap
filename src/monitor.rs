@@ -60,6 +60,13 @@ pub struct RequestRecord {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
+    /// Billed cache writes. Disjoint from cached_tokens, both inside input_tokens.
+    pub cache_write_tokens: Option<u64>,
+    pub cache_write_30m_tokens: Option<u64>,
+    pub cache_write_12h_tokens: Option<u64>,
+    /// Reported by the upstream as input_tokens + output_tokens. Consistency check only.
+    pub total_tokens: Option<u64>,
+    /// Already counted inside output_tokens. Never add it again when pricing.
     pub reasoning_tokens: Option<u64>,
     pub request_bytes: u64,
     pub upstream_request_bytes: Option<u64>,
@@ -88,9 +95,21 @@ pub struct Observation {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub cache_write_30m_tokens: Option<u64>,
+    pub cache_write_12h_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
     pub dropped_frames: u64,
     pub malformed_frames: u64,
+}
+
+/// Cache writes split by lifetime. The two counts do not overlap and sum to
+/// cache_write_tokens, so a missing split must not be inferred from the total.
+fn cache_write_ttl(usage: &Value, field: &str) -> Option<u64> {
+    usage["input_tokens_details"]["cache_write_tokens_details"][field]
+        .as_u64()
+        .or_else(|| usage["prompt_tokens_details"]["cache_write_tokens_details"][field].as_u64())
 }
 
 fn label(value: &Value) -> Option<String> {
@@ -314,6 +333,12 @@ pub fn inspect_json(data: &Value) -> Observation {
         cached_tokens: usage["input_tokens_details"]["cached_tokens"]
             .as_u64()
             .or_else(|| usage["prompt_tokens_details"]["cached_tokens"].as_u64()),
+        cache_write_tokens: usage["input_tokens_details"]["cache_write_tokens"]
+            .as_u64()
+            .or_else(|| usage["prompt_tokens_details"]["cache_write_tokens"].as_u64()),
+        cache_write_30m_tokens: cache_write_ttl(usage, "ttl_30m_tokens"),
+        cache_write_12h_tokens: cache_write_ttl(usage, "ttl_12h_tokens"),
+        total_tokens: usage["total_tokens"].as_u64(),
         reasoning_tokens: usage["output_tokens_details"]["reasoning_tokens"]
             .as_u64()
             .or_else(|| usage["completion_tokens_details"]["reasoning_tokens"].as_u64()),
@@ -334,6 +359,10 @@ impl Observation {
             input_tokens,
             output_tokens,
             cached_tokens,
+            cache_write_tokens,
+            cache_write_30m_tokens,
+            cache_write_12h_tokens,
+            total_tokens,
             reasoning_tokens
         );
         self.retryable |= update.retryable;
@@ -712,6 +741,59 @@ impl StoreState {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn usage_splits_input_into_ordinary_cached_and_written_tokens() {
+        // Numbers from the official prompt caching guide: the three input parts
+        // are disjoint and 12000 - 4000 - 7000 leaves 1000 ordinary tokens.
+        let frame = json!({"response":{"status":"completed","model":"gpt-6-astra","usage":{
+            "input_tokens":12000,
+            "output_tokens":1035,
+            "total_tokens":13035,
+            "input_tokens_details":{
+                "cached_tokens":4000,
+                "cache_write_tokens":7000,
+                "cache_write_tokens_details":{"ttl_30m_tokens":3000,"ttl_12h_tokens":4000}
+            },
+            "output_tokens_details":{"reasoning_tokens":832}
+        }}});
+        let mut parser = SseObserver::new();
+        parser.push(format!("event: response.completed\ndata: {frame}\n\n").as_bytes());
+        parser.finish();
+        let o = parser.observation();
+        assert_eq!(o.input_tokens, Some(12000));
+        assert_eq!(o.cached_tokens, Some(4000));
+        assert_eq!(o.cache_write_tokens, Some(7000));
+        assert_eq!(o.cache_write_30m_tokens, Some(3000));
+        assert_eq!(o.cache_write_12h_tokens, Some(4000));
+        assert_eq!(o.total_tokens, Some(13035));
+        // Reasoning is already inside output_tokens; it is read for display only.
+        assert_eq!(o.output_tokens, Some(1035));
+        assert_eq!(o.reasoning_tokens, Some(832));
+    }
+
+    #[test]
+    fn usage_accepts_chat_completions_naming_and_leaves_absent_splits_unset() {
+        let frame = json!({"response":{"status":"completed","model":"gpt-6.1-sol","usage":{
+            "prompt_tokens":90,
+            "completion_tokens":12,
+            "prompt_tokens_details":{"cached_tokens":64,"cache_write_tokens":16},
+            "completion_tokens_details":{"reasoning_tokens":4}
+        }}});
+        let mut parser = SseObserver::new();
+        parser.push(format!("event: response.completed\ndata: {frame}\n\n").as_bytes());
+        parser.finish();
+        let o = parser.observation();
+        assert_eq!(o.input_tokens, Some(90));
+        assert_eq!(o.output_tokens, Some(12));
+        assert_eq!(o.cached_tokens, Some(64));
+        assert_eq!(o.cache_write_tokens, Some(16));
+        // A missing lifetime split must stay unknown rather than be inferred.
+        assert_eq!(o.cache_write_30m_tokens, None);
+        assert_eq!(o.cache_write_12h_tokens, None);
+        assert_eq!(o.total_tokens, None);
+        assert_eq!(o.reasoning_tokens, Some(4));
+    }
 
     #[test]
     fn sse_arbitrary_chunks_crlf_and_multiline() {

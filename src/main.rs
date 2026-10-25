@@ -70,7 +70,8 @@ async fn run() -> Result<()> {
                     &cfg.local_token,
                     config_path
                         .parent()
-                        .ok_or_else(|| anyhow::anyhow!("配置目录无效"))?
+                        .ok_or_else(|| anyhow::anyhow!("配置目录无效"))?,
+                    u32::try_from(cfg.max_attempts.saturating_sub(1).max(1)).unwrap_or(15),
                 )?
             );
         }
@@ -178,11 +179,26 @@ async fn serve(cfg: Config, path: PathBuf) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(ms)).await;
         }
     });
+    let usage_weak = std::sync::Arc::downgrade(&state);
+    let usage_task = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let Some(s) = usage_weak.upgrade() else {
+                break;
+            };
+            let dir = s.state_dir();
+            let _ = tokio::task::spawn_blocking(move || s.usage.flush(&dir)).await;
+        }
+    });
     println!("Pool Router {} 已启动：{}", env!("CARGO_PKG_VERSION"), addr);
     println!("运行 pool-router open 打开控制台；默认自动读取 BiWrite，也可切换手动号池");
+    let closing = state.clone();
     let server = axum::serve(listener, proxy::router(state)).with_graceful_shutdown(shutdown());
     let result = server.await;
     sync_task.abort();
+    usage_task.abort();
+    // The timer may have slept through the last requests of this run.
+    let _ = closing.usage.flush(&closing.state_dir());
     result?;
     Ok(())
 }

@@ -156,6 +156,160 @@ function syncProgressBrief(sync) {
   return `验证 ${Number(sync.completed) || 0} / ${Number(sync.total) || 0}`;
 }
 
+/// Keeps small amounts readable: a tenth of a cent must not render as 0.00.
+/// Requests that never reached the upstream because the pool has no account for
+/// that model are reported apart from real failures.
+function requestOutcomeSummary(stats) {
+  const successes = Number(stats?.successes) || 0;
+  const failures = Number(stats?.failures) || 0;
+  const unassigned = Number(stats?.unassigned) || 0;
+  const parts = [];
+  if (failures) parts.push(`失败 ${failures} 次`);
+  if (unassigned) parts.push(`${unassigned} 次请求的模型号池里没有`);
+  return {
+    successes,
+    failures,
+    unassigned,
+    total: successes + failures,
+    text: parts.length ? `成功 ${successes} 次 · ${parts.join(" · ")}` : `全部 ${successes} 次都成功`,
+  };
+}
+
+/// Per-model availability, so the panel can say which model is actually usable.
+function modelReadiness(accounts) {
+  const rows = Array.isArray(accounts) ? accounts : [];
+  const models = new Map();
+  for (const account of rows) {
+    if (account?.present === false) continue;
+    const health = Array.isArray(account?.model_health) ? account.model_health : [];
+    for (const entry of health) {
+      const model = typeof entry?.model === "string" ? entry.model : "";
+      if (!model) continue;
+      const seen = models.get(model) || { model, total: 0, ready: 0 };
+      seen.total += 1;
+      const cooling = Number(entry?.cooldown_until_ms) || 0;
+      const disabled = account?.enabled === false || entry?.enabled === false;
+      if (!disabled && cooling <= 0) seen.ready += 1;
+      models.set(model, seen);
+    }
+  }
+  return [...models.values()].sort((left, right) => left.model.localeCompare(right.model));
+}
+
+/// One sentence for the top of the panel: can I use it right now, and if not,
+/// what do I do next. Written for someone who does not know the vocabulary.
+function poolReadiness(state) {
+  if (!state) return { tone: "down", headline: "正在连接本地服务", detail: "", action: "" };
+  const models = modelReadiness(state.accounts);
+  const usable = models.filter((row) => row.ready > 0);
+  const empty = models.filter((row) => row.ready === 0);
+  const manual = state.config?.source_mode === "manual";
+  if (!models.length) {
+    return {
+      tone: "warn",
+      headline: "还没有可用的账号",
+      detail: manual ? "手动池里还没有账号。" : "Pool Router 没有从 BiWrite 读到可用的号。",
+      action: manual ? "到「路由设置」里添加账号。" : "先在 BiWrite 里把号保活好，再点右上角「同步并验证保活」。",
+    };
+  }
+  if (!usable.length) {
+    return {
+      tone: "warn",
+      headline: "账号都在冷却或已停用，暂时用不了",
+      detail: `共 ${models.length} 个模型通道，现在没有一个可以分配。`,
+      action: "等几分钟自动恢复，或点「同步并验证保活」重新检查。",
+    };
+  }
+  const summary = usable.map((row) => `${row.model} ${row.ready} 个`).join("、");
+  return {
+    tone: empty.length ? "partial" : "ok",
+    headline: empty.length ? "部分模型可以用" : "可以用了",
+    detail: `现在可分配：${summary}。`,
+    action: empty.length
+      ? `${empty.map((row) => row.model).join("、")} 还没有可用的号，需要先在 BiWrite 保活再同步。`
+      : "在 Codex 里正常使用即可，请求会自动分配到空闲账号。",
+  };
+}
+
+function usageFormatAmount(value) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return "—";
+  if (amount === 0) return "0.00";
+  const magnitude = Math.abs(amount);
+  if (magnitude >= 100) return amount.toFixed(0);
+  if (magnitude >= 1) return amount.toFixed(2);
+  if (magnitude >= 0.01) return amount.toFixed(3);
+  return amount > 0 ? "<0.01" : ">-0.01";
+}
+
+function usageMoney(usd, pricing) {
+  const rate = Number(pricing?.usd_to_display);
+  const amount = Number(usd) || 0;
+  const display = Number.isFinite(rate) && rate > 0 ? amount * rate : null;
+  return {
+    usd: amount,
+    display,
+    currency: typeof pricing?.display_currency === "string" ? pricing.display_currency : "",
+  };
+}
+
+function usageTokenTotal(tokens) {
+  return (Number(tokens?.input) || 0) + (Number(tokens?.output) || 0);
+}
+
+/// Cached reads as a share of the input. Writes are billed, so they are not hits.
+function usageCacheHitRate(tokens) {
+  const input = Number(tokens?.input) || 0;
+  if (input <= 0) return null;
+  return (Number(tokens?.cached) || 0) / input;
+}
+
+/// What the cached part would have cost at the ordinary input price, minus what
+/// it did cost. Only meaningful when the model has a configured price.
+function usageCacheSavingUsd(tokens, prices, tierMultiplier = 1, rate = 1) {
+  if (!prices) return null;
+  const cached = Number(tokens?.cached) || 0;
+  const full = Number(prices.input);
+  const discounted = Number(prices.cached_input);
+  if (!Number.isFinite(full) || !Number.isFinite(discounted)) return null;
+  return (cached * (full - discounted)) / 1e6 * (Number(tierMultiplier) || 1) * (Number(rate) || 1);
+}
+
+/// Bars for one series, scaled to the largest value in the window.
+function usageBars(daily, pick) {
+  const rows = Array.isArray(daily) ? daily : [];
+  const values = rows.map((row) => Number(pick(row)) || 0);
+  const peak = Math.max(0, ...values);
+  return rows.map((row, index) => ({
+    date: typeof row?.date === "string" ? row.date : "",
+    value: values[index],
+    // A zero peak would divide by zero; an all-zero window draws no height.
+    ratio: peak > 0 ? values[index] / peak : 0,
+  }));
+}
+
+function usageShare(rows, pick) {
+  const list = Array.isArray(rows) ? rows : [];
+  const total = list.reduce((sum, row) => sum + (Number(pick(row)) || 0), 0);
+  return list.map((row) => ({
+    name: typeof row?.name === "string" ? row.name : "",
+    title: typeof row?.title === "string" ? row.title : "",
+    value: Number(pick(row)) || 0,
+    share: total > 0 ? (Number(pick(row)) || 0) / total : 0,
+    requests: Number(row?.requests) || 0,
+    unpriced: Number(row?.unpriced_requests) || 0,
+  }));
+}
+
+/// A day label short enough for an axis: "10/25", and the month when it changes.
+function usageDayLabel(date, previous) {
+  const parts = String(date || "").split("-");
+  if (parts.length !== 3) return "";
+  const [, month, day] = parts;
+  const previousMonth = String(previous || "").split("-")[1];
+  return previousMonth && previousMonth === month ? day : `${month}/${day}`;
+}
+
 function verifiesCandidates(config) {
   return config?.source_mode === "biwrite" && config?.biwrite_import_all !== true;
 }
@@ -297,7 +451,7 @@ function routingConfigPayload(draft, latestConfig) {
   };
 }
 
-if (typeof module !== "undefined" && module.exports) module.exports = { compareReleaseVersions, safeReleaseUrl, updateActionState, conversationInfo, matchesConversationFilter, classifyRequestOutcome, manualAccountPayload, requestRouteMode, classifyServiceTier, recordServiceTier, matchesServiceTierFilter, sourceProviderRows, draftFromConfig, routingConfigPayload, accountModels, filterAccounts, filterModelHealth, syncConfigPatch, syncActionLabel, syncResultText, syncProgressText, syncProgressBrief, verifiesCandidates, syncBusyLabel, sourceTimeState, redactSensitiveText, normalizeProbeResult, gatewayActionRows, attemptErrorDetails, effectiveOutputWait };
+if (typeof module !== "undefined" && module.exports) module.exports = { compareReleaseVersions, safeReleaseUrl, updateActionState, conversationInfo, matchesConversationFilter, classifyRequestOutcome, manualAccountPayload, requestRouteMode, classifyServiceTier, recordServiceTier, matchesServiceTierFilter, sourceProviderRows, draftFromConfig, routingConfigPayload, accountModels, filterAccounts, filterModelHealth, syncConfigPatch, syncActionLabel, syncResultText, syncProgressText, syncProgressBrief, requestOutcomeSummary, modelReadiness, poolReadiness, usageMoney, usageFormatAmount, usageTokenTotal, usageCacheHitRate, usageCacheSavingUsd, usageBars, usageShare, usageDayLabel, verifiesCandidates, syncBusyLabel, sourceTimeState, redactSensitiveText, normalizeProbeResult, gatewayActionRows, attemptErrorDetails, effectiveOutputWait };
 
 if (typeof document !== "undefined") (() => {
   const $ = (id) => document.getElementById(id);
@@ -470,12 +624,18 @@ if (typeof document !== "undefined") (() => {
     const present = accounts.filter((account) => account.present !== false);
     const ready = accounts.filter((account) => availableModelHealth(account).length ? availableModelHealth(account).some((health) => modelStatus(account, health).ready) : accountStatus(account).ready);
     const verified = present.flatMap((account) => availableModelHealth(account).length ? availableModelHealth(account).filter((health) => health.last_ok_ms || health.status === "healthy") : (account.last_ok_ms || account.status === "healthy" ? [account] : []));
+    const readiness = poolReadiness(state);
+    text("readiness-headline", readiness.headline);
+    text("readiness-detail", readiness.detail || "Codex → Pool Router → 上游服务。按会话分配。");
+    text("readiness-action", readiness.action);
+    $("readiness-headline").className = `readiness-${readiness.tone}`;
     text("stat-ready", ready.length);
     text("stat-total", `/ ${present.length} 个`);
     text("stat-verified", `${verified.length} 个模型通道有成功记录`);
     text("stat-active", count(state.stats?.active ?? 0));
-    text("stat-requests", count((state.stats?.successes || 0) + (state.stats?.failures || 0)));
-    text("stat-results", `成功 ${count(state.stats?.successes ?? 0)} 次 · 失败 ${count(state.stats?.failures ?? 0)} 次`);
+    const outcome = requestOutcomeSummary(state.stats);
+    text("stat-requests", count(outcome.total));
+    text("stat-results", outcome.text);
     const uptime = Math.max(0, Math.floor(state.uptime_seconds || 0));
     text("stat-uptime", uptime >= 86400 ? `${Math.floor(uptime / 86400)} 天 ${Math.floor(uptime % 86400 / 3600)} 时` : uptime >= 3600 ? `${Math.floor(uptime / 3600)} 时 ${Math.floor(uptime % 3600 / 60)} 分` : `${Math.floor(uptime / 60)} 分 ${uptime % 60} 秒`);
     text("stat-version", state.version ? `本地服务 v${state.version}` : "本地服务");
@@ -518,7 +678,12 @@ if (typeof document !== "undefined") (() => {
     const warnings = [];
     if (state.source?.last_error) warnings.push(state.source.last_error);
     if (Array.isArray(state.source?.warnings)) warnings.push(...state.source.warnings.filter((warning) => typeof warning === "string"));
-    showAlert("source-warning", warnings.join("；"));
+    const warningText = warnings.join("；");
+    $("source-warning").hidden = !warningText;
+    text("source-warning-summary", state.source?.last_error
+      ? "读取来源时出了问题，点开查看"
+      : `来源说明（${warnings.length} 条，点开查看）`);
+    text("source-warning-body", warningText);
     $("recording-status").className = `badge badge-${state.config?.recording_enabled ? "green" : "neutral"}`;
     text("recording-status", state.config?.recording_enabled ? "正在记录" : "记录已暂停");
   }
@@ -938,6 +1103,208 @@ if (typeof document !== "undefined") (() => {
     return cell;
   }
 
+  let usageData = null;
+  let usageSignature = "";
+
+  function usageAmount(usd, pricing, withUsd = true) {
+    const money = usageMoney(usd, pricing);
+    const display = money.display === null ? null : `${money.currency} ${usageFormatAmount(money.display)}`;
+    const usdText = `$${usageFormatAmount(money.usd)}`;
+    if (!display) return usdText;
+    return withUsd ? `${display} · ${usdText}` : display;
+  }
+
+  /// Bars are drawn as elements with a height class step, because the content
+  /// security policy forbids inline styles.
+  function renderUsageChart(id, bars, label) {
+    const host = $(id);
+    host.replaceChildren();
+    if (!bars.length) {
+      host.append(node("p", "usage-chart-empty", "所选范围还没有记录。"));
+      return;
+    }
+    const track = node("div", "usage-chart-track");
+    bars.forEach((bar, index) => {
+      const column = node("div", "usage-chart-column");
+      column.title = `${bar.date} · ${label(bar.value)}`;
+      const fill = node("div", "usage-chart-fill");
+      // Ten steps keep the stylesheet small while staying readable.
+      const step = bar.value > 0 ? Math.max(1, Math.round(bar.ratio * 10)) : 0;
+      fill.classList.add(`usage-step-${step}`);
+      column.append(fill);
+      const caption = node("span", "usage-chart-label", usageDayLabel(bar.date, bars[index - 1]?.date));
+      column.append(caption);
+      track.append(column);
+    });
+    host.append(track);
+    const peak = bars.reduce((max, bar) => Math.max(max, bar.value), 0);
+    host.append(node("p", "usage-chart-scale", `最高一天 ${label(peak)}`));
+  }
+
+  function renderUsageList(id, rows, pricing, nameOf) {
+    const host = $(id);
+    host.replaceChildren();
+    if (!rows.length) {
+      host.append(node("p", "usage-chart-empty", "今天还没有记录。"));
+      return;
+    }
+    for (const row of rows.slice(0, 8)) {
+      const line = node("div", "usage-bar-row");
+      const head = node("div", "usage-bar-head");
+      head.append(node("span", "usage-bar-name", nameOf ? nameOf(row) : row.name));
+      head.append(node("span", "usage-bar-value", usageAmount(row.value, pricing, false)));
+      line.append(head);
+      const track = node("div", "usage-bar-track");
+      const fill = node("div", "usage-bar-fill");
+      fill.classList.add(`usage-step-${Math.max(1, Math.round(row.share * 10))}`);
+      track.append(fill);
+      line.append(track);
+      const foot = `${count(row.requests)} 次请求${row.unpriced ? ` · ${count(row.unpriced)} 次无价格` : ""}`;
+      line.append(node("span", "usage-bar-foot", foot));
+      host.append(line);
+    }
+  }
+
+  function renderUsage() {
+    if (!usageData) return;
+    const pricing = usageData.pricing || {};
+    const today = usageData.today || {};
+    const range = usageData.range || {};
+    const signature = JSON.stringify([today, range, usageData.by_model, usageData.by_key, usageData.by_effort, usageData.by_conversation, pricing, $("usage-range").value]);
+    if (signature === usageSignature) return;
+    usageSignature = signature;
+
+    text("usage-today-cost", usageAmount(today.cost_usd, pricing, false));
+    $("usage-today-cost").title = usageAmount(today.cost_usd, pricing);
+    text("usage-today-cost-foot", `${count(today.requests)} 次计入统计${today.unpriced_requests ? ` · ${count(today.unpriced_requests)} 次模型无价格` : ""}`);
+    text("usage-today-tokens", count(usageTokenTotal(today.tokens)));
+    text("usage-today-tokens-foot", `输入 ${count(today.tokens?.input)} · 输出 ${count(today.tokens?.output)} · 其中思考 ${count(today.tokens?.reasoning)}`);
+    text("usage-range-cost", usageAmount(range.cost_usd, pricing, false));
+    text("usage-range-foot", `${count(range.days)} 天合计 ${count(usageTokenTotal(range.tokens))} token`);
+
+    const hit = usageCacheHitRate(today.tokens);
+    text("usage-cache-rate", hit === null ? "—" : `${Math.round(hit * 100)}%`);
+    const modelName = (usageData.by_model || [])[0]?.name;
+    const prices = pricing.models?.[modelName]?.short;
+    const saving = usageCacheSavingUsd(today.tokens, prices, pricing.tier_multipliers?.standard ?? 1, pricing.rate_multiplier ?? 1);
+    text("usage-cache-foot", saving && saving > 0
+      ? `缓存读取比普通输入省下约 ${usageAmount(saving, pricing, false)}`
+      : "缓存读取占输入的比例");
+
+    const uncounted = Number(range.uncounted_requests) || 0;
+    showAlert("usage-warning", uncounted
+      ? `所选范围内有 ${numberFormatter.format(uncounted)} 次请求没有收到上游用量，未计入统计。中途断流或上游报错时会出现这种情况。`
+      : "");
+
+    renderUsageChart("usage-cost-chart", usageBars(usageData.daily, (row) => row.cost_usd), (value) => usageAmount(value, pricing, false));
+    renderUsageChart("usage-token-chart", usageBars(usageData.daily, (row) => usageTokenTotal(row.tokens)), (value) => `${numberFormatter.format(Math.round(value))} token`);
+
+    renderUsageList("usage-by-model", usageShare(usageData.by_model, (row) => row.cost_usd), pricing);
+    renderUsageList("usage-by-effort", usageShare(usageData.by_effort, (row) => row.cost_usd), pricing);
+    renderUsageList("usage-by-key", usageShare(usageData.by_key, (row) => row.cost_usd), pricing, (row) => accountLabel(row.name));
+    renderUsageList("usage-by-conversation", usageShare(usageData.by_conversation, (row) => row.cost_usd), pricing, conversationLabel);
+
+    text("pricing-source", pricing.source_note || "");
+    if (!$("usage-pricing").open) fillPricingForm(pricing);
+  }
+
+  /// Account ids are digests; show the nickname the pool already displays.
+  function accountLabel(id) {
+    const account = (state?.accounts || []).find((row) => row.id === id);
+    return account?.label ? `${account.label}` : `${String(id).slice(0, 8)}…`;
+  }
+
+  function conversationLabel(row) {
+    const title = typeof row?.title === "string" ? row.title.trim() : "";
+    return title || `${String(row?.name || "").slice(0, 8)}…`;
+  }
+
+  function fillPricingForm(pricing) {
+    $("pricing-rate").value = pricing.rate_multiplier ?? 1;
+    $("pricing-currency").value = pricing.display_currency ?? "";
+    $("pricing-fx").value = pricing.usd_to_display ?? "";
+    $("pricing-offset").value = pricing.day_offset_minutes ?? 0;
+    const host = $("usage-price-rows");
+    host.replaceChildren();
+    for (const [model, prices] of Object.entries(pricing.models || {})) {
+      for (const bucket of ["short", "long"]) {
+        const row = node("tr");
+        const head = node("th", null, bucket === "short" ? model : "");
+        head.scope = "row";
+        row.append(head);
+        row.append(node("td", null, bucket === "short" ? "≤ 272K" : "> 272K"));
+        for (const field of ["input", "cached_input", "cache_write_30m", "cache_write_12h", "output"]) {
+          const cell = node("td");
+          const input = document.createElement("input");
+          input.type = "number";
+          input.step = "0.01";
+          input.min = "0";
+          input.max = "10000";
+          input.value = prices?.[bucket]?.[field] ?? 0;
+          input.dataset.model = model;
+          input.dataset.bucket = bucket;
+          input.dataset.field = field;
+          input.className = "usage-price-input";
+          input.setAttribute("aria-label", `${model} ${bucket === "short" ? "短上下文" : "长上下文"} ${field}`);
+          cell.append(input);
+          row.append(cell);
+        }
+        host.append(row);
+      }
+    }
+  }
+
+  function pricingFromForm(base) {
+    const pricing = JSON.parse(JSON.stringify(base || {}));
+    pricing.rate_multiplier = Number($("pricing-rate").value);
+    pricing.display_currency = $("pricing-currency").value.trim();
+    pricing.usd_to_display = Number($("pricing-fx").value);
+    pricing.day_offset_minutes = Number($("pricing-offset").value);
+    for (const input of document.querySelectorAll(".usage-price-input")) {
+      const { model, bucket, field } = input.dataset;
+      if (!pricing.models?.[model]?.[bucket]) continue;
+      pricing.models[model][bucket][field] = Number(input.value);
+    }
+    return pricing;
+  }
+
+  let configFilesLoaded = false;
+
+  async function refreshConfigFiles() {
+    const host = $("config-file-list");
+    try {
+      const result = await api("/api/config/files");
+      host.replaceChildren();
+      for (const file of result?.files || []) {
+        const block = node("section", "config-file");
+        const head = node("div", "config-file-head");
+        head.append(node("h4", null, file.name));
+        const path = node("code", "config-file-path", file.path);
+        head.append(path);
+        block.append(head);
+        if (file.note) block.append(node("p", "config-file-note", file.note));
+        block.append(node("pre", "config-file-body", file.content || "（文件为空或无法读取）"));
+        host.append(block);
+      }
+      configFilesLoaded = true;
+    } catch (error) {
+      host.replaceChildren(node("p", "config-file-note", error.message));
+    }
+  }
+
+  $("config-files").addEventListener("toggle", () => {
+    if ($("config-files").open && !configFilesLoaded) refreshConfigFiles();
+  });
+
+  async function refreshUsage() {
+    try {
+      usageData = await api(`/api/usage?days=${encodeURIComponent($("usage-range").value)}`);
+      renderUsage();
+    } catch (error) {
+      showAlert("usage-warning", error.message);
+    }
+  }
+
   function renderRecords(force = false) {
     const selectedModel = $("filter-model").value;
     const conversation = $("filter-conversation").value.trim().toLowerCase();
@@ -1103,12 +1470,13 @@ if (typeof document !== "undefined") (() => {
       if (selected && focus) button.focus();
     }
     if (tabName === "monitor") { renderRecords(true); refreshRecords(); }
+    if (tabName === "usage") refreshUsage();
   }
 
   document.querySelectorAll("[data-tab]").forEach((button) => {
     button.addEventListener("click", () => switchTab(button.dataset.tab));
     button.addEventListener("keydown", (event) => {
-      const tabs = ["accounts", "routing", "monitor"];
+      const tabs = ["accounts", "routing", "usage", "monitor"];
       const index = tabs.indexOf(activeTab);
       let next = null;
       if (event.key === "ArrowRight") next = tabs[(index + 1) % tabs.length];
@@ -1198,6 +1566,26 @@ if (typeof document !== "undefined") (() => {
   }
   $("pause-sync-button").addEventListener("click", () => updateSyncConfig("pause"));
   $("sync-scope-button").addEventListener("click", () => updateSyncConfig("scope"));
+
+  $("usage-range").addEventListener("change", () => { usageSignature = ""; refreshUsage(); });
+
+  $("usage-pricing-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const button = $("pricing-save");
+    button.disabled = true;
+    try {
+      const result = await api("/api/usage/pricing", { method: "POST", body: pricingFromForm(usageData?.pricing) });
+      if (usageData && result?.pricing) usageData.pricing = result.pricing;
+      usageSignature = "";
+      await refreshUsage();
+      toast("价目表已保存，金额按新单价重新折算。", "success");
+    } catch (error) { toast(error.message, "error"); }
+    finally { button.disabled = false; }
+  });
+
+  $("pricing-reset").addEventListener("click", () => {
+    if (usageData?.pricing) fillPricingForm(usageData.pricing);
+  });
 
   $("sync-button").addEventListener("click", async () => {
     if (pendingActions.has("sync") || state?.sync?.running) return;
@@ -1356,7 +1744,7 @@ if (typeof document !== "undefined") (() => {
   for (const id of ["filter-model", "filter-status", "filter-tier"]) $(id).addEventListener("change", () => renderRecords(true));
   $("filter-conversation").addEventListener("input", () => renderRecords(true));
   $("refresh-records").addEventListener("click", async () => { $("refresh-records").disabled = true; await refreshRecords(); $("refresh-records").disabled = false; });
-  document.addEventListener("visibilitychange", () => { if (!document.hidden) { refreshState(); if (activeTab === "monitor") refreshRecords(); } });
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) { refreshState(); if (activeTab === "monitor") refreshRecords(); if (activeTab === "usage") refreshUsage(); } });
   window.addEventListener("beforeunload", (event) => { if (formDirty || manualFormHasInput()) { event.preventDefault(); event.returnValue = ""; } });
 
   if (!sessionToken) {
@@ -1376,6 +1764,6 @@ if (typeof document !== "undefined") (() => {
     refreshState();
     refreshRecords();
     refreshManualAccounts();
-    window.setInterval(() => { if (!document.hidden) { refreshState(); if (activeTab === "monitor") refreshRecords(); if ($("manual-editor").open || document.querySelector('input[name="source_mode"]:checked')?.value === "manual") refreshManualAccounts(); } }, 2000);
+    window.setInterval(() => { if (!document.hidden) { refreshState(); if (activeTab === "monitor") refreshRecords(); if (activeTab === "usage") refreshUsage(); if ($("manual-editor").open || document.querySelector('input[name="source_mode"]:checked')?.value === "manual") refreshManualAccounts(); } }, 2000);
   }
 })();

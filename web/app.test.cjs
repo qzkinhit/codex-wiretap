@@ -2,7 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { compareReleaseVersions, safeReleaseUrl, updateActionState, conversationInfo, matchesConversationFilter, classifyRequestOutcome, manualAccountPayload, requestRouteMode, classifyServiceTier, recordServiceTier, matchesServiceTierFilter, sourceProviderRows, draftFromConfig, routingConfigPayload, accountModels, filterAccounts, filterModelHealth, syncConfigPatch, syncActionLabel, syncResultText, syncProgressText, syncProgressBrief, verifiesCandidates, syncBusyLabel, sourceTimeState, normalizeProbeResult, gatewayActionRows, attemptErrorDetails, effectiveOutputWait } = require("./app.js");
+const { compareReleaseVersions, safeReleaseUrl, updateActionState, conversationInfo, matchesConversationFilter, classifyRequestOutcome, manualAccountPayload, requestRouteMode, classifyServiceTier, recordServiceTier, matchesServiceTierFilter, sourceProviderRows, draftFromConfig, routingConfigPayload, accountModels, filterAccounts, filterModelHealth, syncConfigPatch, syncActionLabel, syncResultText, syncProgressText, syncProgressBrief, requestOutcomeSummary, modelReadiness, poolReadiness, usageMoney, usageFormatAmount, usageTokenTotal, usageCacheHitRate, usageCacheSavingUsd, usageBars, usageShare, usageDayLabel, verifiesCandidates, syncBusyLabel, sourceTimeState, normalizeProbeResult, gatewayActionRows, attemptErrorDetails, effectiveOutputWait } = require("./app.js");
 
 test("retry settings distinguish fifteen retries from sixteen total attempts and support both boundaries", () => {
   const defaults = draftFromConfig({});
@@ -415,4 +415,134 @@ test("only candidate verification announces verifying while other sources announ
     assert.equal(syncBusyLabel(config), "正在读取…");
   }
   assert.equal(verifiesCandidates({ source_mode: "manual", biwrite_import_all: false }), false);
+});
+
+test("money shows both currencies and falls back to dollars without a rate", () => {
+  const both = usageMoney(2, { usd_to_display: 7.2, display_currency: "CNY" });
+  assert.equal(both.usd, 2);
+  assert.ok(Math.abs(both.display - 14.4) < 1e-9);
+  assert.equal(both.currency, "CNY");
+  for (const pricing of [{}, { usd_to_display: 0 }, { usd_to_display: -1 }, { usd_to_display: "x" }]) {
+    assert.equal(usageMoney(2, pricing).display, null);
+  }
+  assert.equal(usageMoney(undefined, {}).usd, 0);
+});
+
+test("cache hit rate counts reads only and needs a non-empty input", () => {
+  assert.equal(usageCacheHitRate({ input: 100, cached: 80, cache_write_30m: 20 }), 0.8);
+  assert.equal(usageCacheHitRate({ input: 0, cached: 0 }), null);
+  assert.equal(usageCacheHitRate(undefined), null);
+  assert.equal(usageTokenTotal({ input: 100, output: 12 }), 112);
+  assert.equal(usageTokenTotal(undefined), 0);
+});
+
+test("cache saving is the discount against the ordinary input price", () => {
+  const prices = { input: 10, cached_input: 1 };
+  // 1e6 cached tokens at a 9 dollar discount per million.
+  assert.equal(usageCacheSavingUsd({ cached: 1_000_000 }, prices), 9);
+  assert.equal(usageCacheSavingUsd({ cached: 1_000_000 }, prices, 2, 1.5), 27);
+  assert.equal(usageCacheSavingUsd({ cached: 100 }, null), null);
+  assert.equal(usageCacheSavingUsd({ cached: 100 }, { input: "x", cached_input: 1 }), null);
+});
+
+test("bars scale to the tallest day and an empty window draws nothing", () => {
+  const daily = [
+    { date: "2026-10-23", cost_usd: 1 },
+    { date: "2026-10-24", cost_usd: 4 },
+    { date: "2026-10-25", cost_usd: 0 },
+  ];
+  const bars = usageBars(daily, (row) => row.cost_usd);
+  assert.deepEqual(bars.map((bar) => bar.ratio), [0.25, 1, 0]);
+  assert.deepEqual(bars.map((bar) => bar.date), ["2026-10-23", "2026-10-24", "2026-10-25"]);
+  assert.deepEqual(usageBars([], (row) => row.cost_usd), []);
+  assert.deepEqual(usageBars(undefined, (row) => row.cost_usd), []);
+  // An all-zero window must not divide by zero.
+  assert.deepEqual(usageBars([{ date: "2026-10-25", cost_usd: 0 }], (row) => row.cost_usd)[0].ratio, 0);
+});
+
+test("shares sum to one and survive a zero total", () => {
+  const rows = [
+    { name: "a", cost_usd: 3, requests: 2 },
+    { name: "b", cost_usd: 1, requests: 1, unpriced_requests: 1 },
+  ];
+  const shares = usageShare(rows, (row) => row.cost_usd);
+  assert.deepEqual(shares.map((row) => row.share), [0.75, 0.25]);
+  assert.equal(shares[1].unpriced, 1);
+  assert.equal(shares[0].requests, 2);
+  const zero = usageShare([{ name: "a", cost_usd: 0 }], (row) => row.cost_usd);
+  assert.equal(zero[0].share, 0);
+  assert.deepEqual(usageShare(undefined, (row) => row.cost_usd), []);
+});
+
+test("day labels repeat the month only when it changes", () => {
+  assert.equal(usageDayLabel("2026-10-25", "2026-10-24"), "25");
+  assert.equal(usageDayLabel("2026-11-01", "2026-10-31"), "11/01");
+  assert.equal(usageDayLabel("2026-10-25", undefined), "10/25");
+  assert.equal(usageDayLabel("bad", "2026-10-24"), "");
+});
+
+test("small amounts stay visible instead of rounding to zero", () => {
+  assert.equal(usageFormatAmount(0), "0.00");
+  assert.equal(usageFormatAmount(0.0006), "<0.01");
+  assert.equal(usageFormatAmount(0.012), "0.012");
+  assert.equal(usageFormatAmount(1.5), "1.50");
+  assert.equal(usageFormatAmount(1234.5), "1235");
+  assert.equal(usageFormatAmount(-0.0006), ">-0.01");
+  assert.equal(usageFormatAmount("x"), "—");
+  assert.equal(usageFormatAmount(undefined), "—");
+});
+
+test("readiness counts each model separately and ignores cooling or disabled accounts", () => {
+  const accounts = [
+    { present: true, model_health: [{ model: "sol" }, { model: "astra", cooldown_until_ms: 2_000_000_000_000 }] },
+    { present: true, model_health: [{ model: "sol" }, { model: "astra" }], enabled: false },
+    { present: false, model_health: [{ model: "sol" }] },
+  ];
+  assert.deepEqual(modelReadiness(accounts), [
+    { model: "astra", total: 2, ready: 0 },
+    { model: "sol", total: 2, ready: 1 },
+  ]);
+  assert.deepEqual(modelReadiness(undefined), []);
+});
+
+test("readiness says plainly whether the pool can serve and what to do next", () => {
+  assert.equal(poolReadiness(undefined).tone, "down");
+
+  const none = poolReadiness({ accounts: [] });
+  assert.equal(none.tone, "warn");
+  assert.match(none.action, /BiWrite/);
+
+  const manual = poolReadiness({ accounts: [], config: { source_mode: "manual" } });
+  assert.match(manual.action, /路由设置/);
+
+  const cooling = poolReadiness({ accounts: [{ present: true, model_health: [{ model: "sol", cooldown_until_ms: 2_000_000_000_000 }] }] });
+  assert.equal(cooling.tone, "warn");
+  assert.match(cooling.headline, /用不了/);
+
+  const partial = poolReadiness({ accounts: [{ present: true, model_health: [{ model: "sol" }, { model: "astra", cooldown_until_ms: 2_000_000_000_000 }] }] });
+  assert.equal(partial.tone, "partial");
+  assert.match(partial.detail, /sol 1 个/);
+  assert.match(partial.action, /astra/);
+
+  const ready = poolReadiness({ accounts: [{ present: true, model_health: [{ model: "sol" }] }] });
+  assert.equal(ready.tone, "ok");
+  assert.equal(ready.headline, "可以用了");
+  assert.match(ready.action, /Codex/);
+});
+
+test("requests for a model the pool lacks are reported apart from failures", () => {
+  const clean = requestOutcomeSummary({ successes: 7, failures: 0, unassigned: 0 });
+  assert.equal(clean.text, "全部 7 次都成功");
+  assert.equal(clean.total, 7);
+
+  const mixed = requestOutcomeSummary({ successes: 10, failures: 3, unassigned: 22 });
+  assert.match(mixed.text, /成功 10 次/);
+  assert.match(mixed.text, /失败 3 次/);
+  assert.match(mixed.text, /22 次请求的模型号池里没有/);
+  // Unassigned requests never reached the upstream, so they are not in the total.
+  assert.equal(mixed.total, 13);
+
+  const onlyUnassigned = requestOutcomeSummary({ successes: 0, unassigned: 5 });
+  assert.match(onlyUnassigned.text, /5 次请求的模型号池里没有/);
+  assert.equal(requestOutcomeSummary(undefined).text, "全部 0 次都成功");
 });

@@ -18,7 +18,7 @@
     </header>
 
     <main>
-      <section class="intro"><div><div class="eyebrow">本地路由控制台</div><h1>让每个号池都用起来。</h1><p>Codex → Pool Router → 上游服务。按会话分配，实时查看路由与请求状态。</p></div><div class="endpoint-chip"><span class="endpoint-label">本地接入地址</span><div><code id="base-url">等待连接</code><button class="icon-button" id="copy-url" type="button" aria-label="复制本地接入地址" title="复制接入地址">⧉</button></div></div></section>
+      <section class="intro"><div><div class="eyebrow">本地路由控制台</div><h1 id="readiness-headline">正在连接本地服务</h1><p id="readiness-detail">Codex → Pool Router → 上游服务。按会话分配，实时查看路由与请求状态。</p><p class="readiness-action" id="readiness-action"></p></div><div class="endpoint-chip"><span class="endpoint-label">本地接入地址</span><div><code id="base-url">等待连接</code><button class="icon-button" id="copy-url" type="button" aria-label="复制本地接入地址" title="复制接入地址">⧉</button></div></div></section>
 
       <div class="alert alert-error" id="connection-error" role="alert" hidden></div>
       <div class="alert alert-note" id="connection-note" hidden></div>
@@ -31,12 +31,12 @@
         <article class="stat-card"><span class="stat-label">运行时长</span><div class="stat-main"><strong class="stat-time" id="stat-uptime">—</strong></div><span class="stat-foot" id="stat-version">本地服务</span></article>
       </section>
 
-      <div class="workspace-header"><nav class="tabs" role="tablist" aria-label="控制台页面"><button class="tab active" id="tab-accounts" role="tab" aria-controls="panel-accounts" aria-selected="true" data-tab="accounts" type="button">号池<span id="account-count" class="count">0</span></button><button class="tab" id="tab-routing" role="tab" aria-controls="panel-routing" aria-selected="false" tabindex="-1" data-tab="routing" type="button">路由设置</button><button class="tab" id="tab-monitor" role="tab" aria-controls="panel-monitor" aria-selected="false" tabindex="-1" data-tab="monitor" type="button">请求监控</button></nav><span class="poll-hint"><span class="status-dot"></span>每 2 秒更新</span></div>
+      <div class="workspace-header"><nav class="tabs" role="tablist" aria-label="控制台页面"><button class="tab active" id="tab-accounts" role="tab" aria-controls="panel-accounts" aria-selected="true" data-tab="accounts" type="button">号池<span id="account-count" class="count">0</span></button><button class="tab" id="tab-routing" role="tab" aria-controls="panel-routing" aria-selected="false" tabindex="-1" data-tab="routing" type="button">路由设置</button><button class="tab" id="tab-usage" role="tab" aria-controls="panel-usage" aria-selected="false" tabindex="-1" data-tab="usage" type="button">用量与花费</button><button class="tab" id="tab-monitor" role="tab" aria-controls="panel-monitor" aria-selected="false" tabindex="-1" data-tab="monitor" type="button">请求监控</button></nav><span class="poll-hint"><span class="status-dot"></span>每 2 秒更新</span></div>
 
       <section id="panel-accounts" role="tabpanel" aria-labelledby="tab-accounts" class="tab-panel">
         <div class="panel-heading"><div><h2 id="source-heading">BiWrite 保活候选</h2><p id="source-description">每 1.5 秒自动读取 BiWrite 候选号池及 Key 昵称。可用性以探测或实际代理请求的结果为准。</p></div><div class="source-heading-actions"><div class="source-time" id="source-time">等待首次读取</div><button class="button button-secondary button-small" id="manage-sources" type="button">来源与手动池</button></div></div>
         <div class="source-controls"><div><span id="sync-mode-status" class="badge badge-neutral">等待同步状态</span><p id="sync-mode-description">可暂停自动同步，或持续同步全部 Key。</p></div><button class="button button-secondary button-small" id="sync-scope-button" type="button" disabled>持续同步全部 Key</button></div>
-        <div class="alert alert-warning" id="source-warning" hidden></div>
+        <details class="alert alert-warning source-warning" id="source-warning" hidden><summary id="source-warning-summary">来源说明</summary><div id="source-warning-body"></div></details>
         <section class="source-sync" id="source-sync" aria-labelledby="source-sync-heading" hidden><div class="source-sync-heading"><h3 id="source-sync-heading">来源同步</h3><p id="source-sync-description">显示当前上游的全部模型配置。保活候选与历史成功均不保证实时可用。</p></div><div class="source-sync-table-wrap"><table class="source-sync-table"><thead><tr><th scope="col">模型</th><th scope="col">配置 Key</th><th scope="col">保活候选</th><th scope="col">已导入</th><th scope="col">同步说明</th></tr></thead><tbody id="source-provider-list"></tbody></table></div></section>
         <div id="accounts-empty" class="empty-state" hidden><span class="empty-symbol" aria-hidden="true">▦</span><h3 id="accounts-empty-title">还没有同步到号池</h3><p id="accounts-empty-description">先在 BiWrite 配置上游服务并运行保活，再点击「同步并验证保活」。Pool Router 会发送小请求验证候选，明确失效的模型将退出号池。</p></div>
         <div class="account-filter"><div class="model-filter-list" id="account-model-filter" role="group" aria-label="按模型筛选号池"></div><p id="account-filter-summary">筛选仅影响当前视图，不改变路由。</p></div>
@@ -78,6 +78,62 @@
         </form>
         <details id="manual-editor" class="manual-editor"><summary>手动池管理 <span id="manual-count" class="count">0</span><span class="manual-summary-note">可提前维护，保存来源设置后才会切换</span></summary><div class="manual-editor-body"><p class="manual-explanation" id="manual-effect-note">当前使用自动来源时，增删手动池不会改变当前路由。相同 Key 再次提交会更新该账号。</p><div class="alert alert-warning" id="manual-error" hidden></div><form id="manual-form" autocomplete="off"><div class="manual-form-grid"><label class="field"><span>上游 Key</span><input id="manual-key" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required placeholder="仅提交给本机，不回显已存 Key"><small>添加或更新均需输入 Key，成功后清空。</small></label><label class="field"><span>模型 ID</span><input id="manual-models" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" required placeholder="gpt-6-astra, gpt-6.1-sol"><small>多个模型用逗号分隔。</small></label><label class="field"><span>昵称（可选）</span><input id="manual-label" type="text" autocomplete="off" maxlength="120" placeholder="例如：备用账号"></label><label class="field"><span>每模型并发上限</span><input id="manual-concurrency" type="number" min="1" max="128" step="1" value="1" required></label></div><div class="manual-form-actions"><span>Key 不写入浏览器存储，只保存到本机手动池。</span><button id="save-manual-account" class="button button-primary" type="submit">添加或更新账号</button></div></form><div class="manual-list" id="manual-list"></div><div class="subtle-note" id="manual-empty">手动池尚未添加账号。空池不能切换为手动来源。</div><p class="manual-delete-note">删除会立即移除手动池账号。若当前指定该账号，不会自动改用其他账号。</p></div></details>
         <div class="info-strip"><span class="info-icon" aria-hidden="true">i</span><p>切换同一供应商的号池，不代表上下文不再传输。上下文是否重传取决于请求协议与会话状态；缓存命中取决于上游实现。监控会分别显示输入规模和缓存 token。</p></div>
+      <details class="usage-pricing config-files" id="config-files">
+        <summary>查看配置文件<span class="badge badge-neutral">只读</span></summary>
+        <div class="usage-pricing-body">
+          <p>这里显示决定行为的两个文件，密钥已隐去。上面的表单改完保存会写回 Pool Router 的配置；要手工微调可以直接编辑文件，改完重启本地服务生效。</p>
+          <div id="config-file-list"></div>
+        </div>
+      </details>
+      </section>
+
+      <section id="panel-usage" role="tabpanel" aria-labelledby="tab-usage" class="tab-panel" hidden>
+        <div class="panel-heading"><div><h2>每天用了多少，花了多少</h2><p id="usage-description">按上游返回的用量统计，金额是按下方价目表折算的估算值，不是账单。</p></div><div class="source-heading-actions"><label class="usage-range-label" for="usage-range">统计范围</label><select id="usage-range"><option value="7">近 7 天</option><option value="30" selected>近 30 天</option><option value="90">近 90 天</option></select></div></div>
+
+        <section class="stats-grid" aria-label="今日用量">
+          <article class="stat-card"><span class="stat-label">今天花费</span><div class="stat-main"><strong id="usage-today-cost">—</strong></div><span class="stat-foot" id="usage-today-cost-foot">等待用量数据</span></article>
+          <article class="stat-card"><span class="stat-label">今天 token</span><div class="stat-main"><strong id="usage-today-tokens">—</strong></div><span class="stat-foot" id="usage-today-tokens-foot">输入与输出合计</span></article>
+          <article class="stat-card"><span class="stat-label">区间花费</span><div class="stat-main"><strong id="usage-range-cost">—</strong></div><span class="stat-foot" id="usage-range-foot">所选范围合计</span></article>
+          <article class="stat-card"><span class="stat-label">缓存命中</span><div class="stat-main"><strong id="usage-cache-rate">—</strong></div><span class="stat-foot" id="usage-cache-foot">缓存读取占输入的比例</span></article>
+        </section>
+
+        <div class="alert alert-warning" id="usage-warning" hidden></div>
+
+        <section class="usage-chart-block" aria-labelledby="usage-cost-chart-heading">
+          <div class="usage-chart-heading"><h3 id="usage-cost-chart-heading">每日花费</h3><p id="usage-cost-chart-note">柱高按所选范围内的最大值缩放。</p></div>
+          <div class="usage-chart" id="usage-cost-chart"></div>
+        </section>
+
+        <section class="usage-chart-block" aria-labelledby="usage-token-chart-heading">
+          <div class="usage-chart-heading"><h3 id="usage-token-chart-heading">每日 token</h3><p>输入与输出合计。与花费分开看，因为两者量纲不同。</p></div>
+          <div class="usage-chart" id="usage-token-chart"></div>
+        </section>
+
+        <div class="usage-breakdowns">
+          <section class="usage-breakdown" aria-labelledby="usage-by-model-heading"><h3 id="usage-by-model-heading">按模型</h3><div class="usage-bar-list" id="usage-by-model"></div></section>
+          <section class="usage-breakdown" aria-labelledby="usage-by-effort-heading"><h3 id="usage-by-effort-heading">按推理档位</h3><div class="usage-bar-list" id="usage-by-effort"></div></section>
+          <section class="usage-breakdown" aria-labelledby="usage-by-key-heading"><h3 id="usage-by-key-heading">按账号</h3><div class="usage-bar-list" id="usage-by-key"></div></section>
+          <section class="usage-breakdown" aria-labelledby="usage-by-conversation-heading"><h3 id="usage-by-conversation-heading">按对话</h3><div class="usage-bar-list" id="usage-by-conversation"></div></section>
+        </div>
+
+        <details class="usage-pricing" id="usage-pricing">
+          <summary>价目表与汇率<span id="usage-pricing-badge" class="badge badge-neutral">按公开标准价</span></summary>
+          <div class="usage-pricing-body">
+            <p id="usage-pricing-note">单价按美元每百万 token 填写。中转服务按自己的倍率结算，可用下面的结算倍率一次性折算，也可直接改每个模型的单价。</p>
+            <form id="usage-pricing-form">
+              <div class="field-grid">
+                <label class="field"><span>结算倍率</span><input id="pricing-rate" type="number" step="0.01" min="0" max="1000"><small>上游按官方价的几倍结算，1 表示与所填单价一致。</small></label>
+                <label class="field"><span>显示货币</span><input id="pricing-currency" type="text" maxlength="8"><small>金额同时显示美元与这个货币。</small></label>
+                <label class="field"><span>汇率</span><input id="pricing-fx" type="number" step="0.0001" min="0" max="10000"><small>1 美元折合多少显示货币。</small></label>
+                <label class="field"><span>日界偏移（分钟）</span><input id="pricing-offset" type="number" step="30" min="-1440" max="1440"><small>按哪个时区切分「今天」。东八区填 480。</small></label>
+              </div>
+              <div class="usage-price-table-wrap"><table class="usage-price-table"><thead><tr><th scope="col">模型</th><th scope="col">上下文</th><th scope="col">输入</th><th scope="col">缓存读取</th><th scope="col">缓存写入 30 分钟</th><th scope="col">缓存写入 12 小时</th><th scope="col">输出</th></tr></thead><tbody id="usage-price-rows"></tbody></table></div>
+              <div class="form-actions"><button class="button button-primary" id="pricing-save" type="submit">保存价目表</button><button class="button button-secondary" id="pricing-reset" type="button">还原为已保存的值</button><span id="pricing-source" class="usage-pricing-source"></span></div>
+            </form>
+          </div>
+        </details>
+
+        <div class="info-strip"><span class="info-icon" aria-hidden="true">i</span><p id="usage-footnote">统计只包含上游返回了用量的请求。推理 token 已经计入输出，不重复计价；缓存写入按公开价高于普通输入，缺少生命期细分时按较便宜的 30 分钟价估算。托管工具的按次费用不在用量里，因此这里是 token 花费而不是账单总额。</p></div>
       </section>
 
       <section id="panel-monitor" role="tabpanel" aria-labelledby="tab-monitor" class="tab-panel" hidden>

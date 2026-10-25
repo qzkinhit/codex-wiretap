@@ -10,12 +10,13 @@ use crate::{
     scheduler::{Scheduler, SelectError, Selection},
     types::{ProviderSummary, RoutingPolicy, SourceSnapshot, now_ms},
     updates::UpdateService,
+    usage,
 };
 use anyhow::Result;
 use axum::{
     Json, Router,
     body::{Body, Bytes, to_bytes},
-    extract::{DefaultBodyLimit, Path, Request, State},
+    extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, Uri},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -84,6 +85,10 @@ pub struct Counters {
     requests: AtomicU64,
     successes: AtomicU64,
     failures: AtomicU64,
+    /// Requests naming a model the pool holds no account for at all. The
+    /// upstream often does not offer that model either, so counting these as
+    /// routing failures would misrepresent the pool.
+    unassigned: AtomicU64,
     active: AtomicU64,
     waiting_streams: AtomicU64,
 }
@@ -94,6 +99,9 @@ pub struct AppState {
     pub scheduler: Scheduler,
     probe_scheduler: Scheduler,
     pub records: RecordStore,
+    /// Per-day token accounting. Independent of `records`, which only keeps the
+    /// most recent requests and cannot answer "how much did today cost".
+    pub usage: usage::Ledger,
     /// Local display metadata only. Titles never enter the persisted request log.
     pub conversations: Arc<ConversationIndex>,
     pub updates: UpdateService,
@@ -127,6 +135,11 @@ impl AppState {
                 .join("records.jsonl")
         });
         let records = RecordStore::new(data_path, config.record_limit)?;
+        let state_dir = config_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf();
+        let usage = usage::Ledger::load(&state_dir);
         let updates = UpdateService::new(
             config_path
                 .parent()
@@ -152,6 +165,7 @@ impl AppState {
             scheduler: Scheduler::new(),
             probe_scheduler: Scheduler::new(),
             records,
+            usage,
             conversations: Arc::new(ConversationIndex::from_environment()),
             updates,
             source: RwLock::new(SourceState::default()),
@@ -330,7 +344,7 @@ impl AppState {
             snapshot
         }
     }
-    fn state_dir(&self) -> PathBuf {
+    pub fn state_dir(&self) -> PathBuf {
         self.config_path
             .parent()
             .unwrap_or(std::path::Path::new("."))
@@ -463,6 +477,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/state", get(api_state))
         .route("/api/records", get(api_records))
+        .route("/api/usage", get(api_usage))
+        .route("/api/config/files", get(api_config_files))
+        .route("/api/usage/pricing", post(api_usage_pricing))
         .route("/api/records/clear", post(api_clear))
         .route("/api/update/check", post(api_update_check))
         .route("/api/update/download", post(api_update_download))
@@ -633,9 +650,88 @@ async fn api_state(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(
         json!({"version":env!("CARGO_PKG_VERSION"),"uptime_seconds":state.started.elapsed().as_secs(),
         "source":state.source.read().unwrap_or_else(|e|e.into_inner()).clone(),"sync":state.sync.read().unwrap_or_else(|e|e.into_inner()).clone(),"accounts":accounts,"models":models,"config":cfg.public(),
-        "connection":connection,"stats":{"requests":state.counters.requests.load(Ordering::Relaxed),"successes":state.counters.successes.load(Ordering::Relaxed),"failures":state.counters.failures.load(Ordering::Relaxed),"active":state.counters.active.load(Ordering::Relaxed),"waiting_streams":state.counters.waiting_streams.load(Ordering::Relaxed)}}),
+        "connection":connection,"stats":{"requests":state.counters.requests.load(Ordering::Relaxed),"successes":state.counters.successes.load(Ordering::Relaxed),"failures":state.counters.failures.load(Ordering::Relaxed),"unassigned":state.counters.unassigned.load(Ordering::Relaxed),"active":state.counters.active.load(Ordering::Relaxed),"waiting_streams":state.counters.waiting_streams.load(Ordering::Relaxed)}}),
     )
 }
+/// Read-only view of the two files that decide behaviour, with every
+/// credential masked. Editing stays in the forms, which validate before saving.
+async fn api_config_files(State(s): State<Arc<AppState>>) -> Response {
+    let own_path = s.config_path.clone();
+    let files = tokio::task::spawn_blocking(move || {
+        let own = std::fs::read_to_string(&own_path).unwrap_or_default();
+        let (codex_path, codex) = integration::codex_config_preview()
+            .unwrap_or_else(|_| ("未找到 Codex 配置".into(), String::new()));
+        json!([
+            {
+                "name": "Pool Router 配置",
+                "path": own_path.to_string_lossy(),
+                "content": integration::mask_json_secrets(&own),
+                "note": "路由设置页的改动会写回这个文件。手工编辑后需要重启本地服务。",
+            },
+            {
+                "name": "Codex 配置",
+                "path": codex_path,
+                "content": codex,
+                "note": "「直接接入 Codex」会写入其中的 model_providers.pool_router 段，包含与号池一致的流重试次数。",
+            }
+        ])
+    })
+    .await
+    .unwrap_or_else(|_| json!([]));
+    Json(json!({"files": files})).into_response()
+}
+
+/// Token totals per day, with the price table that produced the estimates.
+async fn api_usage(State(s): State<Arc<AppState>>, Query(q): Query<UsageQuery>) -> Response {
+    let days = q.days.unwrap_or(30).clamp(1, 400);
+    let today = usage::local_date(now_ms(), s.usage.pricing().day_offset_minutes);
+    let mut value = s.usage.snapshot(days, &today);
+    // Conversation names come from the local Codex index, like the monitor does,
+    // so the usage page reads the same labels without loading the monitor.
+    let ids: Vec<String> = value["by_conversation"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row["name"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !ids.is_empty() {
+        let index = s.conversations.clone();
+        let titles = tokio::task::spawn_blocking(move || index.lookup(&ids))
+            .await
+            .unwrap_or_default();
+        if let Some(rows) = value["by_conversation"].as_array_mut() {
+            for row in rows {
+                if let Some(title) = row["name"].as_str().and_then(|id| titles.get(id)) {
+                    row["title"] = json!(title);
+                }
+            }
+        }
+    }
+    Json(value).into_response()
+}
+
+#[derive(Deserialize)]
+struct UsageQuery {
+    days: Option<usize>,
+}
+
+async fn api_usage_pricing(State(s): State<Arc<AppState>>, Json(v): Json<Value>) -> Response {
+    let Ok(pricing) = serde_json::from_value::<usage::Pricing>(v) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_pricing",
+            "价目表字段无效，未修改原文件",
+        );
+    };
+    let dir = s.state_dir();
+    match s.usage.set_pricing(&dir, pricing) {
+        Ok(()) => Json(json!({"ok": true, "pricing": s.usage.pricing()})).into_response(),
+        Err(e) => error(StatusCode::BAD_REQUEST, "invalid_pricing", &e.to_string()),
+    }
+}
+
 async fn api_records(State(s): State<Arc<AppState>>) -> Json<Value> {
     let records = s.records.records();
     let ids = records
@@ -987,7 +1083,12 @@ async fn api_connect(State(s): State<Arc<AppState>>) -> Response {
         .unwrap_or(std::path::Path::new("."))
         .to_path_buf();
     match tokio::task::spawn_blocking(move || {
-        integration::connect(&cfg.base_url(), &cfg.local_token, &dir)
+        integration::connect(
+            &cfg.base_url(),
+            &cfg.local_token,
+            &dir,
+            u32::try_from(cfg.max_attempts.saturating_sub(1).max(1)).unwrap_or(15),
+        )
     })
     .await
     {
@@ -1309,14 +1410,21 @@ fn waiting_stream(state: Arc<AppState>, uri: Uri, headers: HeaderMap, raw: Bytes
             .is_some_and(|v|v.to_ascii_lowercase().contains("text/event-stream"));
         if status.is_success() && is_sse {
             let mut body=response.into_body().into_data_stream();
+            // An upstream chunk can end mid line. A comment inserted there would
+            // split an event and the client would fail to decode the body, so
+            // heartbeats only go out while the stream sits on a line boundary.
+            let mut at_line_boundary=true;
             loop {
                 tokio::select! {
                     part=body.next()=>match part {
-                        Some(Ok(bytes))=>yield Ok(bytes),
+                        Some(Ok(bytes))=>{
+                            if let Some(last)=bytes.last() { at_line_boundary=*last==b'\n'; }
+                            yield Ok(bytes);
+                        },
                         Some(Err(_))=>{yield Err(io::Error::other("上游流连接中断"));break;},
                         None=>break,
                     },
-                    _=heartbeat.tick()=>yield Ok(Bytes::from_static(b": pool-router waiting\n\n")),
+                    _=heartbeat.tick(),if at_line_boundary=>yield Ok(Bytes::from_static(b": pool-router waiting\n\n")),
                 }
             }
         } else {
@@ -1521,6 +1629,10 @@ impl RequestGuard {
         self.record.input_tokens = o.input_tokens;
         self.record.output_tokens = o.output_tokens;
         self.record.cached_tokens = o.cached_tokens;
+        self.record.cache_write_tokens = o.cache_write_tokens;
+        self.record.cache_write_30m_tokens = o.cache_write_30m_tokens;
+        self.record.cache_write_12h_tokens = o.cache_write_12h_tokens;
+        self.record.total_tokens = o.total_tokens;
         self.record.reasoning_tokens = o.reasoning_tokens;
         if self.record.route_mode != "legacy"
             && let (Some(id), Some(key), Some(model)) = (
@@ -1586,9 +1698,17 @@ impl Drop for RequestGuard {
                 .counters
                 .successes
                 .fetch_add(1, Ordering::Relaxed);
+        } else if self.record.outcome == "no_candidate" {
+            self.state
+                .counters
+                .unassigned
+                .fetch_add(1, Ordering::Relaxed);
         } else {
             self.state.counters.failures.fetch_add(1, Ordering::Relaxed);
         }
+        // Accounting is independent of the monitor: turning request logging off
+        // hides the details, not the daily totals.
+        self.state.usage.record(&self.record);
         if self.recording {
             let _ = self.state.records.record(self.record.clone());
         }
@@ -1764,6 +1884,8 @@ async fn run_legacy_proxy(
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         heartbeat.tick().await;
         if add_heartbeats { yield Ok::<Bytes,io::Error>(Bytes::from_static(b": pool-router legacy waiting\n\n")); }
+        // A chunk may end mid line; a comment inserted there would split an event.
+        let mut at_line_boundary = true;
         loop {
             // Local heartbeats must not reset the upstream idle deadline.
             let part = {
@@ -1772,12 +1894,13 @@ async fn run_legacy_proxy(
                 loop {
                     tokio::select! {
                         result = &mut pending => break result,
-                        _ = heartbeat.tick(), if add_heartbeats => yield Ok(Bytes::from_static(b": pool-router legacy waiting\n\n")),
+                        _ = heartbeat.tick(), if add_heartbeats && at_line_boundary => yield Ok(Bytes::from_static(b": pool-router legacy waiting\n\n")),
                     }
                 }
             };
             match part {
                 Ok(Some(Ok(bytes))) => {
+                    if let Some(last) = bytes.last() { at_line_boundary = *last == b'\n'; }
                     if guard.record.ttfb_ms.is_none() { guard.record.ttfb_ms = Some(guard.started.elapsed().as_millis() as u64); }
                     guard.record.response_bytes += bytes.len() as u64;
                     if is_sse && identity {
@@ -2183,11 +2306,25 @@ async fn run_proxy_inner(
                 if selection.exclude.is_empty() =>
             {
                 guard.finish("no_candidate");
-                return guard.error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "no_candidate",
-                    "当前号池没有匹配模型的可调度账号，或账号已停用",
-                );
+                let mut names: Vec<String> = state
+                    .scheduler
+                    .snapshot(&initial.policy)
+                    .into_iter()
+                    .filter(|account| account.present)
+                    .flat_map(|account| account.models)
+                    .collect();
+                names.sort();
+                names.dedup();
+                let available = names.join("、");
+                let asked = guard.record.requested_model.clone().unwrap_or_default();
+                let detail = if available.is_empty() {
+                    format!("号池里没有 {asked} 的账号，当前号池为空")
+                } else {
+                    format!(
+                        "号池里没有 {asked} 的账号；现在可用的模型是 {available}。上游也可能不提供该模型"
+                    )
+                };
+                return guard.error(StatusCode::SERVICE_UNAVAILABLE, "no_candidate", &detail);
             }
             Err(_) => {
                 if !selection.exclude.is_empty() {

@@ -17,6 +17,9 @@ const PROVIDER: &str = "pool_router";
 const DIRECT_STRING_FIELDS: [&str; 4] =
     ["name", "base_url", "wire_api", "experimental_bearer_token"];
 const DIRECT_BOOL_FIELDS: [&str; 2] = ["supports_websockets", "requires_openai_auth"];
+/// Written by connect and removed by restore, but deliberately left out of the
+/// consistency check so the user can tune the retry budget by hand.
+const DIRECT_TUNABLE_FIELDS: [&str; 1] = ["stream_max_retries"];
 
 #[derive(Clone, Serialize)]
 pub struct ConnectionInfo {
@@ -72,6 +75,82 @@ fn codex_config_path() -> Result<PathBuf> {
     crate::config::codex_home_dir()
         .map(|path| path.join("config.toml"))
         .context("无法确定 Codex 配置目录")
+}
+
+/// The Codex configuration as text, with every credential-looking value masked.
+/// Read-only: the panel shows it so the user can decide what to tune by hand.
+pub fn codex_config_preview() -> Result<(String, String)> {
+    let path = codex_config_path()?;
+    let raw = fs::read_to_string(&path).unwrap_or_default();
+    Ok((
+        path.to_string_lossy().into_owned(),
+        mask_secret_values(&raw),
+    ))
+}
+
+/// True for keys whose value must never be shown.
+pub fn credential_key(name: &str) -> bool {
+    let key = name.trim().trim_matches('"').to_ascii_lowercase();
+    ["token", "key", "secret", "auth", "password", "credential"]
+        .iter()
+        .any(|needle| key.contains(needle))
+}
+
+/// Masks credential values in a TOML document, line by line, keeping comments
+/// and every other line exactly as written.
+pub fn mask_secret_values(raw: &str) -> String {
+    raw.lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') || trimmed.starts_with("//") {
+                return line.to_owned();
+            }
+            // TOML uses `=`; a JSON object pasted into the same view uses `:`.
+            let split = line
+                .split_once('=')
+                .map(|(head, rest)| ('=', head, rest))
+                .or_else(|| line.split_once(':').map(|(head, rest)| (':', head, rest)));
+            let Some((separator, head, rest)) = split else {
+                return line.to_owned();
+            };
+            if !credential_key(head) {
+                return line.to_owned();
+            }
+            let tail = if rest.trim_end().ends_with(',') {
+                ","
+            } else {
+                ""
+            };
+            format!("{head}{separator} \"<已隐去>\"{tail}")
+        })
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+/// Masks credential values in a JSON document by key, whatever its formatting.
+/// Line based masking cannot be trusted here, because the file may be one line.
+pub fn mask_json_secrets(raw: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return mask_secret_values(raw);
+    };
+    mask_json_value(&mut value);
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| "无法展示该配置".into())
+}
+
+fn mask_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, item) in map.iter_mut() {
+                if credential_key(key) {
+                    *item = serde_json::Value::String("<已隐去>".into());
+                } else {
+                    mask_json_value(item);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(mask_json_value),
+        _ => {}
+    }
 }
 
 fn validate_target(raw: &str) -> Result<reqwest::Url> {
@@ -191,8 +270,19 @@ fn inspect_config(base_url: &str, path: &Path) -> Result<ConnectionInfo> {
 }
 
 /// Explicit mutation entry point, invoked only by the connect command/API.
-pub fn connect(base_url: &str, local_token: &str, state_dir: &Path) -> Result<String> {
-    connect_config(base_url, local_token, state_dir, &codex_config_path()?)
+pub fn connect(
+    base_url: &str,
+    local_token: &str,
+    state_dir: &Path,
+    stream_retries: u32,
+) -> Result<String> {
+    connect_config(
+        base_url,
+        local_token,
+        state_dir,
+        &codex_config_path()?,
+        stream_retries,
+    )
 }
 
 #[cfg(test)]
@@ -202,6 +292,7 @@ fn connect_at(base_url: &str, local_token: &str, state_dir: &Path, home: &Path) 
         local_token,
         state_dir,
         &home.join(".codex/config.toml"),
+        15,
     )
 }
 
@@ -210,6 +301,7 @@ fn connect_config(
     local_token: &str,
     state_dir: &Path,
     path: &Path,
+    stream_retries: u32,
 ) -> Result<String> {
     validate_target(base_url)?;
     ensure!(
@@ -237,7 +329,18 @@ fn connect_config(
         );
         let installed = document(after_config)?;
         ensure_direct_requested(&installed, base_url, local_token)?;
-        if known_direct_state(&doc, &installed, previous_provider.as_deref())? {
+        // An install from an older build has no retry budget written. Add the
+        // missing field without touching a value the user has since tuned.
+        let missing_tunable = DIRECT_TUNABLE_FIELDS.iter().any(|field| {
+            doc.get("model_providers")
+                .and_then(Item::as_table_like)
+                .and_then(|providers| providers.get(PROVIDER))
+                .and_then(Item::as_table_like)
+                .and_then(|table| table.get(field))
+                .and_then(Item::as_integer)
+                .is_none()
+        });
+        if known_direct_state(&doc, &installed, previous_provider.as_deref())? && !missing_tunable {
             return Ok("Codex 已直连同一 Pool Router，地址与本地令牌一致，无需重复修改。原始恢复备份及后续无关配置均已保留。".into());
         }
         if !has_direct_table(&doc) {
@@ -253,6 +356,19 @@ fn connect_config(
                 .and_then(Item::as_table_like_mut)
                 .context("model_providers 必须是 TOML 表")?
                 .insert(PROVIDER, managed);
+        }
+        if missing_tunable
+            && let Some(table) = doc
+                .get_mut("model_providers")
+                .and_then(Item::as_table_like_mut)
+                .and_then(|providers| providers.get_mut(PROVIDER))
+                .and_then(Item::as_table_like_mut)
+        {
+            for field in DIRECT_TUNABLE_FIELDS {
+                if table.get(field).and_then(Item::as_integer).is_none() {
+                    table.insert(field, value(i64::from(stream_retries)));
+                }
+            }
         }
         doc["model_provider"] = value(PROVIDER);
         ensure!(
@@ -290,6 +406,9 @@ fn connect_config(
     table["supports_websockets"] = value(false);
     table["requires_openai_auth"] = value(false);
     table["experimental_bearer_token"] = value(local_token);
+    // Codex retries a broken stream on its own. Matching the pool's retry budget
+    // keeps the two layers consistent instead of leaving Codex on its default.
+    table["stream_max_retries"] = value(i64::from(stream_retries));
     providers.insert(PROVIDER, Item::Table(table));
     doc["model_provider"] = value(PROVIDER);
     let updated = doc.to_string();
@@ -820,7 +939,11 @@ fn restore_primary(state_dir: &Path) -> Result<String> {
                         .get_mut(PROVIDER)
                         .and_then(Item::as_table_like_mut)
                         .context("Pool Router 供应商表不存在")?;
-                    for field in DIRECT_STRING_FIELDS.into_iter().chain(DIRECT_BOOL_FIELDS) {
+                    for field in DIRECT_STRING_FIELDS
+                        .into_iter()
+                        .chain(DIRECT_BOOL_FIELDS)
+                        .chain(DIRECT_TUNABLE_FIELDS)
+                    {
                         table.remove(field);
                     }
                     if table.is_empty() {
@@ -1058,7 +1181,7 @@ mod tests {
         fs::create_dir_all(selected_path.parent().unwrap()).unwrap();
         fs::write(&selected_path, &original).unwrap();
 
-        connect_config(TARGET, "local-test-token", &state, &selected_path).unwrap();
+        connect_config(TARGET, "local-test-token", &state, &selected_path, 15).unwrap();
         assert!(inspect_config(TARGET, &selected_path).unwrap().configured);
         assert!(!inspect_config(TARGET, &default_path).unwrap().configured);
         assert_eq!(fs::read(&default_path).unwrap(), original);
@@ -1125,6 +1248,55 @@ mod tests {
             current_provider(&db).unwrap().unwrap().settings,
             settings.to_string()
         );
+    }
+
+    #[test]
+    fn reconnect_adds_a_missing_retry_budget_and_keeps_a_tuned_one() {
+        let (dir, state) = fixture(false);
+        connect_at(TARGET, "local-token", &state, dir.path()).unwrap();
+        let path = dir.path().join(".codex/config.toml");
+
+        // An install from a build that did not write the field at all.
+        let mut doc = document(&fs::read_to_string(&path).unwrap()).unwrap();
+        doc["model_providers"][PROVIDER]
+            .as_table_like_mut()
+            .unwrap()
+            .remove("stream_max_retries");
+        fs::write(&path, doc.to_string()).unwrap();
+        connect_at(TARGET, "local-token", &state, dir.path()).unwrap();
+        let doc = document(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            doc["model_providers"][PROVIDER]["stream_max_retries"].as_integer(),
+            Some(15)
+        );
+
+        // A value the user tuned by hand survives a reconnect.
+        let mut doc = document(&fs::read_to_string(&path).unwrap()).unwrap();
+        doc["model_providers"][PROVIDER]["stream_max_retries"] = value(40);
+        fs::write(&path, doc.to_string()).unwrap();
+        connect_at(TARGET, "local-token", &state, dir.path()).unwrap();
+        let doc = document(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            doc["model_providers"][PROVIDER]["stream_max_retries"].as_integer(),
+            Some(40)
+        );
+    }
+
+    #[test]
+    fn direct_connect_sets_the_stream_retry_budget_and_restore_removes_it() {
+        let (dir, state) = fixture(false);
+        connect_at(TARGET, "local-token", &state, dir.path()).unwrap();
+        let path = dir.path().join(".codex/config.toml");
+        let doc = document(&fs::read_to_string(&path).unwrap()).unwrap();
+        // Codex otherwise falls back to its own default, which is far lower than
+        // the pool's retry budget.
+        assert_eq!(
+            doc["model_providers"][PROVIDER]["stream_max_retries"].as_integer(),
+            Some(15)
+        );
+        restore(&state).unwrap();
+        let restored = fs::read_to_string(&path).unwrap();
+        assert!(!restored.contains("stream_max_retries"));
     }
 
     #[test]
