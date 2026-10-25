@@ -2,24 +2,25 @@
 
 **简体中文** | [English](README.en.md)
 
-**Pool Router 让 Codex 使用 BiWrite 中的账号池，并在本机查看每次请求的账号、模型、重试和用量。** 当前版本为 **1.0.0**，属于 `codex-wiretap` 仓库的 Rust 实现，程序名为 `pool-router`。安装后从桌面启动器打开浏览器控制台，本机后台程序负责实际转发。
+<img src="assets/logo-wordmark.png" width="420" alt="Pool Router">
+
+**Pool Router 是在本机运行的 Codex 请求路由与监控工具。它把请求按账号和模型分配到你自己的多个 Key 上，在浏览器面板里显示每次请求走了哪个账号、重试了几次、用了多少 token 和多少钱，并在某个账号卡住时自动改走另一个。** 当前版本为 **1.1.0**，属于 `codex-wiretap` 仓库的 Rust 实现，程序名为 `pool-router`。安装后从桌面启动器打开浏览器控制台，本机后台程序负责实际转发。
 
 | 你的电脑 | 下载并安装 |
 | --- | --- |
 | Apple Silicon Mac，macOS 11 或更新版本 | [下载 PoolRouter-macOS-arm64.dmg](https://github.com/qzkinhit/codex-wiretap/releases/latest/download/PoolRouter-macOS-arm64.dmg) |
 | Windows 10 / 11，x64 | [下载 PoolRouter-Windows-x64-Setup.exe](https://github.com/qzkinhit/codex-wiretap/releases/latest/download/PoolRouter-Windows-x64-Setup.exe) |
 
-[全部版本与发行说明](https://github.com/qzkinhit/codex-wiretap/releases) · [BiWrite 公开仓库与安装说明](https://github.com/zzccppp/biwrite) · [历史 Python 实现](legacy/python/)
+[全部版本与发行说明](https://github.com/qzkinhit/codex-wiretap/releases) · [历史 Python 实现](legacy/python/)
 
-默认流程需要 Codex、BiWrite，以及可访问的 Responses 上游服务和对应 Key。三者分工如下。
+号池来自你自己。Pool Router 不提供上游账号或 Key，只要上游提供 Responses 接口，它就能用。账号来源有两种，随时在面板里切换。
 
-| 软件 | 负责什么 |
+| 账号来源 | 说明 |
 | --- | --- |
-| Codex | 发起你的对话和编程请求。 |
-| [BiWrite](https://github.com/zzccppp/biwrite) | 保存上游地址、模型和 Key，运行保活并维护候选集合。 |
-| Pool Router | 只读同步候选，按账号与模型分配请求，显示路由结果和监控记录。 |
+| 手动 | 在面板里直接添加 Key、模型、昵称和并发上限，保存在本机。适用于任何自备的多 Key 环境。 |
+| [BiWrite](https://github.com/zzccppp/biwrite) | 只读同步该软件维护的保活候选，并逐项发送真实验证请求。本项目的长期联调测试在这个组合上完成。 |
 
-默认路径为 **Codex → Pool Router → 上游服务**。BiWrite 提供账号来源，不处在每次请求的转发链路中；默认流程不需要 CC Switch。Pool Router 不提供上游账号或 Key。
+默认路径为 **Codex → Pool Router → 上游服务**。选用 BiWrite 来源时，它只提供账号列表，不处在每次请求的转发链路中；该流程不需要 CC Switch。
 
 ![Pool Router 本地控制台示例](docs/dashboard.png)
 
@@ -35,13 +36,17 @@
 
 **Windows：** 双击 **`PoolRouter-Windows-x64-Setup.exe`**，按向导完成当前用户安装，然后从开始菜单打开 **Pool Router**。启动器会启动本地程序并打开浏览器面板。程序安装在 `%LOCALAPPDATA%\Programs\Pool Router`，配置和记录保存在 `%LOCALAPPDATA%\Pool Router`。安装时可选择创建桌面快捷方式和登录时启动快捷方式。
 
-安装本身不会修改 Codex 或 CC Switch 的接入配置。先完成下面的 BiWrite 准备，再执行直接接入。
+安装本身不会修改 Codex 或 CC Switch 的接入配置。先按下一步准备好账号来源，再执行直接接入。
 
 当前版本未使用发布者代码签名，macOS DMG 尚未经过 Apple 公证。若 macOS 阻止首次打开，请确认下载来自本仓库，在“系统设置”的“隐私与安全性”中找到对应提示，选择“仍要打开”并确认；旧版 macOS 的入口为“系统偏好设置”的“安全性与隐私”。Windows 可能显示未知发布者提示，请核对下载来源。
 
-### 2. 在 BiWrite 准备上游、模型和 Key
+### 2. 准备上游、模型和 Key
 
-按照 [BiWrite 仓库说明](https://github.com/zzccppp/biwrite) 安装并打开 BiWrite，然后完成以下操作。
+二选一。自己已经有一批 Key 时走手动来源，用 BiWrite 维护保活时走自动来源。
+
+**方式一，手动来源。** 在面板的“路由设置”中填写上游 Base URL，在手动号池中逐个添加 Key，为每个 Key 勾选要用的模型，按需设置昵称和并发上限，然后把来源保存为**手动**。Key 存在本机私有文件 `manual-keys.json` 中，不经过任何第三方软件。此后可跳到第 4 步。
+
+**方式二，BiWrite 来源。** 按照 [BiWrite 仓库说明](https://github.com/zzccppp/biwrite) 安装并打开 BiWrite，然后完成以下操作。
 
 1. 配置 OpenAI 兼容的 **Responses** 供应商，填写你的上游 Base URL、模型 ID 和 Key。只配置 Chat Completions 的供应商不会被此适配器导入。
 2. 启用**本地密钥文件模式**，即 `keysInFile = true`，使 Key 保存在 BiWrite 的 `keys.json` 中。Pool Router 不读取系统钥匙串，不需要你再次复制 Key。
@@ -49,7 +54,7 @@
 
 默认只同步保活候选，并排除 BiWrite 中被忽略或停止的 Key。候选表示允许参与后续请求，不保证此刻请求一定成功。
 
-### 3. 打开 Pool Router，确认账号已导入
+### 3. 打开 Pool Router，确认账号已导入（BiWrite 来源）
 
 Mac 打开 `~/Applications/Pool Router.app`；Windows 从开始菜单打开 **Pool Router**。看到浏览器面板后，确认服务处于在线状态，并按下面的顺序检查。
 
@@ -149,7 +154,7 @@ python3 scripts/macos-package-dmg.py dist/macos/PoolRouter-macOS-arm64.zip dist/
 Windows 在具备 Rust 和安装器构建工具的 PowerShell 环境中执行：
 
 ```powershell
-./scripts/windows/build.ps1 -ReleaseTag v1.0.0
+./scripts/windows/build.ps1 -ReleaseTag v1.1.0
 ```
 
 也可运行 GitHub Actions 的 **Build Windows installer**，填写 `release_tag`。发布标签已创建时，留空 `source_ref` 即从该标签构建；标签创建前需显式填写要构建的提交或分支，例如 `main`。构建结果应对应最终发布标签，不应把未经核对的分支结果当作已发布版本。
@@ -162,7 +167,7 @@ Windows 在具备 Rust 和安装器构建工具的 PowerShell 环境中执行：
 bash scripts/macos-install.sh --no-build
 ```
 
-1.0.0 的 ZIP 安装器与 DMG 相同，只用系统自带 `plutil` 生成 macOS plist，不需要 Python；v0.1.0 的旧 ZIP 安装器仍需要 `python3`。同一版本的 DMG 与 ZIP 包含相同的程序二进制和依赖许可证。可在当前仓库中从已有二进制 ZIP 打包 DMG；**打包需要 Python 3，安装 DMG 不需要**。
+1.0.0 起的 ZIP 安装器与 DMG 相同，只用系统自带 `plutil` 生成 macOS plist，不需要 Python；v0.1.0 的旧 ZIP 安装器仍需要 `python3`。同一版本的 DMG 与 ZIP 包含相同的程序二进制和依赖许可证。可在当前仓库中从已有二进制 ZIP 打包 DMG；**打包需要 Python 3，安装 DMG 不需要**。
 
 ```bash
 python3 scripts/macos-package-dmg.py /path/PoolRouter-macOS-arm64.zip /path/PoolRouter-macOS-arm64.dmg
@@ -307,6 +312,8 @@ supports_websockets = false
 号池路径同时检查 HTTP 状态与 Responses/SSE 事件。HTTP 200 中的失败事件不会计为成功。有效内容输出前，明确可重试的拒绝或已确认未建立连接的失败可以更换候选；输出文本、推理或工具调用之后不自动重放。结果不确定的传输中断也不透明重试。
 
 号池默认最多重试 **15 次**，加上首次请求共 **16 次尝试**。后端配置 `max_attempts = 16` 包含首次请求，面板显示和编辑的是重试次数。会话恢复和压缩上下文修复产生的请求也计入同一总次数上限。排队和等待有效输出的前导阶段共用 600 秒期限，单次上游响应头等待上限为 120 秒，每次尝试从发送开始等待首段有效内容的上限为 120 秒，流式空闲上限为 180 秒。因此，达到时间期限时可能尚未用完重试次数。兼容监控路径始终只提交一次上游请求。
+
+默认 `hedge_after_ms = 20000`。一次尝试发出后如果 20 秒内上游没有返回任何响应头，代理会在另一个候选账号上并行发起同一请求，两者谁先返回响应头就用谁，另一个立即取消。因为只在还没有任何响应头时才并行，客户端不可能收到重复内容。胜出的账号接管本次尝试的其余部分，用量和记录都归到它名下，面板中显示为“同时试另一个号”和“另一个号先返回”。没有空闲候选时不并行，该值不小于本次尝试剩余的响应头等待时间时也不并行。填 0 关闭该行为。并行会在另一个账号上产生一次真实请求，可能消耗额度。
 
 默认 `first_output_timeout_ms = 120000`。号池请求没有 `previous_response_id` 且尚未产生有效内容时，等待首段有效内容超时可以释放当前尝试并重新调度；SSE 心跳和纯状态事件不算有效内容。已经产生文本、推理或工具调用时不自动重放。超时不能证明上游从未执行，增加重试次数也不保证成功或消除上游整体故障。
 

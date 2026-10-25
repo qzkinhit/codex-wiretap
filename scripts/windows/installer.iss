@@ -31,7 +31,8 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 LicenseFile={#PayloadDir}\LICENSE.txt
-UninstallDisplayIcon={app}\pool-router-launcher.exe
+SetupIconFile={#PayloadDir}\PoolRouter.ico
+UninstallDisplayIcon={app}\PoolRouter.ico
 UninstallDisplayName=Pool Router
 CloseApplications=no
 RestartApplications=no
@@ -51,14 +52,15 @@ Source: "{#PayloadDir}\pool-router-launcher.exe"; DestDir: "{app}"; Flags: ignor
 Source: "{#PayloadDir}\LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\THIRD-PARTY-NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#PayloadDir}\PoolRouter.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\maintenance.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\maintenance.ps1"; Flags: dontcopy
 
 [Icons]
-Name: "{userprograms}\Pool Router\Pool Router"; Filename: "{app}\pool-router-launcher.exe"; WorkingDir: "{app}"
+Name: "{userprograms}\Pool Router\Pool Router"; Filename: "{app}\pool-router-launcher.exe"; WorkingDir: "{app}"; IconFilename: "{app}\PoolRouter.ico"
 Name: "{userprograms}\Pool Router\Uninstall Pool Router"; Filename: "{uninstallexe}"
-Name: "{userdesktop}\Pool Router"; Filename: "{app}\pool-router-launcher.exe"; WorkingDir: "{app}"; Tasks: desktopicon
-Name: "{userstartup}\Pool Router"; Filename: "{app}\pool-router-launcher.exe"; Parameters: "--background"; WorkingDir: "{app}"; Tasks: startup
+Name: "{userdesktop}\Pool Router"; Filename: "{app}\pool-router-launcher.exe"; WorkingDir: "{app}"; IconFilename: "{app}\PoolRouter.ico"; Tasks: desktopicon
+Name: "{userstartup}\Pool Router"; Filename: "{app}\pool-router-launcher.exe"; Parameters: "--background"; WorkingDir: "{app}"; IconFilename: "{app}\PoolRouter.ico"; Tasks: startup
 
 [Run]
 Filename: "{app}\pool-router-launcher.exe"; Description: "Launch Pool Router and open its local dashboard"; Flags: nowait postinstall skipifsilent

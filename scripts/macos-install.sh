@@ -102,6 +102,12 @@ temporary_info="$(mktemp "$application/Contents/.pool-router.XXXXXX")"
 /usr/bin/plutil -insert CFBundlePackageType -string APPL -- "$temporary_info"
 /usr/bin/plutil -insert CFBundleShortVersionString -string "$application_version" -- "$temporary_info"
 /usr/bin/plutil -insert LSUIElement -bool true -- "$temporary_info"
+if [[ -f "$crate_dir/assets/PoolRouter.icns" ]]; then
+  mkdir -p "$application/Contents/Resources"
+  cp -f "$crate_dir/assets/PoolRouter.icns" "$application/Contents/Resources/PoolRouter.icns"
+  chmod 644 "$application/Contents/Resources/PoolRouter.icns"
+  /usr/bin/plutil -insert CFBundleIconFile -string PoolRouter -- "$temporary_info"
+fi
 /usr/bin/plutil -insert NSHighResolutionCapable -bool true -- "$temporary_info"
 /usr/bin/plutil -lint -- "$temporary_plist" "$temporary_info" >/dev/null
 chmod 600 "$temporary_plist" "$temporary_info"
@@ -122,6 +128,8 @@ exec "$root/bin/pool-router" open --config "$root/config.json"
 APP
 chmod 700 "$application/Contents/MacOS/Pool Router"
 /usr/bin/plutil -lint "$plist" "$application/Contents/Info.plist" >/dev/null
+touch "$application"
+
 
 if [[ "$start" == 1 ]]; then
   if /bin/launchctl print "$domain/local.pool-router" >/dev/null 2>&1; then

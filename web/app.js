@@ -374,7 +374,7 @@ function normalizeProbeResult(result, model, elapsedMs = 0, secrets = []) {
 }
 
 function gatewayActionRows(record) {
-  const names = { session_reset: "重置会话", session_reused: "复用恢复后的会话", compaction_repair: "修复压缩上下文", image_compression: "压缩图片", first_output_timeout: "等待首段输出超时", header_timeout_retry: "响应头超时后重试" };
+  const names = { session_reset: "重置会话", session_reused: "复用恢复后的会话", compaction_repair: "修复压缩上下文", image_compression: "压缩图片", first_output_timeout: "等待首段输出超时", header_timeout_retry: "响应头超时后重试", hedged_attempt: "同时试另一个号", hedged_win: "另一个号先返回" };
   return (Array.isArray(record.gateway_actions) ? record.gateway_actions : []).map((action) => ({
     label: Object.hasOwn(names, action.action) ? names[action.action] : "其他网关处理",
     attempt: Number.isInteger(action.attempt) && action.attempt >= 0 ? action.attempt : null,
@@ -430,6 +430,7 @@ function draftFromConfig(config) {
     compaction_repair_enabled: config?.compaction_repair_enabled !== false,
     compress_images: config?.compress_images === true,
     first_output_timeout: (config?.first_output_timeout_ms ?? 120000) / 1000,
+    hedge_after: (config?.hedge_after_ms ?? 20000) / 1000,
   };
 }
 
@@ -448,6 +449,7 @@ function routingConfigPayload(draft, latestConfig) {
     compaction_repair_enabled: draft.compaction_repair_enabled,
     compress_images: draft.compress_images,
     first_output_timeout_ms: Math.round(draft.first_output_timeout * 1000),
+    hedge_after_ms: Math.round(draft.hedge_after * 1000),
   };
 }
 
@@ -840,6 +842,7 @@ if (typeof document !== "undefined") (() => {
       compaction_repair_enabled: $("compaction-repair-enabled").checked,
       compress_images: $("compress-images").checked,
       first_output_timeout: Number($("first-output-timeout").value),
+      hedge_after: Number($("hedge-after").value),
     };
   }
 
@@ -887,6 +890,7 @@ if (typeof document !== "undefined") (() => {
     $("compaction-repair-enabled").checked = draft.compaction_repair_enabled;
     $("compress-images").checked = draft.compress_images;
     $("first-output-timeout").value = draft.first_output_timeout;
+    $("hedge-after").value = draft.hedge_after;
     $("pinned-field").hidden = draft.strategy !== "pinned";
     baselineDraft = readDraft();
     setDirty(false);

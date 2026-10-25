@@ -682,6 +682,8 @@ fn sanitize(mut row: RequestRecord) -> RequestRecord {
                 | "image_compression"
                 | "first_output_timeout"
                 | "header_timeout_retry"
+                | "hedged_attempt"
+                | "hedged_win"
         )
     });
     row.gateway_actions.truncate(32);

@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Pool Router">
+  <title>Pool Router</title>
+  <rect width="512" height="512" rx="112" fill="#16304f"/>
+  <g fill="none" stroke-width="22" stroke-linecap="round">
+    <path d="M 158 256 C 248 256 268 368 358 368" stroke="#8ea4c0"/>
+    <path d="M 158 256 L 358 256" stroke="#8ea4c0"/>
+    <path d="M 158 256 C 248 256 268 144 358 144" stroke="#15d3b0"/>
+  </g>
+  <circle cx="134" cy="256" r="32" fill="#ffffff"/>
+  <circle cx="378" cy="368" r="27" fill="#8ea4c0"/>
+  <circle cx="378" cy="256" r="27" fill="#8ea4c0"/>
+  <circle cx="378" cy="144" r="31" fill="#15d3b0"/>
+</svg>

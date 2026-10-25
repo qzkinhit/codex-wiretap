@@ -43,6 +43,8 @@ struct Seen {
 
 enum Reply {
     ForModel(&'static str, Box<Reply>),
+    /// Holds back the response headers, which is what a hedge races against.
+    SlowHeaders(Duration, Box<Reply>),
     Sse(Vec<(Option<Arc<Notify>>, String)>),
     Json(StatusCode, Value, Option<&'static str>),
     Raw(StatusCode, &'static str, &'static str),
@@ -94,8 +96,16 @@ async fn mock_response(State(state): State<MockState>, request: Request) -> Resp
             reply => reply,
         })
     };
+    let reply = match reply {
+        Some(Reply::SlowHeaders(delay, inner)) => {
+            tokio::time::sleep(delay).await;
+            Some(*inner)
+        }
+        other => other,
+    };
     match reply {
         Some(Reply::ForModel(_, _)) => unreachable!("model replies are unwrapped above"),
+        Some(Reply::SlowHeaders(_, _)) => unreachable!("delays are applied above"),
         Some(Reply::Sse(chunks)) => {
             let stream = async_stream::stream! {
                 for (gate, chunk) in chunks {
@@ -3020,4 +3030,170 @@ async fn a_heartbeat_never_splits_an_upstream_event_across_the_wire() {
         serde_json::from_str::<Value>(payload)
             .unwrap_or_else(|e| panic!("client could not decode {payload}: {e}"));
     }
+}
+
+#[tokio::test]
+async fn a_slow_account_is_overtaken_by_a_hedge_on_another_account() {
+    // The first account holds its response headers far longer than the hedge
+    // delay; the second answers at once and must win the race.
+    let h = Harness::new(
+        vec![
+            Reply::SlowHeaders(
+                Duration::from_secs(9),
+                Box::new(success("resp_slow", ASTRA)),
+            ),
+            success("resp_hedged", ASTRA),
+        ],
+        2,
+        &[ASTRA],
+    )
+    .await;
+    {
+        let mut config = h.state.config.write().unwrap();
+        config.upstream_header_timeout_ms = 20_000;
+        config.stream_idle_timeout_ms = 20_000;
+        config.queue_timeout_ms = 20_000;
+        config.first_output_timeout_ms = 20_000;
+        config.hedge_after_ms = 1_000;
+    }
+    let started = std::time::Instant::now();
+    let response = h.post(Harness::request(ASTRA)).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.unwrap();
+    let elapsed = started.elapsed();
+
+    assert!(
+        body.contains("resp_hedged"),
+        "the hedge should have won: {body}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(7),
+        "the client waited for the slow account: {elapsed:?}"
+    );
+    assert_eq!(h.calls(), 2, "both accounts were asked");
+    let records = h.state.records.records();
+    let actions: Vec<String> = records
+        .iter()
+        .flat_map(|record| record.gateway_actions.iter())
+        .map(|action| action.action.clone())
+        .collect();
+    assert!(
+        actions.iter().any(|action| action == "hedged_attempt"),
+        "records={} actions={actions:?}",
+        records.len()
+    );
+    // Accounting must follow the account that actually served the request.
+    assert!(
+        actions.iter().any(|action| action == "hedged_win"),
+        "the winner was not adopted: {actions:?}"
+    );
+    assert!(records[0].key_id.is_some());
+}
+
+#[tokio::test]
+async fn a_hedge_never_starts_when_the_delay_exceeds_the_budget() {
+    let h = Harness::new(vec![success("resp_single", ASTRA)], 2, &[ASTRA]).await;
+    {
+        let mut config = h.state.config.write().unwrap();
+        // The default budget is shorter than the hedge delay, so racing would
+        // only ever waste a second account.
+        config.hedge_after_ms = 60_000;
+    }
+    let response = h.post(Harness::request(ASTRA)).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.unwrap();
+    assert_eq!(h.calls(), 1, "only one account should have been used");
+    let records = h.state.records.records();
+    assert!(
+        !records[0]
+            .gateway_actions
+            .iter()
+            .any(|action| action.action == "hedged_attempt")
+    );
+}
+
+#[tokio::test]
+async fn the_panel_can_tune_or_switch_off_the_hedge_but_not_set_a_useless_delay() {
+    let h = Harness::new(vec![success("resp_cfg", ASTRA)], 1, &[ASTRA]).await;
+
+    let off = h
+        .api_post("/api/config", json!({"hedge_after_ms": 0}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(off.status(), StatusCode::OK);
+    assert_eq!(h.state.settings().hedge_after_ms, 0);
+
+    let tuned = h
+        .api_post("/api/config", json!({"hedge_after_ms": 8_000}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tuned.status(), StatusCode::OK);
+    assert_eq!(h.state.settings().hedge_after_ms, 8_000);
+
+    // Sub-second delays would race every request against a second account.
+    let rejected = h
+        .api_post("/api/config", json!({"hedge_after_ms": 200}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(h.state.settings().hedge_after_ms, 8_000);
+}
+
+#[tokio::test]
+async fn a_continuation_is_never_raced_because_its_session_lives_on_one_account() {
+    // The follow-up holds its headers past the hedge delay. A hedge would have
+    // to send it to an account that does not hold the session.
+    let h = Harness::new(
+        vec![
+            success("resp_parent", ASTRA),
+            Reply::SlowHeaders(
+                Duration::from_secs(3),
+                Box::new(success("resp_child", ASTRA)),
+            ),
+        ],
+        2,
+        &[ASTRA],
+    )
+    .await;
+    {
+        let mut config = h.state.config.write().unwrap();
+        config.upstream_header_timeout_ms = 20_000;
+        config.stream_idle_timeout_ms = 20_000;
+        config.queue_timeout_ms = 20_000;
+        config.first_output_timeout_ms = 20_000;
+        config.hedge_after_ms = 1_000;
+    }
+    h.post(Harness::request(ASTRA))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+
+    let mut followup = Harness::request(ASTRA);
+    followup["previous_response_id"] = json!("resp_parent");
+    let second = h.post(followup).send().await.unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    assert!(second.text().await.unwrap().contains("resp_child"));
+
+    assert_eq!(h.calls(), 2, "the continuation was sent once");
+    let seen = h.mock.seen.lock().unwrap();
+    assert_eq!(seen[0].authorization, seen[1].authorization);
+    drop(seen);
+    let actions: Vec<String> = h
+        .state
+        .records
+        .records()
+        .iter()
+        .flat_map(|record| record.gateway_actions.iter())
+        .map(|action| action.action.clone())
+        .collect();
+    assert!(
+        !actions.iter().any(|action| action.starts_with("hedged")),
+        "a continuation must not be raced: {actions:?}"
+    );
 }

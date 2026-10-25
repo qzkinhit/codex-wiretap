@@ -40,6 +40,10 @@ pub struct Config {
     pub max_attempts: usize,
     pub queue_timeout_ms: u64,
     pub upstream_header_timeout_ms: u64,
+    /// Start a second attempt on another account when the first has produced no
+    /// response headers after this long. Zero disables it. Only ever started
+    /// before any output exists, so the client can never see duplicated content.
+    pub hedge_after_ms: u64,
     pub stream_idle_timeout_ms: u64,
     pub max_request_bytes: usize,
     pub recording_enabled: bool,
@@ -72,6 +76,7 @@ impl Default for Config {
             max_attempts: 16,
             queue_timeout_ms: 600_000,
             upstream_header_timeout_ms: 120_000,
+            hedge_after_ms: 20_000,
             stream_idle_timeout_ms: 180_000,
             max_request_bytes: 64 * 1024 * 1024,
             recording_enabled: true,
@@ -104,6 +109,7 @@ impl Config {
             || !(1_000..=300_000).contains(&self.upstream_header_timeout_ms)
             || !(1_000..=300_000).contains(&self.first_output_timeout_ms)
             || !(1_000..=900_000).contains(&self.stream_idle_timeout_ms)
+            || (self.hedge_after_ms != 0 && !(1_000..=600_000).contains(&self.hedge_after_ms))
             || !(1024..=128 * 1024 * 1024).contains(&self.max_request_bytes)
             || !(10..=10_000).contains(&self.record_limit)
         {
@@ -177,7 +183,7 @@ impl Config {
             "compress_images":self.compress_images,"first_output_timeout_ms":self.first_output_timeout_ms,
             "reasoning_override":self.reasoning_override,"max_attempts":self.max_attempts,
             "queue_timeout_ms":self.queue_timeout_ms,"upstream_header_timeout_ms":self.upstream_header_timeout_ms,
-            "stream_idle_timeout_ms":self.stream_idle_timeout_ms,"recording_enabled":self.recording_enabled,
+            "stream_idle_timeout_ms":self.stream_idle_timeout_ms,"hedge_after_ms":self.hedge_after_ms,"recording_enabled":self.recording_enabled,
             "poll_interval_ms":self.poll_interval_ms,"record_limit":self.record_limit})
     }
     pub fn patch(&self, patch: Value) -> Result<Self> {

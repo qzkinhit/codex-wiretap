@@ -126,8 +126,9 @@ try {
         }
         Copy-Item -LiteralPath (Join-Path $repoRoot 'LICENSE') -Destination (Join-Path $payload 'LICENSE.txt')
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'maintenance.ps1') -Destination $payload
+        Copy-Item -LiteralPath (Join-Path $repoRoot 'assets/PoolRouter.ico') -Destination $payload
         Write-DependencyLicenses $payload
-        $expected = @('LICENSE.txt', 'THIRD-PARTY-NOTICES.txt', 'licenses', 'maintenance.ps1', 'pool-router-launcher.exe', 'pool-router.exe') | Sort-Object
+        $expected = @('LICENSE.txt', 'PoolRouter.ico', 'THIRD-PARTY-NOTICES.txt', 'licenses', 'maintenance.ps1', 'pool-router-launcher.exe', 'pool-router.exe') | Sort-Object
         $actual = @(Get-ChildItem -LiteralPath $payload | Select-Object -ExpandProperty Name | Sort-Object)
         if (@(Compare-Object $expected $actual).Count -ne 0) { throw 'The package allowlist did not match.' }
         & $iscc "/DAppVersion=$version" "/DPayloadDir=$payload" "/DOutputDir=$OutputDir" (Join-Path $PSScriptRoot 'installer.iss')

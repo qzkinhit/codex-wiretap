@@ -2,24 +2,25 @@
 
 [简体中文](README.md) | **English**
 
-**Pool Router connects Codex to the account pool configured in BiWrite and shows the account, model, retries, and usage for each request locally.** The current release is **1.0.0**, the Rust edition of the `codex-wiretap` repository; its executable is `pool-router`. The desktop launcher opens a browser dashboard, while a local background process forwards requests.
+<img src="assets/logo-wordmark.png" width="420" alt="Pool Router">
+
+**Pool Router is a local router and request monitor for Codex. It spreads requests across your own keys by account and model, shows which account served each request along with retries, tokens, and cost, and moves to another account when one stalls.** The current release is **1.1.0**, the Rust edition of the `codex-wiretap` repository; its executable is `pool-router`. The desktop launcher opens a browser dashboard, while a local background process forwards requests.
 
 | Your computer | Download and install |
 | --- | --- |
 | Apple Silicon Mac, macOS 11 or later | [Download PoolRouter-macOS-arm64.dmg](https://github.com/qzkinhit/codex-wiretap/releases/latest/download/PoolRouter-macOS-arm64.dmg) |
 | Windows 10 / 11, x64 | [Download PoolRouter-Windows-x64-Setup.exe](https://github.com/qzkinhit/codex-wiretap/releases/latest/download/PoolRouter-Windows-x64-Setup.exe) |
 
-[All releases and release notes](https://github.com/qzkinhit/codex-wiretap/releases) · [BiWrite repository and installation instructions](https://github.com/zzccppp/biwrite) · [Historical Python implementation](legacy/python/)
+[All releases and release notes](https://github.com/qzkinhit/codex-wiretap/releases) · [Historical Python implementation](legacy/python/)
 
-The default workflow needs Codex, BiWrite, and an accessible Responses upstream service with your own keys.
+The pool is yours. Pool Router supplies no upstream accounts or keys and works with any upstream that exposes the Responses API. Two account sources are available and can be switched in the dashboard.
 
-| Application | Responsibility |
+| Account source | What it does |
 | --- | --- |
-| Codex | Sends your conversation and coding requests. |
-| [BiWrite](https://github.com/zzccppp/biwrite) | Stores upstream addresses, models, and keys; runs keep-alive and maintains candidates. |
-| Pool Router | Reads candidates, schedules requests by account and model, and displays routing and request records. |
+| Manual | Add keys, models, nicknames, and concurrency limits in the dashboard; they stay on this machine. Works with any multi-key setup you maintain yourself. |
+| [BiWrite](https://github.com/zzccppp/biwrite) | Reads the keep-alive candidates that application maintains and verifies each one with a real request. This project's long-running integration testing was done on that combination. |
 
-The default request path is **Codex → Pool Router → upstream service**. BiWrite supplies the account source; individual requests do not pass through it. CC Switch is not required for this workflow. Pool Router does not supply upstream accounts or keys.
+The default request path is **Codex → Pool Router → upstream service**. With the BiWrite source, BiWrite only supplies the account list and no request passes through it; CC Switch is not required for this workflow.
 
 ![Example Pool Router dashboard](docs/dashboard.png)
 
@@ -35,13 +36,17 @@ Use the download table above. The Mac package is for Apple Silicon; the Windows 
 
 **Windows:** Run **`PoolRouter-Windows-x64-Setup.exe`**, complete the per-user installation wizard, and open **Pool Router** from the Start menu. The launcher starts the local process and opens the dashboard. Program files are installed under `%LOCALAPPDATA%\Programs\Pool Router`; configuration and records are stored under `%LOCALAPPDATA%\Pool Router`. The installer offers optional desktop and sign-in startup shortcuts.
 
-Installation itself does not change Codex or CC Switch connection settings. Prepare BiWrite before performing the direct connection step below.
+Installation itself does not change Codex or CC Switch connection settings. Set up an account source as described next, then perform the direct connection step.
 
 The current release has no publisher code signature, and the macOS DMG has not been notarized by Apple. If macOS blocks the first opening, verify that the download came from this repository, find the corresponding message in System Settings under Privacy & Security, choose Open Anyway, and confirm. Older macOS versions use Security & Privacy in System Preferences. Windows may show an unknown-publisher prompt; verify the download source.
 
-### 2. Prepare your upstream, models, and keys in BiWrite
+### 2. Prepare your upstream, models, and keys
 
-Install and open BiWrite using its [repository instructions](https://github.com/zzccppp/biwrite), then complete these steps.
+Pick one. Use the manual source if you already hold a set of keys; use the BiWrite source if you keep them alive with that application.
+
+**Option A, manual source.** In Routing settings, enter the upstream Base URL. Add each key to the manual pool, tick the models it may serve, set a nickname and concurrency limit if you want, and save the source as **manual**. Keys are stored in the private local file `manual-keys.json` and pass through no third-party application. You can then skip to step 4.
+
+**Option B, BiWrite source.** Install and open BiWrite using its [repository instructions](https://github.com/zzccppp/biwrite), then complete these steps.
 
 1. Configure an OpenAI-compatible **Responses** provider with your upstream Base URL, model ID, and key. Providers configured only for Chat Completions are not imported by this adapter.
 2. Enable **local key file storage**, corresponding to `keysInFile = true`, so that keys are saved in BiWrite's `keys.json`. Pool Router does not read the system keychain, and you do not need to copy keys into it again.
@@ -49,7 +54,7 @@ Install and open BiWrite using its [repository instructions](https://github.com/
 
 The default scope imports only keep-alive candidates and excludes keys ignored or stopped in BiWrite. Candidate membership permits later requests; it does not guarantee that a request will succeed now.
 
-### 3. Open Pool Router and check imported accounts
+### 3. Open Pool Router and check imported accounts (BiWrite source)
 
 On macOS, open `~/Applications/Pool Router.app`. On Windows, open **Pool Router** from the Start menu. Confirm that the dashboard reports the service as online, then check the following.
 
@@ -149,7 +154,7 @@ python3 scripts/macos-package-dmg.py dist/macos/PoolRouter-macOS-arm64.zip dist/
 On Windows, use PowerShell with Rust and the installer build tools available:
 
 ```powershell
-./scripts/windows/build.ps1 -ReleaseTag v1.0.0
+./scripts/windows/build.ps1 -ReleaseTag v1.1.0
 ```
 
 Alternatively, run the **Build Windows installer** GitHub Actions workflow and supply `release_tag`. After creating the release tag, leave `source_ref` empty to build that tag. To build before tagging, explicitly supply the intended commit or branch, such as `main`. The resulting package must correspond to the final release tag; an unchecked branch build is not evidence of a published release.
@@ -162,7 +167,7 @@ Every release ships `PoolRouter-macOS-arm64.zip` alongside the DMG. New users sh
 bash scripts/macos-install.sh --no-build
 ```
 
-The 1.0.0 ZIP installer matches the DMG and generates macOS plist files with the system `plutil`, so it needs no Python; the older v0.1.0 ZIP installer still requires `python3`. A DMG and the ZIP of the same release contain the same executable and dependency licenses. Use the current repository to package a DMG from an existing binary ZIP. **Packaging requires Python 3; installing the DMG does not.**
+The ZIP installer since 1.0.0 matches the DMG and generates macOS plist files with the system `plutil`, so it needs no Python; the older v0.1.0 ZIP installer still requires `python3`. A DMG and the ZIP of the same release contain the same executable and dependency licenses. Use the current repository to package a DMG from an existing binary ZIP. **Packaging requires Python 3; installing the DMG does not.**
 
 ```bash
 python3 scripts/macos-package-dmg.py /path/PoolRouter-macOS-arm64.zip /path/PoolRouter-macOS-arm64.dmg
@@ -305,6 +310,8 @@ The Rust version supports HTTP/SSE on `POST /v1/responses`, plus `POST /v1/respo
 The pool path checks both HTTP status and Responses/SSE events. A failure event inside HTTP 200 is not counted as success. Before meaningful output, an explicit retryable rejection or a confirmed failure to establish a connection can select another candidate. Once text, reasoning, or tool-call output appears, the request is not automatically replayed. Transport interruptions with an uncertain outcome are also not retried transparently.
 
 The pool defaults to at most **15 retries**, or **16 attempts including the first request**. The backend setting `max_attempts = 16` includes the first request; the dashboard displays and edits the retry count. Requests created by session recovery or compaction repair count against the same limit. Queueing and the pre-output phase share a 600-second deadline. The upstream response-header timeout is 120 seconds, the first meaningful output deadline is 120 seconds from the start of each attempt, and the stream idle timeout is 180 seconds. The time deadline can therefore expire before all retries are used. Legacy monitoring submits each upstream request once.
+
+The default `hedge_after_ms` is `20000`. If an attempt has received no response headers after 20 seconds, the proxy issues the same request on another candidate account in parallel and keeps whichever returns headers first, cancelling the other. Because the race only ever starts while no headers exist, a client can never receive duplicated content. The winner takes over the rest of that attempt, and its usage and records are attributed to it; the dashboard shows this as a hedged attempt and a hedged win. No race starts when no candidate is free, or when the delay is not shorter than the header wait left in the attempt. Set it to 0 to disable it. A race issues a real request on the second account and may consume quota.
 
 The default `first_output_timeout_ms` is `120000`. If a pool request has no `previous_response_id` and has produced no meaningful content, reaching that deadline can release the current attempt and schedule another. SSE heartbeats and status-only events do not count as meaningful content. Once text, reasoning, or tool-call output appears, the request is not automatically replayed. A timeout does not prove that the upstream never executed the request, and more retries do not guarantee success or eliminate an upstream-wide outage.
 

@@ -7,7 +7,7 @@ use crate::{
         self, AttemptRecord, GatewayAction, Observation, RecordStore, RequestRecord, SseObserver,
     },
     recovery::{self, RecoveryKind, SessionRemaps},
-    scheduler::{Scheduler, SelectError, Selection},
+    scheduler::{Lease, Scheduler, SelectError, Selection},
     types::{ProviderSummary, RoutingPolicy, SourceSnapshot, now_ms},
     updates::UpdateService,
     usage,
@@ -2399,21 +2399,85 @@ async fn run_proxy_inner(
         guard.record.upstream_request_bytes = Some(attempt_payload.len() as u64);
         let suffix = uri.path().strip_prefix("/v1").unwrap_or("/responses");
         let target = format!("{}{}", lease.account.upstream.trim_end_matches('/'), suffix);
-        let request = state
-            .client
-            .post(&target)
-            .headers(forward_headers(&attempt_headers, attempt_rewritten))
-            .bearer_auth(lease.account.secret.as_ref())
-            .body(attempt_payload);
-        let sent = tokio::time::timeout(
-            Duration::from_millis(cfg.upstream_header_timeout_ms).min(
-                deadline
-                    .min(first_output_deadline)
-                    .saturating_duration_since(Instant::now()),
-            ),
-            request.send(),
-        )
-        .await;
+        let build = |secret: &str, endpoint: &str| {
+            state
+                .client
+                .post(endpoint)
+                .headers(forward_headers(&attempt_headers, attempt_rewritten))
+                .bearer_auth(secret)
+                .body(attempt_payload.clone())
+        };
+        let request = build(lease.account.secret.as_ref(), &target);
+        let budget = Duration::from_millis(cfg.upstream_header_timeout_ms).min(
+            deadline
+                .min(first_output_deadline)
+                .saturating_duration_since(Instant::now()),
+        );
+        // A second account is raced only while no response headers exist, so no
+        // output can ever be duplicated. The loser is dropped, which cancels it.
+        // A continuation is pinned to the account that holds its session, so it
+        // has nowhere else to go and is never raced.
+        let hedgeable = attempt_selection.previous_response_id.is_none();
+        let mut hedge: Option<(Lease, String)> = None;
+        let sent = if !hedgeable
+            || cfg.hedge_after_ms == 0
+            || cfg.hedge_after_ms as u128 >= budget.as_millis()
+        {
+            tokio::time::timeout(budget, request.send()).await
+        } else {
+            let started = Instant::now();
+            let primary = request.send();
+            tokio::pin!(primary);
+            let first = tokio::select! {
+                result = &mut primary => Some(result),
+                _ = tokio::time::sleep(Duration::from_millis(cfg.hedge_after_ms)) => None,
+            };
+            match first {
+                Some(result) => Ok(result),
+                None => {
+                    let mut spare = attempt_selection.clone();
+                    spare.explicit_key = None;
+                    spare.exclude.insert(key.clone());
+                    match scheduler.try_acquire(&spare, &cfg.policy) {
+                        Ok(second) => {
+                            let endpoint = format!(
+                                "{}{}",
+                                second.account.upstream.trim_end_matches('/'),
+                                suffix
+                            );
+                            let secondary = build(second.account.secret.as_ref(), &endpoint);
+                            let second_key = second.account.id.clone();
+                            guard.action("hedged_attempt", attempt_count, 1);
+                            let remaining = budget.saturating_sub(started.elapsed());
+                            tokio::time::timeout(remaining, async {
+                                tokio::select! {
+                                    result = &mut primary => result,
+                                    result = secondary.send() => {
+                                        hedge = Some((second, second_key));
+                                        result
+                                    },
+                                }
+                            })
+                            .await
+                        }
+                        Err(_) => {
+                            tokio::time::timeout(budget.saturating_sub(started.elapsed()), primary)
+                                .await
+                        }
+                    }
+                }
+            }
+        };
+        // The hedge won: adopt its account for the rest of this attempt.
+        let (lease, key): (Lease, String) = match hedge {
+            Some((winner, winner_key)) => {
+                drop(lease);
+                guard.action("hedged_win", attempt_count, 1);
+                guard.record.key_id = Some(winner_key.clone());
+                (winner, winner_key)
+            }
+            None => (lease, key),
+        };
         let upstream = match sent {
             Ok(Ok(response)) => response,
             Ok(Err(e)) => {
