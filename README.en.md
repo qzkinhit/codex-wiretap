@@ -86,6 +86,18 @@ Use the record for the request you just sent.
 
 For first-time setup, complete the direct workflow above. Read Optional CC Switch Monitoring below only if you intend to keep maintaining keys in CC Switch.
 
+## Daily token usage and estimated cost
+
+Open **用量与花费** (Usage and cost). The four cards show today's cost, today's tokens, the cost over the selected range, and the cache hit ratio. Below them, daily cost and daily tokens appear as two separate charts, because an amount and a token count do not share a scale. Further down, the day is broken out by model, reasoning effort, account and conversation.
+
+The amounts are **estimates, not a bill**. They come from the price table under 价目表与汇率 (Price table and rate), which ships with the published standard-tier prices in US dollars per million tokens. When a relay settles at its own multiplier, either set 结算倍率 (Settlement multiplier) once or edit each model's prices. Saving applies immediately and recomputes the history.
+
+Input is priced in three disjoint parts: ordinary input, cache reads and cache writes. Cache writes cost more than ordinary input, and a missing lifetime split is charged at the cheaper rate, so the figure is a lower bound. Reasoning tokens are already inside the output count and are never charged twice; the panel shows them as a share only. An input above 272K tokens uses the long-context prices. Service tiers apply as multipliers. Hosted tool fees never appear in the usage object, so this is a token cost rather than a total bill.
+
+Requests for which the upstream returned no usage are not counted, and the panel reports how many there were. That happens when a stream breaks early or the upstream fails.
+
+Daily totals live in `usage.json`, apart from the request monitor: the monitor keeps only the most recent requests, while the ledger accumulates per day and keeps about a year. The price table lives in `pricing.json`. Neither is written into the main configuration file, so an older build reading the same configuration is unaffected.
+
 ## Check for and install updates
 
 1. Click **Check for Updates (`检查更新`)** at the top of the Pool Router dashboard to view the current version and the latest official GitHub Release.
@@ -216,6 +228,8 @@ wire_api = "responses"
 requires_openai_auth = false
 supports_websockets = false
 ```
+
+Connecting also writes `stream_max_retries`, matching the retry budget in the routing settings so Codex does not fall back to its own default for stream reconnects. The field is deliberately excluded from the connect consistency check, so a value tuned by hand survives a reconnect; it is only filled in when absent. Restoring the connection removes it.
 
 Existing providers and unrelated settings are preserved; `auth.json` is unchanged. The default direct connection does not read or modify the CC Switch database and does not stop CC Switch. If a backup from this application's older integration exists, its own changes are checked and restored before a new backup is created.
 
