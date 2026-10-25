@@ -488,6 +488,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/accounts/{id}/reset", post(api_reset))
         .route("/api/probe", post(api_probe))
         .route("/api/connect", post(api_connect))
+        .route("/api/restore", post(api_restore))
         .route("/api/legacy/connect", post(api_legacy_connect))
         .route("/api/legacy/restore", post(api_legacy_restore))
         .route("/api/manual", get(api_manual_list).post(api_manual_add))
@@ -1110,6 +1111,21 @@ async fn api_legacy_connect(State(s): State<Arc<AppState>>) -> Response {
     })
     .await;
     legacy_integration_response(result)
+}
+
+/// Undo this software's own changes to the Codex configuration. The panel needs
+/// this so disconnecting does not require the command line.
+async fn api_restore(State(s): State<Arc<AppState>>) -> Response {
+    let dir = s.state_dir();
+    match tokio::task::spawn_blocking(move || integration::restore(&dir)).await {
+        Ok(Ok(message)) => Json(json!({"ok":true,"message":message})).into_response(),
+        Ok(Err(e)) => error(StatusCode::CONFLICT, "restore_failed", &e.to_string()),
+        Err(_) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "restore_failed",
+            "断开接入未完成",
+        ),
+    }
 }
 
 async fn api_legacy_restore(State(s): State<Arc<AppState>>) -> Response {

@@ -218,3 +218,42 @@ fn masking_covers_credential_keys_and_leaves_the_rest_readable() {
     // A comment is not a key/value pair and stays as written.
     assert!(masked.contains("# comment with token = keep"));
 }
+
+#[tokio::test]
+async fn disconnecting_needs_local_auth_and_refuses_when_there_is_nothing_to_undo() {
+    // The panel's disconnect button must never guess at a Codex configuration it
+    // did not write, so without a stored backup it has to refuse rather than edit.
+    let directory = tempdir().unwrap();
+    let config = Config {
+        source_mode: SourceMode::Manual,
+        ..Config::default()
+    };
+    let token = config.local_token.clone();
+    let state = AppState::new(config, directory.path().join("config.json"), false).unwrap();
+    let app = proxy::router(state);
+
+    let denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/restore")
+                .header("host", "127.0.0.1:10813")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .clone()
+        .oneshot(post(&token, "/api/restore", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let value = body_of(response).await;
+    assert_eq!(value["error"]["code"], "restore_failed");
+    assert!(!value.to_string().contains(&token));
+}

@@ -4,7 +4,7 @@
 
 <img src="assets/logo-wordmark.png" width="420" alt="Pool Router">
 
-**Pool Router is a local router and request monitor for Codex. It spreads requests across your own keys by account and model, shows which account served each request along with retries, tokens, and cost, and moves to another account when one stalls.** The current release is **1.1.0**, the Rust edition of the `codex-wiretap` repository; its executable is `pool-router`. The desktop launcher opens a browser dashboard, while a local background process forwards requests.
+**Pool Router is a local router and request monitor for Codex. It spreads requests across your own keys by account and model, shows which account served each request along with retries, tokens, and cost, and moves to another account when one stalls.** The current release is **1.1.1**, the Rust edition of the `codex-wiretap` repository; its executable is `pool-router`. The desktop launcher opens a browser dashboard, while a local background process forwards requests.
 
 | Your computer | Download and install |
 | --- | --- |
@@ -154,7 +154,7 @@ python3 scripts/macos-package-dmg.py dist/macos/PoolRouter-macOS-arm64.zip dist/
 On Windows, use PowerShell with Rust and the installer build tools available:
 
 ```powershell
-./scripts/windows/build.ps1 -ReleaseTag v1.1.0
+./scripts/windows/build.ps1 -ReleaseTag v1.1.1
 ```
 
 Alternatively, run the **Build Windows installer** GitHub Actions workflow and supply `release_tag`. After creating the release tag, leave `source_ref` empty to build that tag. To build before tagging, explicitly supply the intended commit or branch, such as `main`. The resulting package must correspond to the final release tag; an unchecked branch build is not evidence of a published release.
@@ -356,13 +356,13 @@ The commands and LaunchAgent operations below apply to macOS. Inspect sanitized 
 
 Rerun the installer to update. Restarting the proxy can affect in-flight requests and in-memory continuation bindings, so update after current requests finish. Ordinary dashboard changes do not require restarting the service or Codex.
 
-If Codex or CC Switch has been connected, restore the connection before disabling or removing the service:
+If Codex or CC Switch has been connected, restore the connection before disabling or removing the service. After a direct connection, a **Disconnect** button appears in the dashboard header; it returns the Codex configuration to its pre-connection state, after which you can pick a provider in CC Switch or Codex yourself. The command line does the same:
 
 ```bash
 "$HOME/Library/Application Support/Pool Router/bin/pool-router" restore
 ```
 
-This checks and restores pending direct and compatibility-monitor integrations managed by the application. To restore only CC Switch monitoring, use its dashboard restore button. Unrelated later edits are preserved; conflicting changes to managed fields stop restoration and retain the backup. You may need to reopen Codex conversations afterward and verify the restored request path.
+The button and the command share one implementation, and both check and restore pending direct and compatibility-monitor integrations managed by the application. To restore only CC Switch monitoring, use its dashboard restore button. Unrelated later edits are preserved; conflicting changes to managed fields stop restoration and retain the backup. You may need to reopen Codex conversations afterward and verify the restored request path.
 
 Disable the macOS background service without removing files:
 

@@ -645,6 +645,8 @@ if (typeof document !== "undefined") (() => {
     text("base-url", state.connection?.base_url || "未提供接入地址");
     $("copy-url").disabled = !state.connection?.base_url;
     text("connect-button", state.connection?.configured ? "检查接入" : "直接接入 Codex");
+    $("disconnect-button").hidden = !state.connection?.configured;
+    $("disconnect-button").title = "把 Codex 配置还原到接入之前，之后可在 CC Switch 或 Codex 里自行选择供应商";
     $("connect-button").title = state.connection?.configured ? "检查 Codex → Pool Router → 上游服务 的直接接入配置" : "直接配置 Codex 使用 Pool Router";
     showAlert("connection-note", !state.connection?.configured ? "点击「直接接入 Codex」完成本地配置，后续由 Pool Router 自动分配号池。" : "");
     const legacyEnabled = state.config?.legacy_monitor_enabled !== false;
@@ -1617,6 +1619,19 @@ if (typeof document !== "undefined") (() => {
       await refreshState();
     } catch (error) { toast(error.message, "error"); }
     finally { button.disabled = false; text("connect-button", state?.connection?.configured ? "检查接入" : "直接接入 Codex"); }
+  });
+
+  $("disconnect-button").addEventListener("click", async () => {
+    const button = $("disconnect-button");
+    button.disabled = true;
+    text("disconnect-button", "正在断开…");
+    try {
+      const result = await serializeMutation(() => api("/api/restore", { method: "POST", body: {}, timeout: 30000 }));
+      if (result.ok === false) throw new Error(safeText(result.message || "断开接入未完成。"));
+      toast(result.message || "已把 Codex 配置还原到接入之前。重新打开 Codex 会话后生效。", "success");
+      await refreshState();
+    } catch (error) { toast(error.message, "error"); }
+    finally { button.disabled = false; text("disconnect-button", "断开接入"); }
   });
 
   async function updateLegacyConnection(action) {

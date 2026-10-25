@@ -4,7 +4,7 @@
 
 <img src="assets/logo-wordmark.png" width="420" alt="Pool Router">
 
-**Pool Router 是在本机运行的 Codex 请求路由与监控工具。它把请求按账号和模型分配到你自己的多个 Key 上，在浏览器面板里显示每次请求走了哪个账号、重试了几次、用了多少 token 和多少钱，并在某个账号卡住时自动改走另一个。** 当前版本为 **1.1.0**，属于 `codex-wiretap` 仓库的 Rust 实现，程序名为 `pool-router`。安装后从桌面启动器打开浏览器控制台，本机后台程序负责实际转发。
+**Pool Router 是在本机运行的 Codex 请求路由与监控工具。它把请求按账号和模型分配到你自己的多个 Key 上，在浏览器面板里显示每次请求走了哪个账号、重试了几次、用了多少 token 和多少钱，并在某个账号卡住时自动改走另一个。** 当前版本为 **1.1.1**，属于 `codex-wiretap` 仓库的 Rust 实现，程序名为 `pool-router`。安装后从桌面启动器打开浏览器控制台，本机后台程序负责实际转发。
 
 | 你的电脑 | 下载并安装 |
 | --- | --- |
@@ -154,7 +154,7 @@ python3 scripts/macos-package-dmg.py dist/macos/PoolRouter-macOS-arm64.zip dist/
 Windows 在具备 Rust 和安装器构建工具的 PowerShell 环境中执行：
 
 ```powershell
-./scripts/windows/build.ps1 -ReleaseTag v1.1.0
+./scripts/windows/build.ps1 -ReleaseTag v1.1.1
 ```
 
 也可运行 GitHub Actions 的 **Build Windows installer**，填写 `release_tag`。发布标签已创建时，留空 `source_ref` 即从该标签构建；标签创建前需显式填写要构建的提交或分支，例如 `main`。构建结果应对应最终发布标签，不应把未经核对的分支结果当作已发布版本。
@@ -358,13 +358,13 @@ supports_websockets = false
 
 更新程序时重新运行安装脚本。重启代理可能影响在途请求和内存中的续接绑定，宜在当前请求结束后更新。一般的面板设置变化不需要重启服务或 Codex。
 
-已接入 Codex 或 CC Switch 时，停用或卸载前先恢复接入：
+已接入 Codex 或 CC Switch 时，停用或卸载前先恢复接入。直接接入后，面板右上角会出现 **断开接入**，点击即可把 Codex 配置还原到接入之前，之后可在 CC Switch 或 Codex 中自行选择供应商。也可使用命令行：
 
 ```bash
 "$HOME/Library/Application Support/Pool Router/bin/pool-router" restore
 ```
 
-该命令检查并恢复本软件待恢复的直连接入和兼容监控接入。只恢复 CC Switch 监控时，也可使用面板对应恢复按钮。恢复保留无关的后续修改；受管字段发生冲突时拒绝覆盖并保留备份。恢复后可能需要重新打开 Codex 会话，确认请求已采用恢复后的入口。
+按钮与命令使用同一套逻辑，都会检查并恢复本软件待恢复的直连接入和兼容监控接入。只恢复 CC Switch 监控时，也可使用面板对应恢复按钮。恢复保留无关的后续修改；受管字段发生冲突时拒绝覆盖并保留备份。恢复后可能需要重新打开 Codex 会话，确认请求已采用恢复后的入口。
 
 仅停用 macOS 后台服务，不卸载文件：
 
