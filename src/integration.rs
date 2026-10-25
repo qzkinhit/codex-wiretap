@@ -153,6 +153,48 @@ fn mask_json_value(value: &mut serde_json::Value) {
     }
 }
 
+/// Subagent defaults written alongside the connection. Codex otherwise runs
+/// subagents with its own defaults, which the user does not see anywhere.
+const AGENT_THREADS: i64 = 5;
+const AGENT_EFFORT: &str = "high";
+
+/// Creates the `[agents]` table only when the file has none. An existing table
+/// belongs to the user and is never touched.
+fn write_agent_defaults(doc: &mut DocumentMut) {
+    if doc.get("agents").is_some() {
+        return;
+    }
+    let mut table = Table::new();
+    table["max_concurrent_threads_per_session"] = value(AGENT_THREADS);
+    table["default_subagent_reasoning_effort"] = value(AGENT_EFFORT);
+    doc["agents"] = Item::Table(table);
+}
+
+/// Removes the defaults on restore, but only when the user never had an
+/// `[agents]` table and never edited the one written here.
+fn remove_untouched_agent_defaults(doc: &mut DocumentMut, before: &DocumentMut) {
+    if before.get("agents").is_some() {
+        return;
+    }
+    let untouched = doc
+        .get("agents")
+        .and_then(Item::as_table_like)
+        .is_some_and(|table| {
+            table.len() == 2
+                && table
+                    .get("max_concurrent_threads_per_session")
+                    .and_then(Item::as_integer)
+                    == Some(AGENT_THREADS)
+                && table
+                    .get("default_subagent_reasoning_effort")
+                    .and_then(Item::as_str)
+                    == Some(AGENT_EFFORT)
+        });
+    if untouched {
+        doc.remove("agents");
+    }
+}
+
 fn validate_target(raw: &str) -> Result<reqwest::Url> {
     let url = reqwest::Url::parse(raw).context("本地路由地址格式错误")?;
     ensure!(url.scheme() == "http", "接入地址必须使用本机 HTTP");
@@ -371,6 +413,7 @@ fn connect_config(
             }
         }
         doc["model_provider"] = value(PROVIDER);
+        write_agent_defaults(&mut doc);
         ensure!(
             fs::read_to_string(&path)? == original,
             "Codex 配置在重新接入期间发生变化，未覆盖；原始备份保留"
@@ -411,6 +454,7 @@ fn connect_config(
     table["stream_max_retries"] = value(i64::from(stream_retries));
     providers.insert(PROVIDER, Item::Table(table));
     doc["model_provider"] = value(PROVIDER);
+    write_agent_defaults(&mut doc);
     let updated = doc.to_string();
     let migrated = matches!(prior_backup, Some(Backup::CcSwitch { .. }));
     if migrated {
@@ -931,6 +975,9 @@ fn restore_primary(state_dir: &Path) -> Result<String> {
                     known_direct_state(&doc, &installed, previous_provider.as_deref())?;
                 let before = document(before_config)?;
                 if has_direct_table(&doc) {
+                    // Only while undoing our own changes. A user who already
+                    // reverted the file by hand must see it left alone.
+                    remove_untouched_agent_defaults(&mut doc, &before);
                     let providers = doc
                         .get_mut("model_providers")
                         .and_then(Item::as_table_like_mut)
@@ -1279,6 +1326,76 @@ mod tests {
         assert_eq!(
             doc["model_providers"][PROVIDER]["stream_max_retries"].as_integer(),
             Some(40)
+        );
+    }
+
+    #[test]
+    fn connect_writes_subagent_defaults_only_when_the_user_has_none() {
+        let (dir, state) = fixture(false);
+        connect_at(TARGET, "local-token", &state, dir.path()).unwrap();
+        let path = dir.path().join(".codex/config.toml");
+        let doc = document(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            doc["agents"]["max_concurrent_threads_per_session"].as_integer(),
+            Some(5)
+        );
+        assert_eq!(
+            doc["agents"]["default_subagent_reasoning_effort"].as_str(),
+            Some("high")
+        );
+
+        // Untouched defaults go away with the connection.
+        restore(&state).unwrap();
+        let doc = document(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(doc.get("agents").is_none());
+    }
+
+    #[test]
+    fn subagent_defaults_never_overwrite_or_discard_the_users_own_table() {
+        let (dir, state) = fixture(false);
+        let path = dir.path().join(".codex/config.toml");
+        let mut doc = document(&fs::read_to_string(&path).unwrap()).unwrap();
+        doc["agents"]["max_concurrent_threads_per_session"] = value(2);
+        doc["agents"]["custom_user_field"] = value("keep me");
+        fs::write(&path, doc.to_string()).unwrap();
+
+        connect_at(TARGET, "local-token", &state, dir.path()).unwrap();
+        let doc = document(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            doc["agents"]["max_concurrent_threads_per_session"].as_integer(),
+            Some(2),
+            "an existing table must not be rewritten"
+        );
+        assert!(
+            doc["agents"]
+                .get("default_subagent_reasoning_effort")
+                .is_none()
+        );
+
+        restore(&state).unwrap();
+        let doc = document(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["agents"]["custom_user_field"].as_str(), Some("keep me"));
+        assert_eq!(
+            doc["agents"]["max_concurrent_threads_per_session"].as_integer(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn restore_keeps_subagent_defaults_the_user_edited() {
+        let (dir, state) = fixture(false);
+        connect_at(TARGET, "local-token", &state, dir.path()).unwrap();
+        let path = dir.path().join(".codex/config.toml");
+        let mut doc = document(&fs::read_to_string(&path).unwrap()).unwrap();
+        doc["agents"]["default_subagent_reasoning_effort"] = value("xhigh");
+        fs::write(&path, doc.to_string()).unwrap();
+
+        restore(&state).unwrap();
+        let doc = document(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            doc["agents"]["default_subagent_reasoning_effort"].as_str(),
+            Some("xhigh"),
+            "an edited value is no longer ours to remove"
         );
     }
 

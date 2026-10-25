@@ -231,6 +231,8 @@ supports_websockets = false
 
 Connecting also writes `stream_max_retries`, matching the retry budget in the routing settings so Codex does not fall back to its own default for stream reconnects. The field is deliberately excluded from the connect consistency check, so a value tuned by hand survives a reconnect; it is only filled in when absent. Restoring the connection removes it.
 
+When the configuration has no `[agents]` table, connecting adds subagent defaults: `max_concurrent_threads_per_session = 5` and `default_subagent_reasoning_effort = "high"`. An existing table is never modified, not even to add a missing key. Restoring removes only defaults that were left exactly as written; editing any of them keeps the whole table.
+
 Existing providers and unrelated settings are preserved; `auth.json` is unchanged. The default direct connection does not read or modify the CC Switch database and does not stop CC Switch. If a backup from this application's older integration exists, its own changes are checked and restored before a new backup is created.
 
 Already-open Codex conversations may need to be reopened or reloaded once after initial connection. Send a real request and confirm that it appears in the dashboard. After that, source selection, candidate synchronization, routing policies, and model/reasoning overrides take effect inside the proxy without restarting Codex. In-flight requests retain their selected account and model.
