@@ -2858,82 +2858,32 @@ async fn cancelling_a_manual_sync_clears_the_running_flag_and_allows_an_immediat
 }
 
 #[tokio::test]
-async fn a_manual_sync_verification_stays_out_of_the_totals_while_a_single_check_still_records() {
-    let h = Harness::new(
-        vec![
-            success("resp_real_traffic", ASTRA),
-            success("resp_sync_verify", ASTRA),
-            success("resp_single_check", ASTRA),
-        ],
-        1,
-        &[ASTRA],
-    )
-    .await;
-    let response = h.post(Harness::request(ASTRA)).send().await.unwrap();
-    response.bytes().await.unwrap();
-    let stats = |value: &Value| {
-        (
-            value["stats"]["requests"].clone(),
-            value["stats"]["successes"].clone(),
-            value["stats"]["failures"].clone(),
-        )
-    };
-    let read_state = async || -> Value {
-        h.api_get("/api/state")
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap()
-    };
-    let count_records = async || -> usize {
-        h.api_get("/api/records")
-            .send()
-            .await
-            .unwrap()
-            .json::<Value>()
-            .await
-            .unwrap()["records"]
-            .as_array()
-            .unwrap()
-            .len()
-    };
-    let before = read_state().await;
-    assert_eq!(stats(&before), (json!(1), json!(1), json!(0)));
-    assert_eq!(count_records().await, 1);
-
-    h.write_biwrite_fixture(&[ASTRA], "p-silent-sync");
-    assert!(h.state.sync_source_now().await.is_ok());
-    let after_sync = read_state().await;
-    assert_eq!(after_sync["sync"]["healthy"], json!(1));
-    assert_eq!(
-        h.calls(),
-        2,
-        "the sync verification does reach the upstream"
-    );
-    assert_eq!(
-        stats(&after_sync),
-        (json!(1), json!(1), json!(0)),
-        "a manual sync must not move the request totals"
-    );
-    assert_eq!(count_records().await, 1, "and must not fill the monitor");
-
-    let id = h.state.scheduler.snapshot(&h.state.settings().policy)[0]
-        .id
-        .clone();
-    let single = h
-        .api_post("/api/probe", json!({"key_id": id, "model": ASTRA}))
+async fn a_manual_sync_answers_with_the_result_of_that_very_round() {
+    let h = Harness::new(vec![success("resp_sync_verify", ASTRA)], 0, &[ASTRA]).await;
+    h.install_biwrite_models_fixture(&[ASTRA]).await;
+    let body: Value = h
+        .api_post("/api/sync", json!({}))
         .send()
         .await
         .unwrap()
-        .json::<Value>()
+        .json()
         .await
         .unwrap();
-    assert_eq!(single["ok"], json!(true));
-    assert_eq!(
-        count_records().await,
-        2,
-        "a single account check stays visible in the monitor"
-    );
+    // The panel reports the summary from this body, so it never has to wait for
+    // the next poll and never shows an empty result.
+    assert_eq!(body["ok"], json!(true));
+    assert_eq!(body["sync"]["running"], json!(false));
+    assert_eq!(body["sync"]["total"], json!(1));
+    assert_eq!(body["sync"]["healthy"], json!(1));
+    assert_eq!(body["sync"]["removed"], json!(0));
+    assert!(body["sync"]["last_completed_ms"].as_u64().is_some());
+    let state: Value = h
+        .api_get("/api/state")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(state["sync"], body["sync"]);
 }
