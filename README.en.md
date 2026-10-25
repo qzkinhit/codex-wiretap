@@ -142,15 +142,15 @@ On Windows, use PowerShell with Rust and the installer build tools available:
 
 Alternatively, run the **Build Windows installer** GitHub Actions workflow and supply `release_tag`. After creating the release tag, leave `source_ref` empty to build that tag. To build before tagging, explicitly supply the intended commit or branch, such as `main`. The resulting package must correspond to the final release tag; an unchecked branch build is not evidence of a published release.
 
-### Older ZIP package and DMG reproduction
+### ZIP package and DMG reproduction
 
-The existing v0.1.0 `PoolRouter-macOS-arm64.zip` remains available. Its older installer still requires `python3` to generate macOS plist files. New users should use the DMG. To use the older ZIP, extract it and double-click `安装.command`, or run this from its root directory:
+Every release ships `PoolRouter-macOS-arm64.zip` alongside the DMG. New users should use the DMG. To use the ZIP, extract it and double-click `安装.command`, or run this from its root directory:
 
 ```bash
 bash scripts/macos-install.sh --no-build
 ```
 
-The v0.1.0 DMG and corresponding ZIP contain the same executable and dependency licenses; the DMG updates the installation scripts. Use the current repository to package a DMG from an existing binary ZIP. **Packaging requires Python 3; installing the DMG does not.**
+The 1.0.0 ZIP installer matches the DMG and generates macOS plist files with the system `plutil`, so it needs no Python; the older v0.1.0 ZIP installer still requires `python3`. A DMG and the ZIP of the same release contain the same executable and dependency licenses. Use the current repository to package a DMG from an existing binary ZIP. **Packaging requires Python 3; installing the DMG does not.**
 
 ```bash
 python3 scripts/macos-package-dmg.py /path/PoolRouter-macOS-arm64.zip /path/PoolRouter-macOS-arm64.dmg

@@ -276,7 +276,8 @@ impl AppState {
                 if probe_only {
                     state.probe_scheduler.clear_cooldown(&id, Some(&model));
                 }
-                let result = probe_account(state, &id, &model, VERIFY_TIMEOUT, probe_only).await;
+                let result =
+                    probe_account(state, &id, &model, VERIFY_TIMEOUT, probe_only, true).await;
                 (upstream, id, model, probe_only, result)
             }
         }))
@@ -944,7 +945,10 @@ async fn api_manual_delete(State(s): State<Arc<AppState>>, Path(id): Path<String
 }
 async fn api_sync(State(s): State<Arc<AppState>>) -> Response {
     match s.sync_source_now().await {
-        Ok(()) => Json(json!({"ok":true})).into_response(),
+        Ok(()) => {
+            let sync = s.sync.read().unwrap_or_else(|e| e.into_inner()).clone();
+            Json(json!({"ok": true, "sync": sync})).into_response()
+        }
         Err(ManualSyncError::AlreadyRunning) => error(
             StatusCode::CONFLICT,
             "sync_in_progress",
@@ -1066,7 +1070,7 @@ async fn api_probe(State(s): State<Arc<AppState>>, Json(v): Json<Value>) -> Resp
             "账号或模型格式无效",
         );
     }
-    Json(probe_account(s, key, model, Duration::from_secs(120), false).await).into_response()
+    Json(probe_account(s, key, model, Duration::from_secs(120), false, false).await).into_response()
 }
 
 async fn probe_account(
@@ -1075,6 +1079,7 @@ async fn probe_account(
     model: &str,
     timeout: Duration,
     sync_probe: bool,
+    silent: bool,
 ) -> Value {
     let body = probe_payload(key, model);
     let started = Instant::now();
@@ -1105,6 +1110,9 @@ async fn probe_account(
         headers.insert("x-pool-router-key", value);
     }
     headers.insert("x-pool-router-probe", HeaderValue::from_static("1"));
+    if silent {
+        headers.insert("x-pool-router-silent", HeaderValue::from_static("1"));
+    }
     let response = tokio::time::timeout_at(
         deadline,
         run_proxy_inner(
@@ -1490,12 +1498,18 @@ struct RequestGuard {
     pub record: RequestRecord,
     started: Instant,
     recording: bool,
+    /// A manual sync verifies every candidate at once. Those synthetic requests
+    /// stay out of the request totals and the monitor, so those numbers keep
+    /// describing real Codex traffic. A single account check still records.
+    silent: bool,
     finished: bool,
     upstream_session: Option<String>,
 }
 impl RequestGuard {
-    fn new(state: Arc<AppState>, record: RequestRecord, recording: bool) -> Self {
-        state.counters.requests.fetch_add(1, Ordering::Relaxed);
+    fn new(state: Arc<AppState>, record: RequestRecord, recording: bool, silent: bool) -> Self {
+        if !silent {
+            state.counters.requests.fetch_add(1, Ordering::Relaxed);
+        }
         state.counters.active.fetch_add(1, Ordering::Relaxed);
         Self {
             scheduler: state.scheduler.clone(),
@@ -1503,7 +1517,8 @@ impl RequestGuard {
             probe_upstream: Arc::new(RwLock::new(ProbeUpstream::default())),
             record,
             started: Instant::now(),
-            recording,
+            recording: recording && !silent,
+            silent,
             finished: false,
             upstream_session: None,
         }
@@ -1578,13 +1593,15 @@ impl Drop for RequestGuard {
             self.record.outcome = "client_cancelled".into();
         }
         self.record.duration_ms = self.started.elapsed().as_millis() as u64;
-        if self.record.outcome == "completed" {
-            self.state
-                .counters
-                .successes
-                .fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.state.counters.failures.fetch_add(1, Ordering::Relaxed);
+        if !self.silent {
+            if self.record.outcome == "completed" {
+                self.state
+                    .counters
+                    .successes
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.state.counters.failures.fetch_add(1, Ordering::Relaxed);
+            }
         }
         if self.recording {
             let _ = self.state.records.record(self.record.clone());
@@ -1660,7 +1677,7 @@ async fn run_legacy_proxy(
         store: body["store"].as_bool(),
         ..RequestRecord::default()
     };
-    let mut guard = RequestGuard::new(state.clone(), record, cfg.recording_enabled);
+    let mut guard = RequestGuard::new(state.clone(), record, cfg.recording_enabled, false);
     let override_origin = state
         .legacy_upstream_override
         .read()
@@ -2002,6 +2019,7 @@ async fn run_proxy_inner(
         .filter(|v| config::safe_label(v))
         .map(str::to_owned);
     let probe = headers.get("x-pool-router-probe").is_some();
+    let silent = headers.get("x-pool-router-silent").is_some();
     let scheduler = if sync_probe {
         &state.probe_scheduler
     } else {
@@ -2107,7 +2125,7 @@ async fn run_proxy_inner(
         store: body["store"].as_bool(),
         ..RequestRecord::default()
     };
-    let mut guard = RequestGuard::new(state.clone(), record, initial.recording_enabled);
+    let mut guard = RequestGuard::new(state.clone(), record, initial.recording_enabled, silent);
     guard.scheduler = scheduler.clone();
     if let Some(summary) = image_summary
         && summary.count > 0

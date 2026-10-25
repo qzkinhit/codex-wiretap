@@ -41,7 +41,18 @@ if [[ -e "$plist" ]]; then
 fi
 if [[ -e "$application" ]]; then
   previous_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$application/Contents/Info.plist" 2>/dev/null || true)"
-  [[ "$previous_id" == local.pool-router.launcher ]] || { printf '%s\n' '同名应用不是 Pool Router 启动器，未覆盖。' >&2; exit 1; }
+  if [[ ! -e "$application/Contents/Info.plist" ]]; then
+    # An interrupted install leaves a bundle without Info.plist. Treat it as our
+    # own leftover only while it holds nothing this script did not write.
+    foreign="$(find "$application" -mindepth 1 \
+      ! -path "$application/Contents" \
+      ! -path "$application/Contents/MacOS" \
+      ! -path "$application/Contents/MacOS/Pool Router" \
+      ! -name .DS_Store -print -quit)"
+    [[ -z "$foreign" ]] || { printf '%s\n' '同名应用不是 Pool Router 启动器，未覆盖。' >&2; exit 1; }
+  else
+    [[ "$previous_id" == local.pool-router.launcher ]] || { printf '%s\n' '同名应用不是 Pool Router 启动器，未覆盖。' >&2; exit 1; }
+  fi
 fi
 
 if [[ "$build" == 1 ]]; then
@@ -134,9 +145,9 @@ if [[ "$start" == 1 ]]; then
     [[ "$loaded" == 1 ]] || { printf '%s\n' '后台服务尚未注册成功，可重新运行安装脚本；配置和恢复备份已保留。' >&2; exit 1; }
   fi
 fi
-if [[ "$show" == 1 ]]; then
-  "$binary" open --config "$config"
-fi
 printf '%s\n' 'Pool Router 已安装。可双击 ~/Applications/Pool Router.app 打开面板。'
 printf '%s\n' '安装仅启动本地路由；请在验证号池后通过面板或 connect 命令接入 Codex。'
 printf '%s\n' '配置和恢复备份保存在 ~/Library/Application Support/Pool Router。'
+if [[ "$show" == 1 ]]; then
+  "$binary" open --config "$config" || printf '%s\n' '未能自动打开面板，可稍后双击 ~/Applications/Pool Router.app。' >&2
+fi

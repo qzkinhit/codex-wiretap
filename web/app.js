@@ -321,7 +321,7 @@ if (typeof document !== "undefined") (() => {
   let activeTab = "accounts";
   let formDirty = false;
   let baselineDraft = null;
-  let statePending = false;
+  let statePending = null;
   let recordsPending = false;
   let accountSignature = "";
   let recordSignature = "";
@@ -379,6 +379,7 @@ if (typeof document !== "undefined") (() => {
   }
 
   function toast(message, kind = "") {
+    if (!message) return;
     const element = node("div", `toast ${kind}`, message);
     $("toast-region").append(element);
     while ($("toast-region").children.length > 3) $("toast-region").firstChild.remove();
@@ -464,6 +465,7 @@ if (typeof document !== "undefined") (() => {
   function accountLabel(id) { return state?.accounts?.find((account) => account.id === id)?.label || shortId(id); }
 
   function renderStats() {
+    if (!state) return;
     const accounts = state.accounts || [];
     const present = accounts.filter((account) => account.present !== false);
     const ready = accounts.filter((account) => availableModelHealth(account).length ? availableModelHealth(account).some((health) => modelStatus(account, health).ready) : accountStatus(account).ready);
@@ -742,15 +744,17 @@ if (typeof document !== "undefined") (() => {
     else updateFormOptions();
   }
 
-  async function refreshState() {
-    if (statePending) return;
-    statePending = true;
-    try { renderState(await api("/api/state")); }
-    catch (error) {
-      $("service-status").className = "live-status offline";
-      text("service-status-text", "连接中断");
-      showAlert("connection-error", error.message);
-    } finally { statePending = false; }
+  function refreshState() {
+    if (statePending) return statePending;
+    statePending = (async () => {
+      try { renderState(await api("/api/state")); }
+      catch (error) {
+        $("service-status").className = "live-status offline";
+        text("service-status-text", "连接中断");
+        showAlert("connection-error", error.message);
+      } finally { statePending = null; }
+    })();
+    return statePending;
   }
 
   function renderManualAccounts() {
@@ -1198,11 +1202,13 @@ if (typeof document !== "undefined") (() => {
   $("sync-button").addEventListener("click", async () => {
     if (pendingActions.has("sync") || state?.sync?.running) return;
     pendingActions.add("sync");
-    renderStats();
     try {
-      await api("/api/sync", { method: "POST", body: {}, timeout: 0 });
+      renderStats();
+      const result = await api("/api/sync", { method: "POST", body: {}, timeout: 0 });
+      if (state && result?.sync) state.sync = result.sync;
       await refreshState();
-      toast(state?.config?.source_mode === "manual" ? "已重新读取当前手动池。" : verifiesCandidates(state?.config) ? syncResultText(state?.sync) : "已重新读取 BiWrite 全部 Key，未执行实时验证。", "success");
+      if (state && result?.sync) state.sync = result.sync;
+      toast(state?.config?.source_mode === "manual" ? "已重新读取当前手动池。" : verifiesCandidates(state?.config) ? syncResultText(result?.sync || state?.sync) : "已重新读取 BiWrite 全部 Key，未执行实时验证。", "success");
       if (state?.config?.sync_paused) toast("自动同步仍处于暂停状态。");
     } catch (error) { toast(error.message, "error"); }
     finally { pendingActions.delete("sync"); if (state) renderStats(); }

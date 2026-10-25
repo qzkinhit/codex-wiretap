@@ -142,15 +142,15 @@ Windows 在具备 Rust 和安装器构建工具的 PowerShell 环境中执行：
 
 也可运行 GitHub Actions 的 **Build Windows installer**，填写 `release_tag`。发布标签已创建时，留空 `source_ref` 即从该标签构建；标签创建前需显式填写要构建的提交或分支，例如 `main`。构建结果应对应最终发布标签，不应把未经核对的分支结果当作已发布版本。
 
-### 旧版 ZIP 与 DMG 复现
+### ZIP 包与 DMG 复现
 
-现有 v0.1.0 的 `PoolRouter-macOS-arm64.zip` 继续保留，其旧安装器仍需要 `python3` 来生成 macOS plist。新用户优先使用 DMG。使用旧 ZIP 时，解压后双击 `安装.command`，或在包根目录执行：
+每个版本在 DMG 之外同时提供 `PoolRouter-macOS-arm64.zip`。新用户优先使用 DMG。使用 ZIP 时，解压后双击 `安装.command`，或在包根目录执行：
 
 ```bash
 bash scripts/macos-install.sh --no-build
 ```
 
-v0.1.0 DMG 与对应 ZIP 包含相同的程序二进制和依赖许可证，DMG 更新了安装脚本。可在当前仓库中从已有二进制 ZIP 打包 DMG；**打包需要 Python 3，安装 DMG 不需要**。
+1.0.0 的 ZIP 安装器与 DMG 相同，只用系统自带 `plutil` 生成 macOS plist，不需要 Python；v0.1.0 的旧 ZIP 安装器仍需要 `python3`。同一版本的 DMG 与 ZIP 包含相同的程序二进制和依赖许可证。可在当前仓库中从已有二进制 ZIP 打包 DMG；**打包需要 Python 3，安装 DMG 不需要**。
 
 ```bash
 python3 scripts/macos-package-dmg.py /path/PoolRouter-macOS-arm64.zip /path/PoolRouter-macOS-arm64.dmg
